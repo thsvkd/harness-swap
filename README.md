@@ -5,21 +5,33 @@ rate-limit rotation, a unified usage dashboard, and parallel sessions.
 
 `hswap` grew out of [claude-swap](https://github.com/realiti4/claude-swap). Its
 Claude Code support *is* the claude-swap engine (unchanged apart from a small
-embedding hook); Codex CLI, Grok Build and OpenCode are added through the same adapter contract any other
+embedding hook); Codex CLI, Grok Build, OpenCode and Antigravity are added through the same adapter contract any other
 harness can implement.
 
-| | Claude Code | Codex CLI | Grok Build | OpenCode |
-|---|---|---|---|---|
-| list / add / remove accounts | yes | yes | yes | yes (native) |
-| switch the default login | yes | yes¹ | yes | yes (native `auth switch`) |
-| running sessions pick up a switch | yes² | no, restart | yes | undocumented |
-| usage | 5h / 7d / per-model | experimental³ | no quota API | no quota API |
-| automatic rotation | `hswap claude auto` | no⁴ | no | no |
-| parallel isolated sessions | experimental | yes | experimental | no |
+| | Claude Code | Codex CLI | Grok Build | OpenCode | Antigravity (`agy`) |
+|---|---|---|---|---|---|
+| list / add / remove accounts | yes | yes | yes | yes (native) | yes⁵ |
+| switch the default login | yes | yes¹ | yes | yes (native `auth switch`) | yes⁵ |
+| running sessions pick up a switch | yes² | no, restart | yes | undocumented | no, restart |
+| usage | 5h / 7d / per-model | experimental³ | experimental³ | experimental³ (Go plan) | experimental³ |
+| automatic rotation | `hswap claude auto` | experimental⁴ | experimental⁴ | experimental⁴ | experimental⁴ |
+| parallel isolated sessions | experimental | yes | experimental | no | experimental |
 
 ¹ file credential store only (`cli_auth_credentials_store = "file"`, Codex's default).
-² on macOS once the Keychain cache expires. ³ read passively from Codex's own
-session logs, no network calls. ⁴ manual `switch --strategy best` only — see
+² on macOS once the Keychain cache expires.
+³ opt-in: `hswap config set usage.remote <ids>`. hswap asks the harness itself
+(Codex `app-server`, Grok's ACP agent, OpenCode `api experimental.usage.limits`,
+`agy -p /usage`) and never calls a provider API or refreshes a token. Without the
+opt-in Codex still shows the last snapshot it logged locally. Verified against
+fake harnesses and the real binaries without accounts only, never a live paid
+account. `list --cached` / `usage --cached` read the cache: no network, no refresh.
+⁴ opt-in per harness: `hswap config set auto.enabled <ids>`, then
+`hswap <harness> auto`. Needs live usage, and every provider's terms are
+unclear or restrictive about switching accounts to get past limits (Google's
+are the strictest); `hswap capabilities` prints the warning. Claude keeps
+`hswap claude auto`.
+⁵ file-backed login only (Linux; not the macOS/Windows keychain); `add --login`
+is unavailable. Cursor and Gemini CLI are not supported. See
 [docs/harness-compatibility.md](docs/harness-compatibility.md) for the evidence
 and the reasons behind every cell. `hswap capabilities` prints the live answer
 for *your* install.
@@ -67,7 +79,7 @@ hswap codex add                       # store the current login
 hswap codex add --login --alias work  # sign in another account in a throwaway CODEX_HOME;
                                       # the current login is never replaced or logged out
 hswap codex switch work               # swaps $CODEX_HOME/auth.json; restart running Codex
-hswap codex usage                     # last rate-limit snapshot Codex logged per account
+hswap codex usage                     # last logged snapshot; live after `config set usage.remote codex`
 hswap codex switch --strategy best    # one-off: the account with the most headroom
 hswap codex run personal -- resume    # isolated per-account CODEX_HOME, this terminal only
 ```
@@ -83,6 +95,29 @@ hswap grok add --login       # isolated GROK_HOME sign-in
 hswap grok switch 1          # leaves that login as the only scope; Grok hot-reloads it
 hswap grok run 2             # experimental isolated GROK_HOME session
 ```
+
+### Antigravity (`agy`)
+
+File-backed login only (`~/.gemini/antigravity-cli/antigravity-oauth-token`).
+
+```bash
+hswap agy add                # the current login; sign in the next account in agy, add again
+hswap agy switch 2           # swaps the token file; restart running agy sessions
+hswap agy run 2 -- --continue    # experimental: per-account --gemini_dir
+```
+
+### Usage and automatic switching (opt-in)
+
+```bash
+hswap config set usage.remote codex,grok,opencode,agy   # ask each harness for live usage
+hswap list --cached                                      # no network, no token refresh
+hswap config set auto.enabled codex                      # allow automatic switching
+hswap codex auto [--once | --interval S] [--dry-run] [--json]
+```
+
+`auto` switches only on fresh usage at or over `rotation.threshold`, at most once
+per `auto.cooldown` (default 600 s), and never on missing data. Read the terms
+warning in `hswap capabilities` first.
 
 ### OpenCode
 
@@ -103,11 +138,12 @@ a time (experimental, mock-verified).
 
 ```
 hswap harnesses | list [H] | status [H] | capabilities [H] | doctor | migrate [--dry-run]
-hswap config [list|get|set|unset|path]          plugins.trusted, rotation.threshold
+hswap config [list|get|set|unset|path]  plugins.trusted, rotation.threshold, usage.remote, auto.enabled, auto.cooldown
 hswap tui
 
-hswap <harness> list [--json] [--no-usage]
-hswap <harness> status | usage [ACCOUNT] [--json]
+hswap <harness> list [--json] [--no-usage] [--cached]
+hswap <harness> status | usage [ACCOUNT] [--json] [--cached]
+hswap <harness> auto [--once|--interval S] [--dry-run] [--json]   # opt-in
 hswap <harness> add [--alias A] [--provider P] [--login]
 hswap <harness> switch ACCOUNT [--provider P] [--force] [--json]
 hswap <harness> switch --strategy best|next-available

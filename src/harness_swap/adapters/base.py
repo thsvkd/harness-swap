@@ -298,10 +298,9 @@ class FileCredentialAdapter:
         creds = self.credentials
         with self.store.lock():
             stored = self._stored(account)
-            try:
-                live = creds.live_identities()
-            except CredentialError:
-                live = {}
+            # An unreadable live file raises: the account might be the live one,
+            # and reading its stored copy could then refresh a token twice.
+            live = creds.live_identities()
             active = creds.is_active(stored, live)
             home = self.home if active else self.store.account_dir(stored.slot)
             if not active and not (home / self.credential_file).exists():

@@ -326,3 +326,230 @@ def test_no_network_is_used_for_usage(codex, monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", no_network)
     monkeypatch.setattr("socket.create_connection", no_network)
     adapter.read_usage(a)
+
+
+def test_switch_round_trip_keeps_keys_hswap_does_not_use(codex):
+    adapter, home = codex
+    doc = codex_auth("a@x.com", "user-a", "acct-a")
+    doc["tokens"]["login_owner_id"] = "synthetic-owner-a"
+    doc["tokens"]["oauth_provenance"] = {"issuer": "https://auth.example", "client_id": "app_synthetic"}
+    doc["future_key"] = {"x": 1}
+    write_json(home / "auth.json", doc)
+    adapter.add_account()
+    login(home, "b@x.com", "user-b", "acct-b")
+    adapter.add_account()
+    service.switch(adapter, "1")
+    assert json.loads((home / "auth.json").read_text()) == doc
+    service.switch(adapter, "2")
+    service.switch(adapter, "1")
+    assert json.loads((home / "auth.json").read_text()) == doc
+
+
+# -- live usage by asking Codex (usage.remote) ------------------------------------------------
+
+FAKE_APP_SERVER = """
+log = open(os.environ["FAKE_LOG"], "a")
+log.write(json.dumps({"argv": sys.argv[1:], "home": os.environ.get("CODEX_HOME"), "tty": os.isatty(0)}) + "\\n")
+reply = json.load(open(os.environ["FAKE_REPLY"]))
+print("codex starting", flush=True)  # stray output is skipped
+for line in sys.stdin:
+    log.write(line)
+    log.flush()
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"id": msg["id"], "result": {"userAgent": "hswap/0.166.0"}}), flush=True)
+    elif msg.get("method") == "account/rateLimits/read":
+        print(json.dumps({"method": "account/rateLimits/updated", "params": {}}), flush=True)
+        print(json.dumps({"id": msg["id"], **reply}), flush=True)
+"""
+
+
+def app_server_reply(used=40, reached=None, account="acct-1", **extra):
+    future = int(time.time()) + 3600
+    return {
+        "result": {
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": used, "windowDurationMins": 300, "resetsAt": future},
+                "secondary": {"usedPercent": 12, "windowDurationMins": 10080, "resetsAt": future + 86400},
+                "credits": {"hasCredits": True, "unlimited": False, "balance": "5.20"},
+                "planType": "pro",
+                "rateLimitReachedType": reached,
+            },
+            "accountId": account,
+            **extra,
+        }
+    }
+
+
+@pytest.fixture
+def remote(codex, tmp_path, monkeypatch):
+    """Two accounts (1 inactive, 2 active), usage.remote on, a fake `codex app-server`."""
+    from harness_swap.core import settings
+
+    adapter, home = codex
+    settings.set_value("usage.remote", "codex")
+    for i in (1, 2):
+        login(home, f"{i}@x.com", f"user-{i}", f"acct-{i}")
+        adapter.add_account()
+    exe = fake_executable(tmp_path / "bin", "codex", FAKE_APP_SERVER)
+    adapter._installation = Installation(True, str(exe), "codex-cli 0.166.0")
+    log, reply = tmp_path / "rpc.log", tmp_path / "reply.json"
+    monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("FAKE_REPLY", str(reply))
+
+    def ask(slot, answer=None):
+        write_json(reply, answer or app_server_reply(account=f"acct-{slot}"))
+        return adapter.read_usage(next(a for a in adapter.list_accounts() if a.slot == slot))
+
+    def calls():
+        return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+
+    return adapter, home, ask, calls
+
+
+def set_live_token(home: Path, **fields):
+    doc = json.loads((home / "auth.json").read_text())
+    if "exp" in fields:
+        from tests.hswap_helpers import jwt
+
+        doc["tokens"]["access_token"] = jwt({"sub": "user-2", "exp": fields.pop("exp")})
+    doc.update(fields)
+    write_json(home / "auth.json", doc)
+
+
+@posix_only
+def test_inactive_account_is_asked_in_its_own_home(remote):
+    adapter, home, ask, calls = remote
+    before = (home / "auth.json").read_bytes()
+    snap = ask(1)
+    assert snap.state is UsageState.AVAILABLE and snap.source == "codex-app-server"
+    assert [(w.name, w.used_percent, w.window_seconds) for w in snap.windows] == [("5h", 40.0, 18000), ("7d", 12.0, 604800)]
+    assert snap.windows[0].resets_at > time.time()  # epoch seconds, not ms
+    assert snap.plan == "pro" and snap.balance == {"hasCredits": True, "unlimited": False, "balance": "5.20"}
+    start, *messages = calls()
+    assert start == {"argv": ["app-server", "--listen", "stdio://"], "home": str(adapter.store.account_dir(1)), "tty": False}
+    assert [m.get("method") for m in messages] == ["initialize", "initialized", "account/rateLimits/read"]
+    assert all("jsonrpc" not in m for m in messages)
+    assert messages[0]["params"]["clientInfo"]["name"] == "hswap"
+    assert messages[2]["params"] == {"excludeResetCreditDetails": True}
+    assert (home / "auth.json").read_bytes() == before  # the live login is not touched
+    assert adapter.usage_policy.min_interval_s >= 120
+
+
+@posix_only
+def test_active_account_is_asked_only_with_token_life_left(remote):
+    _adapter, home, ask, calls = remote
+    set_live_token(home, exp=int(time.time()) + 300)  # Codex would refresh now
+    snap = ask(2)
+    assert snap.state is UsageState.STALE and "single-use" in snap.detail and calls() == []
+    set_live_token(home, exp=int(time.time()) + 480)  # past Codex's 5 min, inside hswap's 10 min
+    assert ask(2).state is UsageState.STALE and calls() == []
+    set_live_token(home, exp=int(time.time()) + 660)
+    assert ask(2).state is UsageState.AVAILABLE
+    assert calls()[0]["home"] == str(home)
+
+
+@posix_only
+def test_an_unreadable_live_login_stops_every_read(remote):
+    """Any account might be the live one, held in memory by a running Codex that
+    could refresh it at any moment; reading a stored copy could refresh it twice."""
+    _adapter, home, ask, calls = remote
+    (home / "auth.json").write_text("{not json")
+    for slot in (1, 2):
+        with pytest.raises(HswapError, match="not valid JSON"):
+            ask(slot)
+    assert calls() == [] and (home / "auth.json").read_text() == "{not json"
+
+
+@posix_only
+def test_nothing_is_started_without_the_opt_in(remote, tmp_path):
+    from harness_swap.core import settings
+
+    settings.set_value("usage.remote", "")
+    assert remote[2](1).source == "codex-session-log"
+    assert not (tmp_path / "rpc.log").exists()
+
+
+@posix_only
+def test_live_read_reports_limits_over_a_rolled_over_window(remote):
+    _adapter, _home, ask, _calls = remote
+    reply = app_server_reply(reached="rate_limit_reached", account="acct-1")
+    reply["result"]["rateLimits"]["primary"]["resetsAt"] = int(time.time()) - 1
+    assert ask(1, reply).state is UsageState.RATE_LIMITED
+    reply = app_server_reply(account="acct-1")
+    reply["result"]["rateLimits"]["spendControlReached"] = True
+    snap = ask(1, reply)
+    assert snap.state is UsageState.RATE_LIMITED and "spend control" in snap.detail
+
+
+@posix_only
+def test_active_account_without_exp_follows_last_refresh(remote):
+    from datetime import datetime, timedelta
+
+    _adapter, home, ask, calls = remote
+    old = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+    set_live_token(home, last_refresh=old)
+    assert ask(2).state is UsageState.STALE and calls() == []
+    almost = (datetime.now(UTC) - timedelta(days=8) + timedelta(minutes=5)).isoformat()
+    set_live_token(home, last_refresh=almost)  # inside the 10-minute margin
+    assert ask(2).state is UsageState.STALE and calls() == []
+    set_live_token(home, last_refresh=datetime.now(UTC).isoformat())
+    assert ask(2).state is UsageState.AVAILABLE
+
+
+@posix_only
+def test_an_account_a_session_is_running_is_not_asked(remote, tmp_path):
+    adapter, _home, ask, calls = remote
+    fd = sessions.acquire(adapter.store.account_dir(1))
+    try:
+        snap = ask(1)
+    finally:
+        os.close(fd)
+    assert snap.state is UsageState.STALE and "running session" in snap.detail and calls() == []
+    # the usage service keeps serving the previous measurement meanwhile
+    svc = UsageService(tmp_path / "cache", clock=lambda: 0.0)
+    acc = adapter.list_accounts()[0]
+    write_json(tmp_path / "reply.json", app_server_reply(used=70, account="acct-1"))
+    assert svc.get(adapter, acc).windows[0].used_percent == 70.0
+    fd = sessions.acquire(adapter.store.account_dir(1))
+    try:
+        svc.clock = lambda: 10_000.0
+        again = svc.get(adapter, acc)
+    finally:
+        os.close(fd)
+    assert again.state is UsageState.STALE and again.windows[0].used_percent == 70.0
+
+
+@posix_only
+def test_remote_usage_states(remote):
+    _adapter, _home, ask, _calls = remote
+    assert ask(1, app_server_reply(used=100, account="acct-1")).state is UsageState.RATE_LIMITED
+    limited = ask(1, app_server_reply(used=20, reached="rate_limit_reached", account="acct-1"))
+    assert limited.state is UsageState.RATE_LIMITED and limited.detail == "rate_limit_reached"
+    assert ask(1, app_server_reply(account="acct-1", ordinaryUsageAllowed=False)).state is UsageState.RATE_LIMITED
+    auth = ask(1, {"error": {"code": -32600, "message": "codex account authentication required to read rate limits"}})
+    assert auth.state is UsageState.AUTHENTICATION_REQUIRED
+    with pytest.raises(HswapError, match="different account"):
+        ask(1, app_server_reply(account="acct-2"))
+    with pytest.raises(Exception, match="withheld"):
+        ask(1, {"error": {"code": -1, "message": "refresh failed for sk-proj-SyntheticAbCdEf0123456789xyz"}})
+
+
+def test_capabilities_follow_the_opt_ins(codex):
+    from harness_swap.core import settings
+
+    adapter, _home = codex
+    caps = adapter.capabilities()
+    assert caps[Capability.USAGE_MONITORING].support is Support.EXPERIMENTAL  # session logs
+    assert "usage.remote" in caps[Capability.USAGE_MONITORING].reason
+    assert caps[Capability.AUTOMATIC_ROTATION].support is Support.UNAVAILABLE
+    assert "usage.remote" in caps[Capability.AUTOMATIC_ROTATION].reason
+    settings.set_value("usage.remote", "codex")
+    caps = adapter.capabilities()
+    assert caps[Capability.USAGE_MONITORING].support is Support.EXPERIMENTAL
+    rotation = caps[Capability.AUTOMATIC_ROTATION]
+    assert rotation.support is Support.EXPERIMENTAL and "circumvent any rate limits" in rotation.reason
+    assert "https://" in rotation.reason
+    adapter._installation = Installation(False, detail="`codex` not found on PATH")
+    assert adapter.capabilities()[Capability.AUTOMATIC_ROTATION].support is Support.UNAVAILABLE

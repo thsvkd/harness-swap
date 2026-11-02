@@ -20,6 +20,7 @@ flowchart TD
         ROT[rotation.py<br/>select_account]
         CRED[credentials.py<br/>SnapshotCredentials]
         SES[sessions.py<br/>isolated homes, session lock]
+        AUTO[autorotate.py<br/>opt-in auto switching]
         REG[registry.py<br/>built-ins + trusted plugins]
     end
     subgraph "Domain (core)"
@@ -34,12 +35,14 @@ flowchart TD
         CX[codex.py]
         GK[grok.py]
         OC[opencode.py]
+        AG[agy.py]
         PLUG[third-party plugins]
     end
     subgraph Infrastructure
         FS[fsutil: atomic 0600 writes]
         LK[locking: flock / msvcrt]
         SP[spawn, processes, secrets]
+        RPC[jsonrpc: ask a harness over stdio]
     end
     ENGINE[(claude_swap<br/>Claude engine)]
 
@@ -52,12 +55,14 @@ flowchart TD
     REG --> ADP
     STO --> FS & LK
     BASE --> CRED & SES & STO & SP
-    CX & GK --> BASE
+    CX & GK & AG --> BASE
+    AUTO --> ACC & USG & ROT
+    CX & GK --> RPC
     OC --> BASE
     CL --> ENGINE
     ENGINE --> FS & LK & SP
     PLUG -. entry point .-> REG
-    REG -. lazy import .-> CL & CX & GK & OC
+    REG -. lazy import .-> CL & CX & GK & OC & AG
 ```
 
 Rules the code follows (and `tests/test_hswap_contract.py` checks):
@@ -139,13 +144,32 @@ window length, remaining when reported), a state
 rate_limited | error`), plan and balance. An account with no usage data is
 `unsupported`/`unknown`, never "unlimited".
 
+**Asking the harness.** Usage is read by starting the harness, never by calling a
+provider API: `infrastructure/jsonrpc.py` runs a child over newline-delimited
+JSON-RPC (Codex `app-server`, Grok ACP `_x.ai/billing`; no shell, stdin a pipe,
+stderr discarded, deadline, scrubbed errors), other adapters run a one-shot
+command (OpenCode `api`, `agy -p /usage`). Reads are opt-in per harness
+(`usage.remote`). `FileCredentialAdapter.usage_home(account)` yields the home to
+ask in, with the session lock held: the account's own directory when inactive,
+the default home when active, `None` when a running session owns it, in which case
+the adapter returns `stale` and the service keeps the last measurement (the STALE
+convention). `home_flag` (agy's `--gemini_dir=`) is the flag counterpart of
+`home_env`. `list --cached` / `usage --cached` serve the cache only: no
+network and no token refresh. `UsageService` holds a 30 s cache lock across a
+read, so a read slower than that (Grok 120 s, Codex 45 s) can make a second
+process give up waiting; this is known and not yet fixed.
+
 `rotation.select_account` is pure: `best` requires fresh `available` evidence
 below the threshold; `next-available` skips only accounts known to be exhausted.
 It is scoped to one harness (and optionally one provider) and used for
-user-initiated `switch --strategy`. Automatic background rotation remains the
-Claude engine's `hswap claude auto`, which encodes Anthropic's quota model
-(5-hour/7-day/per-model windows, priority tiers, hysteresis); no other harness
-offers a documented quota API to rotate on.
+user-initiated `switch --strategy`. `core/autorotate.py` (`hswap <harness> auto [--once|--interval S] [--dry-run]
+[--json]`) runs one pass per active account: stay while fresh usage is below
+`rotation.threshold` or unknown, otherwise switch to the `best` account, at most
+once per `auto.cooldown` per harness, with overlapping runs serialised. It
+requires the harness in `auto.enabled` and a usable `automatic_rotation`
+capability, whose reason must quote the provider's terms. Claude keeps its own
+`hswap claude auto` (Anthropic's quota model: 5-hour/7-day/per-model windows,
+priority tiers, hysteresis).
 
 ## Sessions
 

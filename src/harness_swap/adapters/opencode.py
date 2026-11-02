@@ -24,6 +24,18 @@ Verified with synthetic files only (no 1.x binary was available).
 
 Any other version gets an explicit "unsupported version" rather than a
 strategy that may not fit it.
+
+**Usage (native mode, opt-in: ``usage.remote`` includes ``opencode``)** -- OpenCode
+Go plan limits are read by asking OpenCode itself, ``opencode api
+experimental.usage.limits`` (what its ``/usage`` view calls). OpenCode talks to
+the Console and refreshes its own token inside its one background service, so
+hswap never sees a token or calls a provider endpoint. The answer is about the
+*active* ``opencode`` (OpenCode Console) login only; every other account keeps
+its last measurement. The read holds hswap's switch lock (excluding hswap's own
+switches) and re-checks the active flag afterwards, so a switch made inside
+OpenCode meanwhile discards the answer. Because OpenCode refreshes its rotating
+token on use, an active login within 10 minutes of expiry is not asked (its
+``expires`` is the only value read from the secret column; no token is).
 """
 
 from __future__ import annotations
@@ -31,8 +43,10 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 from harness_swap.adapters.base import (
@@ -40,10 +54,13 @@ from harness_swap.adapters.base import (
     parse_version,
     probe_installation,
 )
+from harness_swap.core import settings
+from harness_swap.core.adapter import UsagePolicy
 from harness_swap.core.credentials import Identity, fingerprint, jwt_claims
 from harness_swap.core.errors import (
     HarnessNotInstalled,
     HswapError,
+    LockError,
     UnsupportedOperation,
 )
 from harness_swap.core.models import (
@@ -51,7 +68,10 @@ from harness_swap.core.models import (
     Capability,
     CapabilityStatus,
     Installation,
+    QuotaWindow,
     SwitchResult,
+    UsageSnapshot,
+    UsageState,
     experimental,
     supported,
     unavailable,
@@ -63,6 +83,25 @@ from harness_swap.infrastructure import spawn
 from harness_swap.infrastructure.locking import FileLock
 
 NATIVE, LEGACY = "native", "legacy"
+
+#: The one integration whose login carries a Console workspace (and so Go limits).
+CONSOLE = "opencode"
+#: Console route timeout is 15 s; the rest is the service starting up.
+_USAGE_TIMEOUT_S = 60
+#: Each read may start OpenCode's background service: keep it rare.
+_USAGE_POLICY = UsagePolicy(min_interval_s=300.0, stale_after_s=1800.0, max_backoff_s=3600.0)
+_REFRESH_MARGIN_MS = 600_000
+_ONLY_ACTIVE = "measured only while it is the active OpenCode Console account"
+_ENABLE_REMOTE = "enable with `hswap config set usage.remote <ids>` (include the harnesses already listed)"
+#: Go meter -> (window name, length in seconds; None where OpenCode does not say).
+_GO_WINDOWS = {"rolling": ("5h", 18000), "weekly": ("weekly", 604800), "monthly": ("monthly", None)}
+_TERMS = (
+    'OpenCode\'s Terms of Service (effective 2026-08-15) forbid using the services in a manner that "creates, '
+    "maintains, or uses multiple accounts to circumvent usage limits, access restrictions, billing "
+    'obligations" (https://opencode.ai/legal/terms-of-service), which automatic switching between '
+    "OpenCode Console accounts to escape Go limits matches directly. Inactive accounts are measured only "
+    "while they are active, so automatic switching rarely has evidence to act on. You are responsible for complying"
+)
 
 
 def _failure(out: subprocess.CompletedProcess) -> str:
@@ -133,6 +172,7 @@ class OpenCodeAdapter:
     providers: tuple[str, ...] = ()  # any provider OpenCode is configured for
     #: Seconds allowed for one OpenCode command (it may start its service).
     timeout = 120
+    usage_policy = _USAGE_POLICY
 
     def __init__(self) -> None:
         self._installation: Installation | None = None
@@ -184,22 +224,34 @@ class OpenCodeAdapter:
     def capabilities(self) -> dict[Capability, CapabilityStatus]:
         inst = self.installation()
         mode = self.mode()
-        no_usage = unsupported("OpenCode has no quota interface (`opencode stats` is local token statistics)")
         if not inst.installed:
-            off = unavailable(f"OpenCode is not installed ({inst.detail})")
-            return {c: off for c in Capability} | {Capability.USAGE_MONITORING: no_usage}
+            return {c: unavailable(f"OpenCode is not installed ({inst.detail})") for c in Capability}
         if mode is None:
             off = unavailable(
                 self._mode_error
                 or f"OpenCode {inst.version} has no `auth switch` and is not a 1.x release; "
                 "hswap does not guess at its credential storage"
             )
-            return {c: off for c in Capability} | {Capability.USAGE_MONITORING: no_usage}
+            return {c: off for c in Capability}
+        if mode == LEGACY:
+            usage = unsupported("OpenCode 1.x has no usage interface (`opencode stats` is local token statistics)")
+            rotation = unsupported("no quota data to rotate on")
+        elif not settings.opted_in("usage.remote", self.id):
+            usage = unavailable(_ENABLE_REMOTE)
+            rotation = unavailable(f"needs live usage; {_ENABLE_REMOTE}")
+        else:
+            usage = experimental(
+                "asks OpenCode itself (`opencode api experimental.usage.limits`, what its /usage view uses) for "
+                "OpenCode Go 5h/weekly/monthly limits; only the active OpenCode Console login is measured, "
+                "others keep their last measurement. OpenCode does not report usage for API-key logins. Not verified against "
+                "a live Go account"
+            )
+            rotation = experimental(f"switches on live usage. {_TERMS}")
         common = {
             Capability.ACCOUNT_LIST: supported(),
             Capability.CREDENTIAL_REFRESH: unsupported("OpenCode refreshes its own logins"),
-            Capability.USAGE_MONITORING: no_usage,
-            Capability.AUTOMATIC_ROTATION: unsupported("no quota data to rotate on"),
+            Capability.USAGE_MONITORING: usage,
+            Capability.AUTOMATIC_ROTATION: rotation,
             Capability.PARALLEL_SESSIONS: unsupported(
                 "the active account is global to OpenCode; per-session account selection is not documented"
             ),
@@ -283,6 +335,24 @@ class OpenCodeAdapter:
             elif len(creds) == 1:
                 flags[creds[0][0]] = True  # the only saved account is the one in use
         return flags
+
+    def _expires_ms(self, identity: str) -> int | None:
+        """Only the integer ``expires`` of a login (never a token); None when unreadable."""
+        db = self._database()
+        if db is None or not db.exists():
+            return None
+        try:
+            con = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=2)
+            try:
+                row = con.execute(
+                    "SELECT json_extract(value, '$.expires') FROM credential WHERE id = ?", (identity,)
+                ).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return None
+        value = row[0] if row else None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     def _native_accounts(self) -> list[Account]:
         listing = self._native_listing()
@@ -386,6 +456,118 @@ class OpenCodeAdapter:
                     "other integrations are unchanged"
                 ),
             ),
+        )
+
+    # -- usage ------------------------------------------------------------------------
+
+    def read_usage(self, account: Account) -> UsageSnapshot:
+        if self.mode() != NATIVE:
+            return UsageSnapshot(UsageState.UNSUPPORTED, detail="OpenCode 1.x has no usage interface")
+        if not settings.opted_in("usage.remote", self.id):
+            return UsageSnapshot(UsageState.UNSUPPORTED, detail=_ENABLE_REMOTE)
+        if account.provider != CONSOLE or account.auth_mode == "key":
+            return UsageSnapshot(
+                UsageState.UNSUPPORTED, detail="OpenCode reports Go limits only for OpenCode Console logins"
+            )
+        self._database()  # resolved before the lock: it may spawn opencode
+        # The route answers for whichever login is active, so a switch must not
+        # slip in between the check and the answer.
+        mkdir_private(self.store.root)
+        try:
+            with FileLock(self.store.root / ".switch.lock", timeout=30):
+                flags = self._active_flags()
+                if flags is None:
+                    return UsageSnapshot(UsageState.STALE, detail="cannot tell which OpenCode account is active")
+                if not flags.get(account.identity):
+                    return UsageSnapshot(UsageState.STALE, detail=_ONLY_ACTIVE)
+                expires = self._expires_ms(account.identity)
+                if expires is not None and expires < time.time() * 1000 + _REFRESH_MARGIN_MS:
+                    return UsageSnapshot(
+                        UsageState.STALE,
+                        detail="the OpenCode login is about to refresh; showing the last measurement",
+                    )
+                out = self._ask_limits()
+                after = self._active_flags()
+                if not after or not after.get(account.identity):
+                    return UsageSnapshot(
+                        UsageState.STALE,
+                        detail="the active OpenCode account changed during the read; showing the last measurement",
+                    )
+        except LockError:
+            return UsageSnapshot(UsageState.STALE, detail="an account switch is in progress; showing the last measurement")
+        return self._limits_snapshot(out)
+
+    def _ask_limits(self) -> subprocess.CompletedProcess:
+        inst = self.installation()
+        if not inst.installed:
+            raise HarnessNotInstalled(f"OpenCode: {inst.detail}")
+        try:
+            return spawn.run(
+                [str(inst.executable), "api", "experimental.usage.limits"],
+                capture_output=True,
+                text=True,
+                timeout=_USAGE_TIMEOUT_S,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            raise HswapError(f"`opencode api experimental.usage.limits` did not finish within {_USAGE_TIMEOUT_S}s") from None
+        except OSError as exc:
+            raise HswapError(f"could not run opencode: {type(exc).__name__}") from None
+
+    @staticmethod
+    def _limits_snapshot(out: subprocess.CompletedProcess) -> UsageSnapshot:
+        lines = f"{out.stdout or ''}\n{out.stderr or ''}".splitlines()
+        text = "\n".join(line for line in lines if not line.strip().startswith("at "))
+        doc = None
+        # The whole of stdout, else its last JSON line (a service start-up may print before it).
+        for candidate in (out.stdout, next((ln for ln in reversed((out.stdout or "").splitlines()) if ln.startswith("{")), None)):
+            try:
+                doc = json.loads(candidate)
+                break
+            except (TypeError, ValueError):
+                continue
+        failed = out.returncode != 0 or not isinstance(doc, dict) or "data" not in doc
+        if failed:
+            # A 401 from the Console (503 from the route) means the login was rejected.
+            if re.search(r"(?<![:\d])401(?![:\d])|\bUnauthorized\b", text):
+                return UsageSnapshot(
+                    UsageState.AUTHENTICATION_REQUIRED,
+                    source="opencode",
+                    detail="OpenCode Console rejected this login; sign in again (`opencode auth login opencode`)",
+                )
+            tag = doc.get("_tag") if isinstance(doc, dict) else None
+            why = tag if isinstance(tag, str) and tag.isalnum() else f"exit status {out.returncode}"
+            raise HswapError(f"`opencode api experimental.usage.limits` failed ({why})")
+        data = doc["data"]
+        if data is None:
+            return UsageSnapshot(
+                UsageState.UNKNOWN,
+                source="opencode",
+                detail="OpenCode reports no usage limits for the active login (not signed in to a Console workspace)",
+            )
+        go = data.get("go") if isinstance(data, dict) else None
+        if not isinstance(go, dict):
+            return UsageSnapshot(
+                UsageState.UNSUPPORTED, source="opencode", detail="this workspace has no OpenCode Go plan quota"
+            )
+        windows, limited = [], False
+        for key, (name, length) in _GO_WINDOWS.items():
+            meter = go.get(key)
+            if not isinstance(meter, dict) or not isinstance(meter.get("percent"), int | float):
+                continue
+            percent = min(max(float(meter["percent"]), 0.0), 100.0)
+            resets = meter.get("resetsAt")
+            resets_s = resets / 1000.0 if isinstance(resets, int | float) and not isinstance(resets, bool) else None
+            limited = limited or meter.get("limited") is True or percent >= 100
+            windows.append(QuotaWindow(name, percent, resets_s, length))
+        if not windows:
+            return UsageSnapshot(UsageState.UNKNOWN, source="opencode", detail="OpenCode returned no Go meters")
+        return UsageSnapshot(
+            UsageState.RATE_LIMITED if limited else UsageState.AVAILABLE,
+            windows=tuple(windows),
+            measured_at=time.time(),
+            source="opencode",
+            detail="an OpenCode Go limit is reached" if limited else "",
         )
 
     def set_alias(self, account: Account, alias: str | None) -> Account:

@@ -100,6 +100,18 @@ class UsageReader(Protocol):
 
 
 @runtime_checkable
+class KeepAlive(Protocol):
+    """Keeps a stored login usable (capability ``credential_refresh``).
+
+    The harness itself is asked something that needs the login, in the
+    account's own home, so it refreshes the token there when it is due --
+    hswap never refreshes tokens itself. Returns what happened, in a few words.
+    """
+
+    def keep_alive(self, account: Account) -> str: ...
+
+
+@runtime_checkable
 class CachedUsageView(Protocol):
     """For a harness whose engine keeps its own usage cache: accounts and their
     last measured usage without any network call or token refresh. Others get

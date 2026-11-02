@@ -14,9 +14,12 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 | Core: store, rotation, usage service, registry, dispatch, resolution | `test_hswap_core.py` | |
 | Credential activation guarantees | `test_hswap_credentials.py` | sync-back, conflict/stash, part isolation, exclusive formats, rollback on interrupted write and on failed verification, tampered snapshot, harness lock, lock file not truncated, concurrent switches (threads and processes), session-owned snapshot never overwritten, no secrets in errors |
 | Isolated sessions | `test_hswap_sessions.py` | lock held while running and released after, not inherited by the harness's background children, exit status/signals, removed slot not reused, remove refused while running |
-| Codex adapter | `test_hswap_codex.py` | identity, workspaces, API keys, switch + restart notice, credential-store modes, missing binary, isolated session (env, `--no-daemon`, links, lock), `--login` isolation, usage attribution and states, strategy switch, no network |
-| Grok adapter | `test_hswap_grok.py` | exclusive scope switch (session ↔ API key), unmanaged scope refused, capability honesty, unsupported usage, isolated session, `--login` isolation |
-| OpenCode adapter | `test_hswap_opencode.py` | V2 emulator over a real SQLite file: probe-based mode, listing + active flags, native switch/login/logout, DB never written and secret column never selected; unknown version refused; legacy provider swap |
+| Codex adapter | `test_hswap_codex.py` | identity, workspaces, API keys, switch + restart notice, credential-store modes, missing binary, isolated session (env, `--no-daemon`, links, lock), `--login` isolation, usage attribution and states, strategy switch, live usage over a fake `app-server` (own home, token-life guard, session-held account, account mismatch, scrubbing), round trip keeps unknown `auth.json` keys |
+| Grok adapter | `test_hswap_grok.py` | exclusive scope switch (session ↔ API key), unmanaged scope refused, capability honesty, isolated session, `--login` isolation, no usage read without the opt-in, billing over a fake ACP agent (own home, expiry guard, session-held, states, API-key login, capabilities) |
+| OpenCode adapter | `test_hswap_opencode.py` | V2 emulator over a real SQLite file: probe-based mode, listing + active flags, native switch/login/logout, DB never written and secret column never selected; unknown version refused; legacy provider swap; Go limits through a fake `api` command (windows, null data, auth, timeout, switch lock held, inactive accounts, stale carry-over) |
+| Antigravity adapter | `test_hswap_agy.py` | fake `agy` speaking the `/usage` JSON: identity, switch + restart note, `add --login` refused, capabilities with and without the token file and on darwin, `--gemini_dir` argv/env/no tty, near-expiry and session-held skips, no output echoed, `UNAUTHENTICATED` |
+| Automatic switching | `test_hswap_auto.py` | opt-in, threshold, cooldown, no switch on missing data, `--dry-run`, overlapping runs |
+| Ask-a-harness transport | `test_hswap_jsonrpc.py` | JSON-RPC session over a fake child: deadline, shutdown, errors scrubbed |
 | Claude adapter | `test_hswap_claude_adapter.py` | schema-v1 → core usage mapping, engine embedding (prog name, argv restore, upgrade refused), legacy-store migration gate (no engine path bypasses it) + backup |
 | CLI and dashboard | `test_hswap_cli.py` | native passthrough, errors and JSON envelopes, confirmations, failed switch keeps login, config, **no credential in any output**, Textual pilot test of the dashboard |
 | Extensibility acceptance | `test_hswap_contract.py` | the example adapter registered at runtime and as a trusted/untrusted entry-point plugin, driven through CLI, services and dashboard; snapshot-name rule; static check that shared code names no harness and imports no adapter |
@@ -62,11 +65,16 @@ covered by the tests above, except these, which remain known limits:
 - the dashboard cuts long rows (Left/Right scrolls) and has no detail view;
   a slow harness (e.g. OpenCode starting its service) delays only its own rows;
 - a usage reading of "unknown" is cached like any other for the adapter's
-  minimum interval (30 s for Codex).
+  minimum interval (30 s for Codex's passive log reading, 300 s for every live read);
+- a live read slower than `UsageService`'s 30 s cache lock (Grok 120 s, Codex 45 s
+  timeouts) can make a concurrent process give up waiting.
 
 ## What is mock-only
 
 These pass against fakes and synthetic files, not against a live service:
+
+- **every live usage read** (Codex `account/rateLimits/read`, Grok `_x.ai/billing`, OpenCode `api experimental.usage.limits`, `agy -p /usage`) and everything built on it, including automatic switching: verified only against fake harnesses that speak the protocol, plus the real binaries in a sandbox with no account (which showed only the signed-out replies and, for OpenCode, `data: null`). No logged-in answer has been seen;
+- Antigravity as a whole: the real `agy` 1.4.8 was run with a synthetic token and a dead or fake endpoint only;
 
 - every switch/add/remove against real Codex, Grok and OpenCode logins (the
   tests use the real file formats; the binaries were checked separately with

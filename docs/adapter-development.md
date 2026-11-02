@@ -170,13 +170,38 @@ Return one measurement; the `UsageService` handles pacing, caching across
 processes, backoff and staleness. Map the provider's limits to `QuotaWindow`s
 and its states to `UsageState` (`rate_limited`, `authentication_required`,
 ...). Raise on failure: it becomes an `error` snapshot that keeps the last good
-numbers. Use only documented interfaces (or data the harness itself writes
-locally); if there is none, do not implement the role and report
-`usage_monitoring` as unsupported.
+numbers. **Ask the harness, never the provider.** Run the harness itself (a
+JSON-RPC child through `infrastructure.jsonrpc.session`, or a one-shot command
+through `spawn`) so it refreshes its own tokens; never call the provider's API or
+refresh a token in hswap. Rules the built-in adapters follow:
+
+- Make the read opt-in: check `settings.opted_in("usage.remote", self.id)`;
+  until then report `usage_monitoring` as unavailable with "enable with `hswap
+  config set usage.remote <ids>`".
+- Enter `with self.usage_home(account) as (home, active)` (file-backed
+  adapters). It gives the account's own directory for an inactive account, the
+  default home for the active one, and `home=None` when a running session owns
+  the account. Pass the home with `home_env` or, if the harness takes a flag,
+  `home_flag` (e.g. `--gemini_dir=`).
+- STALE convention: when you must not ask (`home is None`, no credential file, an
+  active login with 10 minutes or less of token life left or an unreadable
+  expiry), return a snapshot with state `stale`, no windows and a reason; the
+  service keeps the last measurement. Unsupported for this account (API-key login)
+  is `unsupported`, a signed-out harness `authentication_required`.
+- Raise `HswapError` for anything else, with a message that names no harness
+  output; no shell, no terminal (stdin a pipe or `/dev/null`), a timeout.
+- Set a conservative `usage_policy` (the built-ins use 300 s minimum interval,
+  30 min stale, 1 h backoff ceiling).
+- Use only documented interfaces, or ones you tag `experimental` with the
+  evidence; if there is none, do not implement the role and report
+  `usage_monitoring` as unsupported.
 
 With usage available, `hswap acme switch --strategy best|next-available` works
-automatically. Automatic background rotation is a separate decision: report
-`automatic_rotation` as supported only if the provider's terms allow it.
+automatically. Automatic switching (`hswap acme auto`, opt-in through
+`auto.enabled`) is a separate decision: report `automatic_rotation` as
+`unavailable` until usage is usable, and then as `experimental` at best, with a
+reason that quotes the provider's terms (clause, URL, date) or says plainly that
+the provider has not said. Only report `supported` if the terms clearly allow it.
 
 ## 7. Errors
 
@@ -191,7 +216,7 @@ message; name the account by label or slot.
 ## 8. Register it
 
 **Ids** are 1-32 lowercase letters, digits, `-` or `_`, starting with a letter.
-They may not be a built-in id (`claude`, `codex`, `grok`, `opencode`) or one of
+They may not be a built-in id (`claude`, `codex`, `grok`, `opencode`, `agy`) or one of
 hswap's own command or directory names: `harnesses capabilities list ls status
 doctor migrate config tui help version cache backups`. The entry-point name and
 the adapter's `id` must be the same string. Entry points that break these rules

@@ -32,6 +32,13 @@ elif args == ["auth", "switch", "--help"]:
     print("USAGE\n  opencode auth switch [flags] [<target>] [<credential>]")
 elif args == ["debug", "paths"]:
     print(f"data       /tmp/x\ndb         {db}")
+elif args == ["api", "experimental.usage.limits"]:
+    if sys.stdin.isatty():
+        print("stdin is a terminal", file=sys.stderr); sys.exit(9)
+    reply = json.load(open(os.environ["FAKE_OC_LIMITS"]))
+    print(reply["out"])
+    print(reply.get("err", ""), file=sys.stderr)
+    sys.exit(reply.get("code", 0))
 elif args[:2] == ["auth", "list"]:
     print(json.dumps([{"id": i, "name": i.title(), "connections": [
         {"type": "credential", "id": c["id"], "label": c["label"], "method": c["method"]} for c in creds]}
@@ -99,7 +106,10 @@ def test_native_mode_is_detected_by_probing_not_by_version(v2):
     caps = adapter.capabilities()
     assert caps[Capability.NATIVE_ACCOUNT_SWITCH].support is Support.SUPPORTED
     assert caps[Capability.PARALLEL_SESSIONS].support is Support.UNSUPPORTED
-    assert caps[Capability.USAGE_MONITORING].support is Support.UNSUPPORTED
+    usage = caps[Capability.USAGE_MONITORING]
+    assert usage.support is Support.UNAVAILABLE and "hswap config set usage.remote" in usage.reason
+    assert "quota interface" not in usage.reason
+    assert caps[Capability.AUTOMATIC_ROTATION].support is Support.UNAVAILABLE
 
 
 def test_listing_numbers_accounts_and_reads_active_flags(v2):
@@ -264,3 +274,267 @@ def test_a_failed_command_is_reported_in_one_readable_line():
     out = subprocess.CompletedProcess([], 1, stdout="", stderr=trace)
     assert _failure(out) == "Error: Managed service port 49374 on 127.0.0.1 is already in use by another process."
     assert _failure(subprocess.CompletedProcess([], 2, stdout="", stderr="")) == "exit status 2"
+
+
+# -- Go plan usage by asking OpenCode (usage.remote) -------------------------------------------------
+
+NOW_MS = 1_900_000_000_000
+
+
+@pytest.fixture
+def console(v2, monkeypatch):
+    """Two OpenCode Console logins (cred_c1 inactive, cred_c2 active) and usage.remote on."""
+    from harness_swap.core import settings
+
+    adapter, tmp = v2
+    state = json.loads((tmp / "state.json").read_text())
+    state["opencode"] = [
+        {"id": "cred_c1", "label": "team", "method": "oauth"},
+        {"id": "cred_c2", "label": "personal", "method": "oauth"},
+        {"id": "cred_k1", "label": "svc", "method": "key"},
+    ]
+    write_json(tmp / "state.json", state)
+    con = sqlite3.connect(tmp / "opencode.db")
+    con.executemany(
+        "INSERT INTO credential VALUES (?, ?, ?, ?, ?)",
+        [
+            ("cred_c1", "opencode", "team", "SECRET-C1", 0),
+            ("cred_c2", "opencode", "personal", "SECRET-C2", 1),
+            ("cred_k1", "opencode", "svc", "SECRET-K1", 0),
+        ],
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setenv("FAKE_OC_LIMITS", str(tmp / "limits.json"))
+    settings.set_value("usage.remote", "opencode")
+
+    def reply(out, code=0, err=""):
+        write_json(tmp / "limits.json", {"out": out if isinstance(out, str) else json.dumps(out), "code": code, "err": err})
+
+    accounts = {a.identity: a for a in adapter.list_accounts()}
+    return adapter, tmp, accounts, reply
+
+
+def _meter(percent, limited=False, resets=NOW_MS):
+    return {"percent": percent, "limited": limited, "resetsAt": resets}
+
+
+def _calls(tmp):
+    return (tmp / "calls.log").read_text().splitlines()
+
+
+def test_go_meters_become_windows_for_the_active_console_account(console):
+    adapter, tmp, accounts, reply = console
+    reply({"location": {}, "data": {"workspace": {"id": "wrk_1"}, "go": {
+        "rolling": _meter(12.5), "weekly": _meter(40), "monthly": _meter(55, resets=NOW_MS + 5000)}, "budgets": []}})
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert snap.state.value == "available" and snap.source == "opencode"
+    by = {w.name: w for w in snap.windows}
+    assert set(by) == {"5h", "weekly", "monthly"}
+    assert (by["5h"].used_percent, by["5h"].resets_at, by["5h"].window_seconds) == (12.5, NOW_MS / 1000, 18000)
+    assert by["weekly"].window_seconds == 604800 and by["monthly"].window_seconds is None
+    assert by["monthly"].resets_at == (NOW_MS + 5000) / 1000
+    assert snap.measured_at is not None
+    assert "api experimental.usage.limits" in _calls(tmp)
+
+
+def test_a_limited_or_full_meter_means_rate_limited(console):
+    adapter, _tmp, accounts, reply = console
+    reply({"data": {"go": {"rolling": _meter(100, True), "weekly": _meter(30), "monthly": _meter(20)}}})
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "rate_limited"
+    reply({"data": {"go": {"rolling": _meter(30), "weekly": _meter(30, limited=True), "monthly": _meter(20)}}})
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "rate_limited"
+
+
+def test_a_partial_go_answer_keeps_the_meters_it_has(console):
+    adapter, _tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(7), "monthly": "junk", "rolling": {"percent": "x"}}}})
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert [w.name for w in snap.windows] == ["weekly"]
+    reply({"data": {"go": {}}})
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "unknown"
+
+
+def test_null_data_is_unknown_and_a_workspace_without_go_is_unsupported(console):
+    adapter, _tmp, accounts, reply = console
+    reply({"location": {}, "data": None})
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert snap.state.value == "unknown" and snap.detail and not snap.windows
+    reply({"data": {"workspace": {"id": "wrk_1"}, "budgets": []}})
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "unsupported"
+
+
+def test_a_rejected_token_needs_authentication(console):
+    adapter, _tmp, accounts, reply = console
+    msg = {"_tag": "ServiceUnavailableError", "message": "OpenCode Console budgets are unavailable: GET ... 401 ...",
+           "service": "opencode"}
+    reply(msg, code=1)
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert snap.state.value == "authentication_required" and "auth login" in snap.detail
+    reply("", code=1, err="Error: request failed with status 401")
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "authentication_required"
+
+
+def test_a_stack_trace_line_number_is_not_a_401(console):
+    adapter, _tmp, accounts, reply = console
+    reply("", code=1, err="Error: port in use\n    at start (/$bunfs/root/opencode:401:17)")
+    with pytest.raises(Exception, match="exit status 1"):
+        adapter.read_usage(accounts["cred_c2"])
+
+
+def test_json_after_startup_chatter_is_still_parsed(console):
+    adapter, _tmp, accounts, reply = console
+    reply("service started\n" + json.dumps({"data": {"go": {"weekly": _meter(9)}}}))
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "available"
+
+
+def _set_value(tmp, identity, value):
+    con = sqlite3.connect(tmp / "opencode.db")
+    con.execute("UPDATE credential SET value = ? WHERE id = ?", (json.dumps(value), identity))
+    con.commit()
+    con.close()
+
+
+def test_a_login_about_to_refresh_is_not_asked(console):
+    import time
+
+    adapter, tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(9)}}})
+    _set_value(tmp, "cred_c2", {"access": "SECRET", "expires": int(time.time() * 1000) + 60_000})
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert snap.state.value == "stale" and "about to refresh" in snap.detail
+    assert "api experimental.usage.limits" not in _calls(tmp)
+    _set_value(tmp, "cred_c2", {"access": "SECRET", "expires": int(time.time() * 1000) + 3_600_000})
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "available"
+
+
+def test_a_switch_made_inside_opencode_during_the_read_discards_the_answer(console, monkeypatch):
+    adapter, tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(9)}}})
+    real = adapter._ask_limits
+
+    def ask_then_switch():
+        out = real()
+        con = sqlite3.connect(tmp / "opencode.db")
+        con.execute("UPDATE credential SET active = (id = 'cred_c1') WHERE integration_id = 'opencode'")
+        con.commit()
+        con.close()
+        return out
+
+    monkeypatch.setattr(adapter, "_ask_limits", ask_then_switch)
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert snap.state.value == "stale" and not snap.windows and "changed during the read" in snap.detail
+
+
+def test_other_failures_raise_without_echoing_the_output(console):
+    adapter, _tmp, accounts, reply = console
+    reply({"_tag": "ServiceUnavailableError", "message": "boom sk-SECRET-TOKEN-123"}, code=1)
+    with pytest.raises(Exception, match="ServiceUnavailableError") as exc:
+        adapter.read_usage(accounts["cred_c2"])
+    assert "SECRET" not in str(exc.value)
+    reply("not json at all", code=0)
+    with pytest.raises(Exception, match="exit status 0"):
+        adapter.read_usage(accounts["cred_c2"])
+    reply("", code=3)
+    with pytest.raises(Exception, match="exit status 3"):
+        adapter.read_usage(accounts["cred_c2"])
+
+
+def test_inactive_other_integration_and_key_accounts_are_not_measured(console):
+    adapter, tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(1)}}})
+    snap = adapter.read_usage(accounts["cred_c1"])
+    assert snap.state.value == "stale" and not snap.windows
+    assert "only while it is the active OpenCode Console account" in snap.detail
+    for ident in ("cred_a1", "cred_o1", "cred_k1"):
+        snap = adapter.read_usage(accounts[ident])
+        assert snap.state.value == "unsupported" and "Console logins" in snap.detail
+    assert "api experimental.usage.limits" not in _calls(tmp)
+
+
+def test_the_active_flag_is_read_fresh_so_a_switch_is_followed(console):
+    adapter, _tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(9)}}})
+    assert adapter.read_usage(accounts["cred_c1"]).state.value == "stale"
+    service.switch(adapter, "team", provider="opencode")
+    assert adapter.read_usage(accounts["cred_c1"]).state.value == "available"
+    assert adapter.read_usage(accounts["cred_c2"]).state.value == "stale"  # stale Account object, fresh answer
+
+
+def test_unreadable_database_means_no_measurement(console):
+    adapter, tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(9)}}})
+    (tmp / "opencode.db").unlink()
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert snap.state.value == "stale" and "cannot tell" in snap.detail
+
+
+def test_a_read_waits_out_a_switch_in_progress(console, monkeypatch):
+    from harness_swap.core.errors import LockError
+    from harness_swap.infrastructure import locking
+
+    adapter, _tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(9)}}})
+
+    def busy(self):
+        raise LockError("held")
+
+    monkeypatch.setattr(locking.FileLock, "__enter__", busy)
+    snap = adapter.read_usage(accounts["cred_c2"])
+    assert snap.state.value == "stale" and "switch is in progress" in snap.detail
+
+
+def test_a_hanging_usage_read_is_an_error_for_the_service(console, monkeypatch):
+    import subprocess
+
+    adapter, _tmp, accounts, _reply = console
+
+    def hang(*a, **k):
+        raise subprocess.TimeoutExpired(a[0], 60)
+
+    monkeypatch.setattr("harness_swap.adapters.opencode.spawn.run", hang)
+    with pytest.raises(Exception, match="did not finish"):
+        adapter.read_usage(accounts["cred_c2"])
+
+
+def test_the_usage_service_keeps_the_last_measurement_for_an_inactive_account(console, tmp_path):
+    from harness_swap.core.usage import UsageService
+
+    adapter, _tmp, accounts, reply = console
+    reply({"data": {"go": {"weekly": _meter(33)}}})
+    clock = {"t": 1000.0}
+    svc = UsageService(tmp_path / "cache", clock=lambda: clock["t"])
+    first = svc.get(adapter, accounts["cred_c2"])
+    assert first.state.value == "available"
+    service.switch(adapter, "team", provider="opencode")  # c2 is now inactive
+    clock["t"] += adapter.usage_policy.min_interval_s + 1
+    again = svc.get(adapter, accounts["cred_c2"])
+    assert again.state.value == "stale" and again.windows == first.windows
+    assert adapter.usage_policy.min_interval_s >= 120
+
+
+def test_usage_and_rotation_capabilities(console):
+    from harness_swap.core import settings
+
+    adapter, _tmp, _accounts, _reply = console
+    caps = adapter.capabilities()
+    usage, rotation = caps[Capability.USAGE_MONITORING], caps[Capability.AUTOMATIC_ROTATION]
+    assert usage.support is Support.EXPERIMENTAL and "experimental.usage.limits" in usage.reason
+    assert rotation.support is Support.EXPERIMENTAL
+    assert "circumvent usage limits" in rotation.reason and "https://opencode.ai/legal/terms-of-service" in rotation.reason
+    assert "only while they are active" in rotation.reason
+    settings.unset("usage.remote")
+    caps = adapter.capabilities()
+    assert caps[Capability.USAGE_MONITORING].support is Support.UNAVAILABLE
+    assert "enable with `hswap config set usage.remote <ids>`" in caps[Capability.USAGE_MONITORING].reason
+    assert caps[Capability.AUTOMATIC_ROTATION].support is Support.UNAVAILABLE
+    assert adapter.read_usage(_accounts["cred_c2"]).state.value == "unsupported"
+
+
+def test_legacy_and_missing_opencode_report_no_usage(tmp_path, monkeypatch):
+    _fake_version(tmp_path, monkeypatch, "1.4.2")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    caps = OpenCodeAdapter().capabilities()
+    assert caps[Capability.USAGE_MONITORING].support is Support.UNSUPPORTED
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    assert OpenCodeAdapter().capabilities()[Capability.USAGE_MONITORING].support is Support.UNAVAILABLE

@@ -54,3 +54,31 @@ def test_deadline_exit_and_missing_binary(server):
         rpc.request("quit")
     with pytest.raises(jsonrpc.RpcError, match="could not start"), jsonrpc.session(["/nonexistent/harness"], {}, timeout=1):
         pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups")
+def test_helpers_started_by_the_harness_are_stopped(tmp_path):
+    marker = tmp_path / "helper.pid"
+    server = tmp_path / "server.py"
+    server.write_text(
+        "import json, subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(marker)!r}, 'w').write(str(p.pid))\n"
+        "for line in sys.stdin:\n"
+        "    msg = json.loads(line)\n"
+        "    print(json.dumps({'id': msg['id'], 'result': 1}), flush=True)\n"
+    )
+    with jsonrpc.session([sys.executable, str(server)], dict(os.environ), timeout=10) as rpc:
+        assert rpc.request("ping") == 1
+    pid = int(marker.read_text())
+    import time
+
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the harness's helper outlived the session")

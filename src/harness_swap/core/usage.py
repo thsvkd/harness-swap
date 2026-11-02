@@ -59,39 +59,69 @@ class UsageService:
             return {}
         return data if isinstance(data, dict) else {}
 
+    #: How long a claimed measurement may take before another process may retry it.
+    CLAIM_S = 300.0
+
+    def _lock(self) -> FileLock:
+        mkdir_private(self.cache_dir)
+        return FileLock(self.cache_dir / ".usage.lock", timeout=30.0)
+
+    def _entry(self, cache: dict, key: str) -> tuple[dict, UsageSnapshot | None]:
+        entry = cache.get(key)
+        entry = entry if isinstance(entry, dict) else {}
+        try:
+            return entry, (_from_cache(entry["snapshot"]) if "snapshot" in entry else None)
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return {}, None  # written by another hswap version: start over
+
     def get(self, reader: UsageReader, account: Account) -> UsageSnapshot:
+        """The account's usage, measuring it when the policy allows.
+
+        The cache lock is held only to decide and to record, never while the
+        adapter measures (asking a harness can take a minute): the measurement
+        is *claimed* in the cache first, so a concurrent process serves the last
+        numbers instead of starting a second measurement.
+        """
         policy = reader.usage_policy
         now = self.clock()
-        mkdir_private(self.cache_dir)
-        with FileLock(self.cache_dir / ".usage.lock", timeout=30.0):
+        with self._lock():
             cache = self._load()
-            entry = cache.get(account.key)
-            entry = entry if isinstance(entry, dict) else {}
-            try:
-                last = _from_cache(entry["snapshot"]) if "snapshot" in entry else None
-            except (TypeError, ValueError, KeyError, AttributeError):
-                entry, last = {}, None  # written by another hswap version: start over
+            entry, last = self._entry(cache, account.key)
             failures = entry.get("failures", 0)
             if failures and now < entry.get("retry_at", 0.0):
                 return self._failed(last, entry.get("error", "usage read failed"))
             if not failures and last is not None and now < entry.get("fetched_at", 0.0) + policy.min_interval_s:
                 return self._aged(last, policy.stale_after_s, now)
-            try:
-                snap = reader.read_usage(account)
-                if snap.state is UsageState.STALE and not snap.windows and last is not None:
-                    # The adapter cannot measure right now (e.g. the account is
-                    # not the active one): keep serving the last measurement.
-                    return dataclasses.replace(last, state=UsageState.STALE, detail=snap.detail)
-                entry = {"snapshot": _to_cache(snap), "fetched_at": now, "failures": 0}
-            except Exception as exc:  # noqa: BLE001 - any adapter failure becomes an error snapshot
-                failures += 1
-                error = f"{type(exc).__name__}: {exc}"
+            if now < entry.get("claimed_until", 0.0):
+                if last is None:
+                    return UsageSnapshot(UsageState.UNKNOWN, detail="being measured by another hswap process")
+                return self._aged(last, policy.stale_after_s, now)
+            cache[account.key] = {**entry, "claimed_until": now + self.CLAIM_S}
+            atomic_write_text(self._path(), json.dumps(cache, indent=1))
+        try:
+            snap = reader.read_usage(account)
+            keep_last = snap.state is UsageState.STALE and not snap.windows and last is not None
+            error = None
+        except Exception as exc:  # noqa: BLE001 - any adapter failure becomes an error snapshot
+            snap, keep_last, error = None, False, f"{type(exc).__name__}: {exc}"
+        with self._lock():
+            cache = self._load()
+            entry, last = self._entry(cache, account.key)
+            entry.pop("claimed_until", None)
+            if keep_last and last is not None:
+                # The adapter cannot measure right now (e.g. the account is not
+                # the active one): keep serving the last measurement.
+                snap = dataclasses.replace(last, state=UsageState.STALE, detail=snap.detail)  # type: ignore[union-attr]
+            elif error is not None:
+                failures = entry.get("failures", 0) + 1
                 delay = min(policy.min_interval_s * 2**failures, policy.max_backoff_s)
                 entry = {**entry, "failures": failures, "retry_at": now + delay, "error": error}
                 snap = self._failed(last, error)
+            else:
+                entry = {"snapshot": _to_cache(snap), "fetched_at": now, "failures": 0}  # type: ignore[arg-type]
             cache[account.key] = entry
             atomic_write_text(self._path(), json.dumps(cache, indent=1))
-        return self._aged(snap, policy.stale_after_s, now)
+        return self._aged(snap, policy.stale_after_s, now)  # type: ignore[arg-type]
 
     def peek(self, reader: UsageReader, account: Account) -> UsageSnapshot:
         """The cached measurement only: no adapter call, no network, no token

@@ -21,8 +21,10 @@ from harness_swap.core import autorotate, settings
 from harness_swap.core.adapter import (
     Diagnosable,
     HarnessAdapter,
+    KeepAlive,
     Migrator,
     NativeCommandLine,
+    require,
 )
 from harness_swap.core.errors import CredentialConflict, HswapError
 from harness_swap.core.models import Capability, Support
@@ -96,6 +98,10 @@ def _harness_parser(adapter: HarnessAdapter) -> argparse.ArgumentParser:
     sp.add_argument("account", nargs="?", metavar="SLOT|ALIAS|EMAIL")
     sp.add_argument("--json", action="store_true")
     sp.add_argument("--cached", action="store_true", help="last measured usage only: no network, no token refresh")
+    provider(sp)
+    sp = cmd("refresh", "keep stored logins alive: let the harness refresh tokens that are due (for cron)")
+    sp.add_argument("account", nargs="?", metavar="SLOT|ALIAS|EMAIL")
+    sp.add_argument("--json", action="store_true")
     provider(sp)
     sp = cmd("auto", "switch automatically when the active account nears its limit (opt-in: auto.enabled)")
     sp.add_argument("--once", action="store_true", help="one decision, then exit (for cron)")
@@ -236,6 +242,8 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
         print(f"slot {acc.slot}: alias {acc.alias or '(none)'}")
     elif verb == "auto":
         return _auto(adapter, args)
+    elif verb == "refresh":
+        return _refresh(adapter, args)
     elif verb == "capabilities":
         return _print_capabilities([adapter], as_json)
     return 0
@@ -262,6 +270,27 @@ def _auto(adapter: HarnessAdapter, args) -> int:
         if args.once:
             return 0
         time.sleep(max(args.interval, 30.0))
+
+
+def _refresh(adapter: HarnessAdapter, args) -> int:
+    keeper = require(adapter, Capability.CREDENTIAL_REFRESH, KeepAlive)
+    accounts = adapter.list_accounts()
+    if args.account:
+        accounts = [service.resolve(accounts, args.account, args.provider)]
+    rows, failed = [], False
+    for acc in accounts:
+        try:
+            rows.append({"account": acc.to_json(), "ok": True, "result": keeper.keep_alive(acc)})
+        except Exception as exc:  # noqa: BLE001 - one account must not stop the others
+            failed = True
+            rows.append({"account": acc.to_json(), "ok": False, "result": _describe(exc)})
+    if args.json:
+        output.emit_json({"harness": adapter.id, "accounts": rows})
+    else:
+        for row in rows:
+            a = row["account"]
+            print(f"{adapter.display_name} {a['slot']} {a['label']}: {row['result']}")
+    return 1 if failed else 0
 
 
 def _harness_json(adapter, accounts, usage) -> dict:
@@ -543,7 +572,7 @@ Across harnesses:
   hswap tui                    dashboard (also: bare hswap in a terminal)
 
 Per harness ({harnesses}):
-  hswap <harness> list | status | add [--login] | remove | switch | run | usage | auto | alias | capabilities
+  hswap <harness> list | status | add [--login] | remove | switch | run | usage | refresh | auto | alias | capabilities
   Harnesses with a richer command set of their own take it here instead
   (see `hswap <harness> help`).
 """

@@ -12,7 +12,9 @@ scrubbed of anything credential-shaped.
 from __future__ import annotations
 
 import json
+import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -101,22 +103,42 @@ def session(
             text=True,
             encoding="utf-8",
             errors="replace",
+            # Its own process group, so helpers it starts (MCP servers, ...) end with it.
+            start_new_session=os.name == "posix",
         )
     except OSError as exc:
         raise RpcError(f"could not start {argv[0]}: {exc}") from None
     try:
         yield _Session(proc, time.monotonic() + timeout, version_tag)
     finally:
-        try:
-            proc.stdin.close()  # type: ignore[union-attr]
-        except OSError:
-            pass
+        _stop(proc)
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, sig)
+        elif sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    """Close stdin, give the harness a moment to exit, then end its whole group."""
+    try:
+        proc.stdin.close()  # type: ignore[union-attr]
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        _signal_group(proc, signal.SIGTERM)
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            _signal_group(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+            proc.wait()
+    _signal_group(proc, signal.SIGTERM)  # helpers the harness left behind

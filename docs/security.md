@@ -104,14 +104,52 @@ package installed into hswap's environment can already run code when Python
 starts (for example through a `.pth` file). Install only plugins you would
 trust with your logins.
 
+## Usage reads
+
+hswap never refreshes a token or calls a provider's API itself (Claude's
+claude-swap engine keeps its own behaviour). With `usage.remote` on, it starts the
+*harness* and asks it (Codex `app-server`, Grok's ACP agent, OpenCode's `api`
+command, `agy -p /usage`): the harness refreshes its own tokens and stores them
+where it always does.
+
+- An inactive account is asked in its own account directory
+  (`FileCredentialAdapter.usage_home`) with that home's session lock held, so no
+  other process holds the same rotating refresh token. If a running session owns
+  the account it is not asked; the last measurement is shown as `stale`.
+- The active account is asked in the default home only when its access token has
+  more than 10 minutes left (Codex: JWT `exp`, else `last_refresh`; Grok: the
+  earlier of `expires_at` and JWT `exp`; agy: `token.expiry`). If the expiry is
+  unreadable it is not asked.
+- The child gets no shell and no terminal; error text from it is scrubbed and
+  agy output is never echoed. `list --cached` and `usage --cached` start nothing.
+- Limits: a Codex that refreshes after a 401 while hswap is asking cannot be
+  detected, OpenCode's active flag and refresh happen inside its own service, and
+  every live read is verified only against fake harnesses and real binaries
+  without accounts (see [testing.md](testing.md)).
+
 ## Rate limits and provider terms
 
-hswap shows usage and lets you switch accounts. It does not rotate accounts
-automatically for harnesses whose providers offer no documented quota interface
-(Codex, Grok, OpenCode). `hswap claude auto` is the claude-swap feature,
-unchanged. Make sure your use of multiple accounts complies with each
-provider's terms; hswap is not a tool for getting around rate limits or
-protective controls.
+Automatic switching is opt-in per harness (`hswap config set auto.enabled <ids>`,
+then `hswap <harness> auto`), needs live usage, is experimental everywhere, never
+acts on missing or stale data and waits `auto.cooldown` between switches. It may
+breach a provider's terms; you are responsible. What each says, and where
+`hswap capabilities` quotes it:
+
+- Google Antigravity: Additional Terms section 6 prohibits "Using third party
+  software, tools, or services to access the Service" and says such actions "may
+  be grounds for suspension or termination" of Antigravity and/or Gemini CLI
+  accounts; suspensions were reported in 2026. Strongest warning.
+- OpenAI (Codex): the Terms of Use (2024-12-11 text) forbid using the services
+  to "circumvent any rate limits or restrictions"; whether switching between your
+  own accounts counts is not stated.
+- xAI (Grok): the Acceptable Use Policy prohibits "circumventing any rate limits
+  or restrictions" and access through "unauthorized automated or non-human
+  means"; nothing on several genuine accounts.
+- OpenCode: the Terms of Service forbid using multiple accounts "to circumvent
+  usage limits, access restrictions, billing obligations".
+- Anthropic: `hswap claude auto` is the claude-swap feature, unchanged.
+
+hswap is not a tool for getting around rate limits or protective controls.
 
 ## Known limits
 

@@ -175,6 +175,25 @@ class CountingReader:
 
 
 class TestUsageService:
+    def test_a_slow_measurement_does_not_hold_the_cache_lock(self, tmp_path):
+        """While one process asks a slow harness, another serves the last numbers at once."""
+        clock = [1000.0]
+        svc = UsageService(tmp_path, lambda: clock[0])
+        svc.get(CountingReader(snap(10)), acct(1))
+        clock[0] += 61
+        seen = {}
+
+        class Slow(CountingReader):
+            def read_usage(self, account):
+                other = UsageService(tmp_path, lambda: clock[0])  # a second process meanwhile
+                seen["other"] = other.get(CountingReader(snap(99)), account)
+                return snap(20)
+
+        assert svc.get(Slow(None), acct(1)).windows[0].used_percent == 20
+        assert seen["other"].windows[0].used_percent == 10  # the last measurement, no second read
+        clock[0] += 61
+        assert svc.get(CountingReader(snap(30)), acct(1)).windows[0].used_percent == 30  # claim released
+
     def test_min_interval_is_respected_across_instances(self, tmp_path):
         clock = [1000.0]
         reader = CountingReader(snap(10))

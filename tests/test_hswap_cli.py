@@ -407,3 +407,31 @@ def test_doctor_reports_a_corrupt_store_once(homes, capsys):
     (tmp / "hswap" / "codex" / "accounts.json").write_text("{broken")
     code, out, _ = run(reg, capsys, "doctor")
     assert code == 1 and out.count("accounts.json is not valid JSON") == 1
+
+
+def test_refresh_reports_each_account_and_fails_on_any_failure(native, capsys):
+    from harness_swap.core.models import Capability
+
+    class Keeper(Native):
+        id = "keep"
+        run_cli = None
+
+        def capabilities(self):
+            return {Capability.ACCOUNT_LIST: supported(), Capability.CREDENTIAL_REFRESH: supported()}
+
+        def list_accounts(self):
+            return [Account("keep", "i1", "a@x", "p", 1), Account("keep", "i2", "b@x", "p", 2)]
+
+        def keep_alive(self, account):
+            if account.slot == 2:
+                raise RuntimeError("sign in again")
+            return "token is fresh"
+
+    reg, _ = native
+    reg.register("keep", Keeper)
+    code, out, _ = run(reg, capsys, "keep", "refresh")
+    assert code == 1 and "1 a@x: token is fresh" in out and "2 b@x: RuntimeError: sign in again" in out
+    code, out, _ = run(reg, capsys, "keep", "refresh", "1", "--json")
+    assert code == 0 and json.loads(out)["accounts"][0]["result"] == "token is fresh"
+    code, _, _ = run(reg, capsys, "nat", "list")  # Native has its own command line: untouched
+    assert code == 7

@@ -11,3 +11,9 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# oh-my-claudecode session state (local operational artifacts)
+.omc/

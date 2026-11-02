@@ -31,8 +31,12 @@ hswap's tests or copied.
 ² `experimental` on a Codex without `--no-daemon`.
 ³ `experimental` on macOS (Keychain cache).
 ⁴ opt-in (`usage.remote`), otherwise `unavailable` with that hint (Codex keeps its
-passive log reading, also experimental). Read by asking the harness; only ever
-checked against fake harnesses and the real binaries without accounts.
+passive log reading, also experimental). Read by asking the harness. The active
+login's answer was read once with real paid accounts (2026-11-03): Codex 0.166.0
+(`prolite`, one 7-day window), Grok 1.0.70 (SuperGrok, weekly period sent as
+`USAGE_PERIOD_TYPE_WEEKLY`), agy 1.4.8 (two weekly buckets), OpenCode 2.2.5 (Go
+5-hour, weekly, monthly; one transient `ServiceUnavailableError` among four reads).
+Inactive accounts are verified against fake harnesses only.
 ⁵ `unavailable` unless the login is file-backed (see Antigravity below); `add --login` is unavailable.
 ⁶ opt-in (`auto.enabled`) and only when usage is usable; the reason quotes the provider's terms.
 ⁷ `hswap <id> refresh` (no opt-in) asks the harness in each account's own home, so

@@ -122,8 +122,10 @@ def snapshot_from_billing(result: object, plan: str | None, now: float) -> Usage
     percent = cfg.get("creditUsagePercent")
     if not isinstance(percent, int | float) or isinstance(percent, bool):
         return UsageSnapshot(UsageState.UNKNOWN, detail="Grok reported no included-credit usage", **common)
+    # Grok 1.0.70 sends the protobuf enum name ("USAGE_PERIOD_TYPE_WEEKLY"); show "weekly".
+    kind = str(period.get("type") or "period").removeprefix("USAGE_PERIOD_TYPE_").lower()
     window = QuotaWindow(
-        name=str(period.get("type") or "period"),
+        name=kind,
         used_percent=float(percent),
         resets_at=end,
         window_seconds=int(end - start) if start is not None and end is not None and end > start else None,

@@ -75,7 +75,7 @@ covered by the tests above, except these, which remain known limits:
 These pass against fakes and synthetic files, not against a live service:
 
 - **keep-alive (`refresh`)**: fake harnesses only; whether a real Codex/Grok writes the rotated token as assumed, and agy's `/usage` as a login use, were not seen with a live account;
-- **every live usage read** (Codex `account/rateLimits/read`, Grok `_x.ai/billing`, OpenCode `api experimental.usage.limits`, `agy -p /usage`) and everything built on it, including automatic switching: verified only against fake harnesses that speak the protocol, plus the real binaries in a sandbox with no account (which showed only the signed-out replies and, for OpenCode, `data: null`). No logged-in answer has been seen;
+- **live usage reads for inactive accounts** (in an account's own home) and everything built on usage, including automatic switching: verified only against fake harnesses that speak the protocol, plus the real binaries in a sandbox with no account. The **active** login's answer from each real harness (Codex `account/rateLimits/read`, Grok `_x.ai/billing`, OpenCode `api experimental.usage.limits`, `agy -p /usage`) was read once with real paid accounts on 2026-11-03 (read-only, tokens with more than 10 minutes left, nothing written to hswap's store) and mapped correctly, which also showed Grok's period type is an enum name (`USAGE_PERIOD_TYPE_WEEKLY`, now normalised);
 - Antigravity as a whole: the real `agy` 1.4.8 was run with a synthetic token and a dead or fake endpoint only;
 
 - every switch/add/remove against real Codex, Grok and OpenCode logins (the

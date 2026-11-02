@@ -292,7 +292,7 @@ def test_stored_copy_is_not_used_while_the_live_file_is_unreadable(remote):
 @posix_only
 def test_remote_usage_states(remote):
     _adapter, _home, ask, _calls = remote
-    limited = ask(1, billing_reply(percent=100, period="monthly"))
+    limited = ask(1, billing_reply(percent=100, period="USAGE_PERIOD_TYPE_MONTHLY"))  # as Grok 1.0.70 sends it
     assert limited.state is UsageState.RATE_LIMITED and limited.windows[0].name == "monthly"
     auth = ask(1, {"error": {"code": -32000, "message": "Authentication required", "data": "Authentication required to fetch billing data"}})
     assert auth.state is UsageState.AUTHENTICATION_REQUIRED

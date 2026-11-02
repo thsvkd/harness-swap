@@ -22,9 +22,10 @@ harness can implement.
 ³ opt-in: `hswap config set usage.remote <ids>`. hswap asks the harness itself
 (Codex `app-server`, Grok's ACP agent, OpenCode `api experimental.usage.limits`,
 `agy -p /usage`) and never calls a provider API or refreshes a token. Without the
-opt-in Codex still shows the last snapshot it logged locally. Verified against
-fake harnesses and the real binaries without accounts only, never a live paid
-account. OpenCode reports Go-plan limits only for OpenCode Console logins, not
+opt-in Codex still shows the last snapshot it logged locally. Each harness's
+answer for a real, active paid login was read once (2026-11-03, read-only) and
+mapped correctly; inactive-account reads, keep-alive and automatic switching are
+verified against fake harnesses only. OpenCode reports Go-plan limits only for OpenCode Console logins, not
 API keys. Turning the opt-in on or off takes effect on the next read.
 `list --cached` / `usage --cached` read the cache: no usage read, no token
 refresh (hswap still runs each harness's version probe, and OpenCode's

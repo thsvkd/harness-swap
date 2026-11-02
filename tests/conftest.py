@@ -17,6 +17,7 @@ import pytest
 
 from claude_swap import macos_keychain as _macos_keychain
 from claude_swap import paths as _paths
+from harness_swap.core import paths as _hswap_paths
 
 
 class RealStoreWriteBlocked(Exception):
@@ -146,6 +147,13 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             # directory exists, so not one mkdir is attempted above them.
             (_paths.get_default_claude_config_home() / "projects", True),
             (_paths.get_claude_config_home() / "projects", True),
+            # hswap: its own store (all of it), and the live credential files
+            # of the other harnesses it manages (direct children only: these
+            # homes also hold the harnesses' own sessions and caches).
+            (_hswap_paths.hswap_home(), True),
+            (Path.home() / ".codex", False),
+            (Path.home() / ".grok", False),
+            (Path.home() / ".local" / "share" / "opencode", False),
         )
 
     ambient_specs = _resolve()
@@ -517,6 +525,10 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    # hswap and the harnesses it manages: every location must resolve under
+    # the isolated $HOME unless a test sets it explicitly.
+    for name in ("HSWAP_HOME", "HSWAP_TRUSTED_PLUGINS", "CODEX_HOME", "GROK_HOME"):
+        monkeypatch.delenv(name, raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
     if "tmp_keychain" in request.fixturenames:

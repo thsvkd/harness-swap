@@ -1,7 +1,9 @@
 """Custom exceptions for Claude Switch."""
 
+from harness_swap.core import errors as _core
 
-class ClaudeSwitchError(Exception):
+
+class ClaudeSwitchError(_core.HswapError):
     """Base exception for Claude Switch errors."""
 
     pass
@@ -43,7 +45,7 @@ class SessionError(ClaudeSwitchError):
     pass
 
 
-class LockError(ClaudeSwitchError):
+class LockError(ClaudeSwitchError, _core.LockError):
     """Error acquiring lock."""
 
     pass

@@ -35,6 +35,12 @@ from claude_swap.settings import (
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
+#: Set by a host that embeds this CLI (hswap sets "hswap claude"). Renames the
+#: program in help/usage and turns off the claude-swap self-upgrade and PyPI
+#: update notice, which would otherwise point at the upstream package.
+EMBEDDED_PROG: str | None = None
+
+
 def _prog_name() -> str:
     """The command name to show in usage/help.
 
@@ -44,6 +50,8 @@ def _prog_name() -> str:
     bare command the user typed (``cswap`` / ``claude-swap``), falling back to
     ``cswap`` for ``python -m claude_swap`` and odd launchers.
     """
+    if EMBEDDED_PROG:
+        return EMBEDDED_PROG
     name = os.path.basename(sys.argv[0] or "")
     for ext in (".exe", ".pyw", ".py"):
         if name.lower().endswith(ext):
@@ -1594,6 +1602,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     # Self-upgrade runs before switcher init so we don't touch config/keychain
     # just to upgrade the tool itself.
+    if args.upgrade and EMBEDDED_PROG:
+        error(
+            "Upgrade harness-swap with the tool that installed it "
+            "(e.g. `uv tool upgrade harness-swap` or `pipx upgrade harness-swap`)."
+        )
+        sys.exit(1)
     if args.upgrade:
         from claude_swap.update_check import run_self_upgrade
 
@@ -1728,6 +1742,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         not args.purge
         and not args.upgrade
         and not args.json
+        and not EMBEDDED_PROG
         and load_update_settings(paths.get_backup_root()).check
     ):
         from claude_swap.update_check import check_for_update

@@ -3,6 +3,8 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  # Re-run a release's upload by hand (e.g. after configuring PyPI trusted publishing).
+  workflow_dispatch:
 
 jobs:
   publish:

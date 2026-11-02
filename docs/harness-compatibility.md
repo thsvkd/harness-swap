@@ -109,7 +109,8 @@ leader mode was not tested). Usage monitoring is reported unsupported.
 | 2.x stores credentials in its SQLite DB (`opencode debug paths` → `db`); do not edit it | verified | dev.opencode.ai/v2/docs/cli/providers |
 | several saved accounts per integration; `auth list --format json`, `auth switch <integration> <label-or-id>`, `auth login`, `auth logout` | verified | docs; `--help` 2.2.5 |
 | `auth list --format json` → `[{id, name, connections:[{type, id, label, method}]}]`, no active flag in 2.2.5 | verified locally | 2.2.5 output |
-| `credential(id, integration_id, active, ...)` table; `active` 1/0 per integration, NULL for a lone account | experimental | read-only inspection of 2.2.5; used only to display `active` |
+| `credential(id, integration_id, active, ...)` table; `active` 1/0 per integration; a lone account has been seen both as 1 (fresh 2.2.5 store) and NULL | experimental | read-only inspection of 2.2.5; used only to display `active` (a lone NULL is shown as active) |
+| every `opencode auth` command needs OpenCode's managed background service: it starts one (≈335 MB resident on aarch64) if none runs, and fails if its port (default 49374) is taken by another OpenCode home's service | verified locally | 2.2.5; `opencode service set port <port>` moves it |
 | legacy `~/.local/share/opencode/auth.json` (`{provider: {type, ...}}`) | verified (1.x docs) | opencode.ai/docs/providers; imported once by 2.x, not written back |
 | release that introduced `auth switch` | unknown | hswap probes `opencode auth switch --help` instead of trusting a version number |
 | running sessions pick up a switch? | unknown | not documented |
@@ -117,7 +118,10 @@ leader mode was not tested). Usage monitoring is reported unsupported.
 What hswap does: native mode whenever `auth switch` exists; it numbers saved
 accounts and keeps aliases in its own store, never reads secret columns, and
 opens the DB read-only (`mode=ro`) only to show which account is active
-(`active: unknown` if that fails). Legacy mode for 1.x snapshots and swaps one
+(`active: unknown` if that fails). Because it calls `opencode auth list`, even a
+read-only `hswap list`, `hswap status` or the dashboard starts OpenCode's
+background service when it is not running. hswap's own concurrent switches are
+serialised; switches made by OpenCode itself at the same moment are not. Legacy mode for 1.x snapshots and swaps one
 provider entry at a time (experimental; verified with synthetic files only).
 Any other version is refused with an explanation. No isolated sessions and no
 usage (no quota interface; `opencode stats` is local statistics).

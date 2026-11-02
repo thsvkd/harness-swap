@@ -20,6 +20,11 @@ follows, where they are enforced, and how they are tested.
   that no token reaches stdout or stderr.
 - hswap logs nothing about credentials. The Claude engine keeps its own
   logging rules (unchanged).
+- One deliberate exception: `hswap claude export -` writes the exported
+  accounts, tokens included, to stdout, and `hswap claude export <file>` to a
+  0600 file (replacing an existing one). That is the claude-swap export
+  format, plaintext by design (see [claude.md](claude.md)); treat its output
+  like the credentials it contains.
 
 ## Credential files
 
@@ -40,8 +45,9 @@ For every file-backed harness (`core/credentials.py`):
    before anything is overwritten, so a token the harness rotated since the
    last switch is kept.
 2. **Unmanaged logins are refused.** If the login being replaced is not one
-   hswap stores, the switch stops with a message. `--force` continues only
-   after stashing the original file (0600) under `<harness>/stash/`.
+   hswap stores (or the live file is empty or not valid JSON), the switch stops
+   with a message. `--force` continues only after stashing the original file
+   (0600) under `<harness>/stash/`, and prints where.
 3. **Nothing unrelated changes.** Entries of other providers in the same file
    (OpenCode 1.x) and non-credential keys are carried over unchanged. Grok is
    the exception by design: Grok itself picks between several login scopes, so
@@ -57,7 +63,9 @@ For every file-backed harness (`core/credentials.py`):
    account running in an isolated session cannot be activated globally (or
    removed) until that session exits; the check and the session start both
    happen under the store lock, and sync-back skips that account's snapshot,
-   which the session keeps fresher. Claude's `run` follows the claude-swap rules.
+   which the session keeps fresher. A `run` on the account that already is the
+   default login uses the default home and locks it, so no switch or remove can
+   change the login under it. Claude's `run` follows the claude-swap rules.
 
 `add --login` signs a new account in inside a throwaway harness home, so the
 current login is never replaced or logged out (which could revoke its refresh
@@ -76,10 +84,25 @@ that talk to the same provider never share a stored login.
 
 ## Plugins
 
-Third-party adapters run with access to your credentials, so installing one is
-not enough: its entry point is listed but not imported until you trust its id
-(`hswap config set plugins.trusted <id>` or `HSWAP_TRUSTED_PLUGINS`). A plugin
-cannot replace a built-in adapter id.
+Third-party adapters run with access to your credentials, so an installed
+plugin is listed but not imported until you trust it, and trust names the
+package as well as the id: `hswap config set plugins.trusted <id>@<distribution>`
+(or `HSWAP_TRUSTED_PLUGINS`). `hswap harnesses` prints that command, shell-safe.
+
+- A package that declares an id you trusted for a *different* package is not
+  trusted; trusted entries with no installed package are reported by
+  `hswap doctor` and `hswap harnesses`.
+- An id declared by two installed packages is loaded from neither.
+- Ids are validated (lowercase, path-safe, not an hswap command or data
+  directory); a plugin cannot replace a built-in id. Ignored entry points are
+  reported, not silently dropped.
+- A plugin that fails to load, raises, or exits is reported as an error for
+  its own id; the other harnesses keep working.
+
+This gate controls which adapters hswap *uses*. It is not a sandbox: any
+package installed into hswap's environment can already run code when Python
+starts (for example through a `.pth` file). Install only plugins you would
+trust with your logins.
 
 ## Rate limits and provider terms
 

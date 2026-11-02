@@ -19,7 +19,8 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 | OpenCode adapter | `test_hswap_opencode.py` | V2 emulator over a real SQLite file: probe-based mode, listing + active flags, native switch/login/logout, DB never written and secret column never selected; unknown version refused; legacy provider swap |
 | Claude adapter | `test_hswap_claude_adapter.py` | schema-v1 → core usage mapping, engine embedding (prog name, argv restore, upgrade refused), legacy-store migration gate (no engine path bypasses it) + backup |
 | CLI and dashboard | `test_hswap_cli.py` | native passthrough, errors and JSON envelopes, confirmations, failed switch keeps login, config, **no credential in any output**, Textual pilot test of the dashboard |
-| Extensibility acceptance | `test_hswap_contract.py` | the example adapter registered at runtime and as a trusted/untrusted entry-point plugin, driven through CLI, services and dashboard; static check that shared code names no harness and imports no adapter |
+| Extensibility acceptance | `test_hswap_contract.py` | the example adapter registered at runtime and as a trusted/untrusted entry-point plugin, driven through CLI, services and dashboard; snapshot-name rule; static check that shared code names no harness and imports no adapter |
+| Plugin trust and isolation | `test_hswap_core.py`, `test_hswap_cli.py` | trust bound to the distribution, duplicate/invalid/reserved ids, a plugin that raises or exits, every cross-harness command (and `--json`) surviving a broken adapter |
 
 ## Isolation rules
 
@@ -34,6 +35,34 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 - Credentials are synthetic (`tests/hswap_helpers.py` builds unsigned JWTs);
   harness binaries are faked with small Python scripts on `PATH` (POSIX only)
   or by setting `adapter._installation`.
+
+## User acceptance runs
+
+Before release, four agents used an installed hswap the way people would
+(a newcomer on Codex and Grok, a claude-swap user migrating, a multi-terminal
+OpenCode/Codex user scripting `--json`, and a plugin author following
+[adapter-development.md](adapter-development.md) for a fifth harness), each in a
+bubblewrap sandbox: a private `$HOME` and `/tmp`, a clean environment, the real
+home hidden except the harness binaries (read-only), and synthetic logins only.
+The real Claude Code, Codex, Grok, OpenCode and upstream cswap binaries were
+exercised, never with a real account. The defects they found are fixed and
+covered by the tests above, except these, which remain known limits:
+
+- restart notices count every running process of the harness on the machine
+  (hswap cannot tell which home each one uses);
+- OpenCode: an account removed with `opencode auth logout` loses its hswap
+  alias and slot; removing the active account does not say which one OpenCode
+  activated instead; switches OpenCode makes itself are not serialised with
+  hswap's;
+- `add`, `remove` and `alias` have no `--json`; the dashboard refreshes on `r`
+  only;
+- accounts with the same email in two workspaces look alike in `list`
+  (use the slot number); `status` does not name a login hswap does not store;
+  `add` names only the logins that were new when one file holds several;
+- the dashboard cuts long rows (Left/Right scrolls) and has no detail view;
+  a slow harness (e.g. OpenCode starting its service) delays only its own rows;
+- a usage reading of "unknown" is cached like any other for the adapter's
+  minimum interval (30 s for Codex).
 
 ## What is mock-only
 

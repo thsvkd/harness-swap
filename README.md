@@ -72,6 +72,10 @@ hswap codex switch --strategy best    # one-off: the account with the most headr
 hswap codex run personal -- resume    # isolated per-account CODEX_HOME, this terminal only
 ```
 
+`run` on the account that is already the default login runs in the default
+`CODEX_HOME` (a second copy of the token would mean two refreshers); hswap still
+holds a session lock there, so `switch` and `remove` wait until it exits.
+
 ### Grok Build
 
 ```bash
@@ -120,22 +124,41 @@ claude`, ...) work for Claude too.
 `ACCOUNT` is a slot number, an alias, or an email/label. Unsupported operations
 fail with the reason (`hswap capabilities` lists them all). Every `--json`
 payload carries `schemaVersion: 1`; Claude's own `--json` keeps claude-swap's
-schema.
+schema. Cross-harness commands (`list`, `status`, `capabilities`, `doctor`,
+`harnesses`) still show every harness that works when one fails, report the
+failure (`errors` in JSON), and exit 1.
+
+- `remove` forgets the stored login. The account's isolated-session history
+  stays in `<hswap home>/<harness>/accounts/<slot>/`; delete that directory to
+  discard it.
+- `switch --force` saves the login it replaces to
+  `<hswap home>/<harness>/stash/<file>.<timestamp>` (0600) and prints the path.
+  To get it back, copy it over the harness's login file (e.g.
+  `$CODEX_HOME/auth.json`) and `hswap <harness> add` it.
+- `rotation.threshold` (default 95%) is the cut-off for `switch --strategy` on
+  the generic harnesses. Claude's auto-switch has its own settings
+  (`hswap claude config`, default `autoswitch.threshold` 90%, per-account
+  `hswap claude threshold`).
 
 ## How it stays safe
 
 - Credentials never appear in output: core models carry no secrets, and hswap
-  refuses to print JSON that looks like it contains a token.
+  refuses to print JSON that looks like it contains a token. The one exception
+  is the explicit, plaintext `hswap claude export -`.
 - Before overwriting a login hswap copies the harness's freshly rotated tokens
   back into the stored account, refuses to overwrite a login it does not manage
   (`--force` stashes it first, 0600), leaves other providers' entries alone
   (Grok: the target becomes the only login scope, the others are saved first),
   writes atomically at 0600 under hswap's lock and the harness's own lock, re-reads
   the result and restores the original on any failure.
-- For Codex and Grok, an account running in an isolated session cannot be
+- For Codex and Grok, an account running in a `run` session cannot be
   activated globally (or removed) until that session exits — two processes
-  would rotate one refresh token. Claude's `run` keeps the claude-swap rules
+  would rotate one refresh token — and a `run` on the default login blocks
+  switching away from it. Claude's `run` keeps the claude-swap rules
   (see docs/claude.md).
+- Plugins (third-party adapters) load only after you trust that id from that
+  package: `hswap config set plugins.trusted <id>@<distribution>` (the command
+  `hswap harnesses` prints). See [docs/adapter-development.md](docs/adapter-development.md).
 
 Details: [docs/security.md](docs/security.md).
 

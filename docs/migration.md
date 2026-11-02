@@ -22,8 +22,10 @@ and writes the claude-swap store where it already is:
 | Linux/WSL | `$XDG_DATA_HOME/claude-swap` (default `~/.local/share/claude-swap`) |
 | macOS/Windows | `~/.claude-swap-backup` (macOS backup credentials stay in the Keychain) |
 
-There is therefore no import step, no duplicate copy of your credentials, and
-no Keychain item is moved.
+There is therefore no import step, and no Keychain item is moved. The engine
+keeps one previous generation of each stored credential next to it
+(`credentials/.creds-<n>-<email>.enc.prev`, 0600) once it rewrites the file, as
+claude-swap 0.30 does; older cswap releases ignore those files.
 
 **One exception.** Very old claude-swap installs on Linux kept their data in
 `~/.claude-swap-backup`; the engine moves it to the XDG location the first time
@@ -32,13 +34,18 @@ except `hswap claude help`/`--version` (including bare `hswap claude`) stops
 with an explanation instead, and
 
 ```bash
-hswap migrate --dry-run   # would move ~/.claude-swap-backup -> ~/.local/share/claude-swap
+hswap migrate --dry-run   # would back up ~/.claude-swap-backup, then move it to ~/.local/share/claude-swap
 hswap migrate             # backs it up to <hswap home>/backups/claude-swap-<time>, then moves it
 ```
 
-The backup is a plain copy inside a 0700 directory; delete it once you are satisfied.
-To roll back, move the backup back to `~/.claude-swap-backup` and remove the new
-directory.
+If both `~/.claude-swap-backup` and `~/.local/share/claude-swap` hold data,
+hswap (like the engine) refuses to merge them: the dry run says so, and nothing
+is copied. Keep the directory you use and move the other one aside.
+
+The backup is a plain copy of your credentials inside a 0700 directory; delete
+it once you are satisfied. To roll back, move the backup back to
+`~/.claude-swap-backup` and remove the new directory. Anything changed since the
+migration (accounts added, switches, settings) is lost by rolling back.
 
 ## Running hswap and cswap side by side
 
@@ -46,7 +53,11 @@ hswap does not install `cswap`, so an installed upstream claude-swap keeps its
 command. Both work on the same store and serialise through its `.lock`
 (`flock`), so they do not corrupt each other. Keep them on the same release
 line: an older cswap may not understand data written by a newer engine and
-vice versa. `hswap doctor` reports a `cswap` it finds on `PATH`.
+vice versa. `hswap doctor` reports a `cswap` it finds on `PATH` with its
+version, and warns when its release line differs from hswap's engine (in our
+tests cswap 0.28 read 0.30 data without trouble, but that is not a promise).
+It also warns when the claude-swap store's directories or credential files are
+readable by other users.
 
 `hswap claude upgrade` is refused (it would upgrade upstream claude-swap, not
 hswap); upgrade hswap with the tool that installed it.

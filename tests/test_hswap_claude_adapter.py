@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import sys
 from pathlib import Path
 
@@ -128,6 +129,114 @@ def test_embedded_help_names_hswap_claude(capsys):
     assert ClaudeAdapter().run_cli(["help"]) == 0
     out = capsys.readouterr().out
     assert "hswap claude list" in out
+    assert "upgrade" not in out  # refused when embedded, so not advertised
+    assert "rm=remove" in out
+
+
+@pytest.mark.parametrize(
+    ("engine_text", "shown"),
+    [
+        ("log in with Claude Code, then run: cswap add", "log in with Claude Code, then run: hswap claude add"),
+        ("Run cswap --switch to rotate.", "Run hswap claude --switch to rotate."),
+        ("`cswap unclaimed --purge` drops it", "`hswap claude unclaimed --purge` drops it"),
+        ("cswap's OAuth client was rejected", "cswap's OAuth client was rejected"),
+        ("another cswap surface holds the slot", "another cswap surface holds the slot"),
+        ("cswap auto --once >> ~/.cswap-auto.log", "hswap claude auto --once >> ~/.cswap-auto.log"),
+    ],
+)
+def test_engine_hints_name_the_hswap_command(engine_text, shown):
+    assert claude_adapter.respell(engine_text) == shown
+
+
+def test_engine_output_is_respelled_and_streams_restored(monkeypatch, capsys):
+    from claude_swap import cli as engine_cli
+
+    def fake_main():
+        print("re-login needed; then run: cswap add")
+        print("cswap list failed", file=sys.stderr)
+
+    monkeypatch.setattr(engine_cli, "main", fake_main)
+    out_before, err_before = sys.stdout, sys.stderr
+    assert ClaudeAdapter().run_cli(["list"]) == 0
+    captured = capsys.readouterr()
+    assert "then run: hswap claude add" in captured.out
+    assert "hswap claude list failed" in captured.err
+    assert (sys.stdout, sys.stderr) == (out_before, err_before)
+
+
+def test_a_confirmation_without_a_terminal_is_a_clean_error(monkeypatch):
+    from claude_swap import cli as engine_cli
+
+    def fake_main():
+        input("Remove? ")
+
+    monkeypatch.setattr(engine_cli, "main", fake_main)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    with pytest.raises(HswapError, match="run it in a terminal"):
+        ClaudeAdapter().run_cli(["remove", "1"])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_doctor_flags_a_credential_store_others_can_read(monkeypatch, tmp_path):
+    from claude_swap import paths as cpaths
+
+    root = tmp_path / "claude-swap"
+    (root / "credentials").mkdir(parents=True)
+    root.chmod(0o700)
+    (root / "credentials").chmod(0o700)
+    secret = root / "credentials" / ".creds-1-a@x.com.enc"
+    secret.write_text("{}")
+    secret.chmod(0o600)
+    (root / "credentials" / ".consume-1.lock").write_text("")
+    (root / "credentials" / ".consume-1.lock").chmod(0o664)  # lock files are not secret
+    monkeypatch.setattr(cpaths, "get_backup_root", lambda: root)
+    monkeypatch.setattr(claude_adapter.shutil, "which", lambda name: None)
+    assert ClaudeAdapter().diagnose() == []
+    (root / "claude-swap.log").write_text("")
+    (root / "claude-swap.log").chmod(0o664)  # neither is the log
+    assert ClaudeAdapter().diagnose() == []
+    secret.chmod(0o644)
+    (warning,) = ClaudeAdapter().diagnose()
+    assert warning[0] == "warn" and str(secret) in warning[1]
+    secret.chmod(0o600)
+    (root / "sequence.json").write_text("{}")
+    (root / "sequence.json").chmod(0o644)
+    (warning,) = ClaudeAdapter().diagnose()
+    assert "sequence.json" in warning[1]
+
+
+def test_doctor_compares_the_upstream_cswap_release_line(monkeypatch):
+    import subprocess
+
+    from claude_swap import __version__
+
+    monkeypatch.setattr(claude_adapter.shutil, "which", lambda name: "/opt/bin/cswap")
+    monkeypatch.setattr(claude_adapter, "_loose_modes", lambda root: [])
+
+    def fake_run(version):
+        return lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=f"cswap {version}\n")
+
+    monkeypatch.setattr(claude_adapter.spawn, "run", fake_run("0.1.0"))
+    (finding,) = ClaudeAdapter().diagnose()
+    assert finding[0] == "warn" and "0.1.0" in finding[1] and __version__ in finding[1]
+    major_minor = ".".join(__version__.split(".")[:2])
+    monkeypatch.setattr(claude_adapter.spawn, "run", fake_run(f"{major_minor}.9"))
+    (finding,) = ClaudeAdapter().diagnose()
+    assert finding[0] == "info"
+
+
+def test_disabled_accounts_are_marked_everywhere():
+    from harness_swap import output
+
+    engine = FakeEngine()
+    rows = engine.list_accounts()
+    rows["accounts"][0]["disabled"] = True
+    engine.list_accounts = lambda json_output=False: rows
+    adapter = ClaudeAdapter()
+    adapter._engine = engine
+    first, second = adapter.list_accounts()
+    assert first.to_json()["details"]["disabled"] is True and "disabled" not in second.details
+    assert output.account_line(first).endswith("(disabled)")
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the legacy move only exists on Linux/WSL")
@@ -140,7 +249,8 @@ def test_legacy_store_is_not_moved_as_a_side_effect(monkeypatch, tmp_path):
     with pytest.raises(HswapError, match="hswap migrate"):
         adapter.list_accounts()
     assert legacy.exists()
-    assert adapter.migration_plan() and "move claude-swap data" in adapter.migration_plan()[0]
+    (plan,) = adapter.migration_plan()
+    assert "backups" in plan and "move it to" in plan
     done = adapter.apply_migration()
     assert not legacy.exists()
     (backup,) = (tmp_path / "hswap" / "backups").iterdir()
@@ -163,7 +273,44 @@ def test_no_engine_path_bypasses_the_migration_gate(monkeypatch, tmp_path, argv)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the legacy move only exists on Linux/WSL")
+def test_both_stores_present_is_refused_before_any_backup(monkeypatch, tmp_path):
+    from claude_swap import paths as cpaths
+
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path / "hswap"))
+    legacy = Path.home() / ".claude-swap-backup"
+    legacy.mkdir()
+    (legacy / "sequence.json").write_text("{}")
+    target = cpaths.get_backup_root()
+    target.mkdir(parents=True)
+    (target / "sequence.json").write_text("{}")
+    adapter = ClaudeAdapter()
+    (plan,) = adapter.migration_plan()
+    assert plan.startswith("refuse to move") and "will not merge" in plan
+    with pytest.raises(HswapError, match="will not merge"):
+        adapter.apply_migration()
+    with pytest.raises(HswapError, match="will not merge"):
+        adapter.list_accounts()
+    assert not (tmp_path / "hswap" / "backups").exists()
+    assert (legacy / "sequence.json").exists() and (target / "sequence.json").exists()
+    monkeypatch.setattr(claude_adapter.shutil, "which", lambda name: None)
+    monkeypatch.setattr(claude_adapter, "_loose_modes", lambda root: [])
+    assert [level for level, message in adapter.diagnose() if "will not merge" in message] == ["error"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the legacy move only exists on Linux/WSL")
 def test_help_still_works_with_a_pending_migration(capsys):
     (Path.home() / ".claude-swap-backup").mkdir()
     assert ClaudeAdapter().run_cli(["help"]) == 0
     assert (Path.home() / ".claude-swap-backup").exists()
+
+
+def test_an_embedded_menubar_service_runs_hswap_not_an_upstream_cswap(monkeypatch, tmp_path):
+    from claude_swap import cli as engine_cli
+    from claude_swap import launch_agent
+
+    found = {"hswap": str(tmp_path / "bin" / "hswap"), "cswap": "/opt/upstream/cswap"}
+    monkeypatch.setattr(launch_agent.shutil, "which", found.get)
+    monkeypatch.setattr(engine_cli, "EMBEDDED_PROG", "hswap claude")
+    assert launch_agent.resolve_program() == [found["hswap"], "claude"]
+    monkeypatch.setattr(launch_agent.shutil, "which", lambda name: None)
+    assert launch_agent.resolve_program() == [sys.executable, "-m", "claude_swap"]

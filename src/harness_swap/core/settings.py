@@ -12,6 +12,7 @@ import math
 from pathlib import Path
 
 from harness_swap.core.paths import hswap_home
+from harness_swap.core.registry import parse_trust
 from harness_swap.core.store import mkdir_private
 from harness_swap.infrastructure.fsutil import atomic_write_text
 
@@ -19,8 +20,8 @@ from harness_swap.infrastructure.fsutil import atomic_write_text
 def _plugin_ids(value: object) -> list[str]:
     items = value.split(",") if isinstance(value, str) else value
     if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
-        raise ValueError("expected a comma-separated list of adapter ids")
-    return sorted({i.strip().lower() for i in items if i.strip()})
+        raise ValueError("expected a comma-separated list of <id>@<distribution>")
+    return sorted({parse_trust(i) for i in items if i.strip()})
 
 
 def _threshold(value: object) -> float:
@@ -55,6 +56,24 @@ def load() -> dict:
             out[key] = validate(data[key]) if key in data else default
         except ValueError:
             out[key] = default  # a hand-edited bad value never blocks the CLI
+    return out
+
+
+def invalid() -> list[str]:
+    """Stored values :func:`load` ignores (and falls back to the default for)."""
+    try:
+        data = json.loads(settings_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except ValueError:
+        return [f"{settings_path()} is not valid JSON; every setting uses its default"]
+    out = []
+    for key, (_default, validate) in SPECS.items():
+        if key in data:
+            try:
+                validate(data[key])
+            except ValueError as exc:
+                out.append(f"{key} in {settings_path()} is ignored: {exc}")
     return out
 
 

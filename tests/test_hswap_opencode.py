@@ -247,3 +247,20 @@ def test_odd_listing_shapes(v2, monkeypatch):
     listing["out"] = '{"not": "a list"}'
     with pytest.raises(Exception, match="JSON list"):
         adapter.list_accounts()
+
+
+def test_a_failed_command_is_reported_in_one_readable_line():
+    import subprocess
+
+    from harness_swap.adapters.opencode import _failure
+
+    trace = (
+        "Server process exited with code 1\n"
+        "Error: Managed service port 49374 on 127.0.0.1 is already in use by another process.\n"
+        "    at <anonymous> (/$bunfs/root/chunk.js:3:7550) {\n"
+        "  [cause]: ServeError:\n"
+        "      at P (/$bunfs/root/chunk.js:52:8551)\n}\n"
+    )
+    out = subprocess.CompletedProcess([], 1, stdout="", stderr=trace)
+    assert _failure(out) == "Error: Managed service port 49374 on 127.0.0.1 is already in use by another process."
+    assert _failure(subprocess.CompletedProcess([], 2, stdout="", stderr="")) == "exit status 2"

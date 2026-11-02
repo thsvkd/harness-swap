@@ -273,9 +273,19 @@ class TestDispatch:
     def test_resolve_ambiguous_label_needs_provider(self):
         a = Account("h", "id1", "same@x", "openai", 1)
         b = Account("h", "id2", "same@x", "xai", 2)
-        with pytest.raises(HswapError, match="ambiguous"):
+        with pytest.raises(HswapError, match="ambiguous.*Use the slot number or --provider"):
             service.resolve([a, b], "same@x")
         assert service.resolve([a, b], "same@x", provider="xai") is b
+
+    def test_resolve_messages_name_the_choices(self):
+        a = Account("h", "u/ws1", "same@x", "openai", 1, alias="work")
+        b = Account("h", "u/ws2", "same@x", "openai", 2)
+        with pytest.raises(HswapError) as ambiguous:
+            service.resolve([a, b], "same@x")
+        assert "1: same@x (work) [openai], 2: same@x [openai]. Use the slot number" in str(ambiguous.value)
+        assert "--provider" not in str(ambiguous.value)  # it would not tell them apart
+        with pytest.raises(AccountNotFound, match="known: 1: same@x"):
+            service.resolve([a, b], "nobody")
 
 
 # -- registry -------------------------------------------------------------------------------
@@ -297,7 +307,7 @@ class TestRegistry:
         reg.register("mini", Minimal)
         assert reg.get("mini").id == "mini"
         reg.register("other", Minimal)  # reports id "mini" under "other"
-        with pytest.raises(HarnessNotFound, match="contract"):
+        with pytest.raises(HarnessNotFound, match="reports id 'mini', but is registered as 'other'"):
             reg.get("other")
         assert [a.id for a in reg.available()] == ["mini"]
 
@@ -316,7 +326,7 @@ class TestRegistry:
         assert reg.available() == [] and loaded == []
         with pytest.raises(HarnessNotFound, match="not trusted"):
             reg.get("mini")
-        monkeypatch.setenv("HSWAP_TRUSTED_PLUGINS", "mini")
+        monkeypatch.setenv("HSWAP_TRUSTED_PLUGINS", "mini@mini-dist")
         reg = Registry({}, trusted_plugins=set())
         assert reg.get("mini").id == "mini" and loaded
 
@@ -325,8 +335,60 @@ class TestRegistry:
             "harness_swap.core.registry.entry_points",
             lambda group: [FakeEntryPoint(name="mini", value="evil:Adapter", dist=None)],
         )
-        reg = Registry({"mini": "tests.test_hswap_core:Minimal"}, trusted_plugins={"mini"})
-        assert reg.entries()[0].origin == "builtin"
+        reg = Registry({"mini": "tests.test_hswap_core:Minimal"}, trusted_plugins={"mini@unknown"})
+        assert [e.origin for e in reg.entries()] == ["builtin"]
+        assert any("built-in id 'mini'" in m for _s, m in reg.problems())
+
+    @staticmethod
+    def _eps(monkeypatch, *claims):
+        eps = [FakeEntryPoint(name=n, value="tests.test_hswap_core:Minimal", dist=SimpleNamespace(name=d)) for n, d in claims]
+        monkeypatch.setattr("harness_swap.core.registry.entry_points", lambda group: eps)
+
+    def test_trust_is_bound_to_the_distribution(self, monkeypatch):
+        self._eps(monkeypatch, ("mini", "Impostor_Pkg"))
+        reg = Registry({}, trusted_plugins={"mini@mini-dist"})
+        assert reg.available() == [] and not reg.entries()[0].trusted
+        assert ("mini@mini-dist", "trusted, but no installed package provides it; remove it from plugins.trusted") in reg.problems()
+        assert reg.trust_command("mini") == "hswap config set plugins.trusted mini@impostor-pkg,mini@mini-dist"
+
+    def test_an_id_declared_by_two_packages_is_never_loaded(self, monkeypatch):
+        self._eps(monkeypatch, ("mini", "mini-dist"), ("mini", "other-dist"))
+        reg = Registry({}, trusted_plugins={"mini@mini-dist"})
+        assert reg.available() == []
+        with pytest.raises(HarnessNotFound, match="several packages"):
+            reg.get("mini")
+        assert reg.notices() == []  # the trusted package *is* installed; no "stale trust" advice
+
+    @pytest.mark.parametrize("bad", ["x; touch pwned #", "Mini", "../escape", "list", "cache", "a" * 40])
+    def test_invalid_or_reserved_ids_are_ignored_and_reported(self, monkeypatch, bad):
+        self._eps(monkeypatch, (bad, "dist"))
+        reg = Registry({}, trusted_plugins=set())
+        assert reg.entries() == []
+        ((subject, message),) = reg.problems()
+        assert subject == bad and "ignored plugin id" in message
+
+    def test_a_plugin_that_exits_at_import_is_a_load_error(self, monkeypatch):
+        self._eps(monkeypatch, ("mini", "mini-dist"))
+
+        def exits(target):
+            raise SystemExit(3)
+
+        monkeypatch.setattr("harness_swap.core.registry._load_target", exits)
+        reg = Registry({}, trusted_plugins={"mini@mini-dist"})
+        assert reg.available() == []
+        assert reg.problems() == [("mini", "failed to load: SystemExit: 3")]
+
+    def test_trust_entries_are_validated(self):
+        from harness_swap.core.registry import parse_trust
+
+        assert parse_trust(" Zest@Zest_HSwap ") == "zest@zest-hswap"
+        for bad in ("zest", "zest;rm@x", "zest@", "@x", "zest@a b"):
+            with pytest.raises(ValueError):
+                parse_trust(bad)
+
+    def test_runtime_ids_are_validated(self):
+        with pytest.raises(ValueError, match="hswap's own"):
+            Registry(discover_plugins=False).register("config", Minimal)
 
 
 def test_hswap_home_respects_env_and_xdg(monkeypatch, tmp_path):
@@ -399,8 +461,8 @@ def test_store_errors_are_hswap_errors(tmp_path):
 def test_trust_hint_keeps_already_trusted_plugins(monkeypatch):
     eps = [FakeEntryPoint(name=n, value="x:Y", dist=None) for n in ("one", "two")]
     monkeypatch.setattr("harness_swap.core.registry.entry_points", lambda group: eps)
-    reg = Registry({}, trusted_plugins={"one"})
-    with pytest.raises(HarnessNotFound, match="plugins.trusted one,two"):
+    reg = Registry({}, trusted_plugins={"one@unknown"})
+    with pytest.raises(HarnessNotFound, match="plugins.trusted one@unknown,two@unknown"):
         reg.get("two")
 
 

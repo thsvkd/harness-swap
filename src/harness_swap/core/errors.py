@@ -24,8 +24,8 @@ class UnsupportedOperation(HswapError):
     show *why* instead of a bare "not supported".
     """
 
-    def __init__(self, capability: str, reason: str):
-        super().__init__(f"{capability} is not supported: {reason}")
+    def __init__(self, capability: str, reason: str, support: str = "unsupported"):
+        super().__init__(f"{capability} is {'unavailable here' if support == 'unavailable' else 'not supported'}: {reason}")
         self.capability = capability
         self.reason = reason
 

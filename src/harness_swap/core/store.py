@@ -95,7 +95,7 @@ class AccountStore:
         try:
             data = json.loads(raw)
         except ValueError:
-            raise HswapError(f"{self.file} is not valid JSON; restore it from a backup or remove it") from None
+            raise HswapError(f"{self.file} is not valid JSON; fix or remove it (removing it forgets every stored {self.root.name} account; their snapshots stay in {self.root / 'accounts'})") from None
         version = data.get("schemaVersion") if isinstance(data, dict) else None
         if not isinstance(version, int) or version > SCHEMA_VERSION:
             raise StoreVersionError(
@@ -104,7 +104,7 @@ class AccountStore:
             )
         rows = data.get("accounts", [])
         if not isinstance(rows, list) or not all(isinstance(a, dict) for a in rows):
-            raise HswapError(f"{self.file} has malformed account rows; restore it from a backup")
+            raise HswapError(f"{self.file} has malformed account rows; fix the file by hand")
         return [StoredAccount.from_json(a) for a in rows]
 
     def save(self, accounts: list[StoredAccount]) -> None:

@@ -22,7 +22,11 @@ and asks for ``hswap migrate`` instead of moving it as a side effect.
 
 from __future__ import annotations
 
+import functools
+import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -47,8 +51,42 @@ from harness_swap.core.models import (
 )
 from harness_swap.core.paths import hswap_home
 from harness_swap.core.store import mkdir_private
+from harness_swap.infrastructure import spawn
 
 PROG = "hswap claude"
+
+#: engine verbs dispatched before its flag table (see ``claude_swap.cli.main``)
+_ENGINE_VERBS = ("switch", "run", "auto", "map", "unmap", "unclaimed", "alias", "threshold", "priority", "swap", "move")
+
+
+@functools.cache
+def _cswap_command() -> re.Pattern:
+    from claude_swap.cli import _SUBCOMMAND_FLAGS
+
+    verbs = "|".join(sorted({*_SUBCOMMAND_FLAGS, *_ENGINE_VERBS, "config"}, key=len, reverse=True))
+    return re.compile(rf"(?<![\w./-])cswap(?= (?:-|(?:{verbs})\b))")
+
+
+def respell(text: str) -> str:
+    """The engine's hints say ``cswap <command>``; under hswap that is ``hswap claude <command>``.
+
+    Only the command spelling changes: the product name ("cswap's OAuth
+    client") and paths (``~/.cswap-auto.log``) are left alone.
+    """
+    return _cswap_command().sub(PROG, text) if "cswap" in text else text
+
+
+class _Respelled:
+    """Write-through text stream that applies :func:`respell`."""
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        return self._stream.write(respell(text))
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
 
 #: engine ``usageStatus`` -> (state, explanation)
 _STATUS = {
@@ -102,7 +140,7 @@ def usage_from_row(row: dict) -> UsageSnapshot:
         windows=windows,
         measured_at=measured,
         source="anthropic-oauth-usage",
-        detail=row.get("usageError") or detail,
+        detail=respell(row.get("usageError") or detail),
         balance={k: spend.get(k) for k in ("used", "limit", "currency", "pct")} if spend else None,
     )
 
@@ -118,6 +156,52 @@ def legacy_move_pending() -> tuple[Path, Path] | None:
     except OSError:
         same = legacy == target
     return None if same or not legacy.exists() else (legacy, target)
+
+
+def legacy_collision(legacy: Path, target: Path) -> bool:
+    """Both locations hold claude-swap data: the engine refuses to merge them."""
+    from claude_swap import paths as cpaths
+
+    return (
+        target.exists()
+        and not cpaths.migration_flag_for(target).exists()
+        and cpaths._target_has_meaningful_data(target)
+    )
+
+
+def _collision_message(legacy: Path, target: Path) -> str:
+    return (
+        f"both {legacy} and {target} hold claude-swap data; hswap will not merge them. "
+        "Keep the one you use, move the other out of the way, then run the command again."
+    )
+
+
+def _release_line(text: str) -> tuple[int, int] | None:
+    m = re.search(r"(\d+)\.(\d+)", text)
+    return (int(m[1]), int(m[2])) if m else None
+
+
+def _loose_modes(root: Path) -> list[Path]:
+    """Store directories and secret files that group/other can access (POSIX)."""
+    if os.name != "posix" or not root.is_dir():
+        return []
+    loose = [root] if root.stat().st_mode & 0o077 else []
+    loose += [
+        f
+        for f in sorted(root.glob("*.json"))
+        if f.is_file() and f.stat().st_mode & 0o077  # sequence/settings/mappings
+    ]
+    for sub in (root / "credentials", root / "configs"):
+        if not sub.is_dir():
+            continue
+        if sub.stat().st_mode & 0o077:
+            loose.append(sub)
+        loose += [
+            f
+            for f in sorted(sub.iterdir())
+            if f.is_file() and not f.name.endswith(".lock") and f.stat().st_mode & 0o077
+        ]
+    return loose
 
 
 class ClaudeAdapter:
@@ -137,6 +221,8 @@ class ClaudeAdapter:
     def _switcher(self):
         if self._engine is None:
             pending = legacy_move_pending()
+            if pending and legacy_collision(*pending):
+                raise HswapError(_collision_message(*pending))
             if pending:
                 raise HswapError(
                     f"claude-swap data still lives in {pending[0]}; the Claude engine would move it to "
@@ -155,16 +241,19 @@ class ClaudeAdapter:
             self._switcher()  # raises the explanatory error
         from claude_swap import cli as engine_cli
 
-        saved_argv, saved_prog = sys.argv, engine_cli.EMBEDDED_PROG
+        saved = sys.argv, engine_cli.EMBEDDED_PROG, sys.stdout, sys.stderr
         sys.argv = [PROG, *argv]
         engine_cli.EMBEDDED_PROG = PROG
+        sys.stdout, sys.stderr = _Respelled(sys.stdout), _Respelled(sys.stderr)
         try:
             engine_cli.main()
             return 0
         except SystemExit as exc:
             return exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+        except EOFError:
+            raise HswapError("this command asks for confirmation; run it in a terminal") from None
         finally:
-            sys.argv, engine_cli.EMBEDDED_PROG = saved_argv, saved_prog
+            sys.argv, engine_cli.EMBEDDED_PROG, sys.stdout, sys.stderr = saved
 
     # -- discovery ----------------------------------------------------------------
 
@@ -215,7 +304,8 @@ class ClaudeAdapter:
             alias=row.get("alias"),
             auth_mode="api_key" if row.get("usageStatus") == "api_key" else "oauth",
             active=bool(row.get("active")),
-            details={"organization": row.get("organizationName") or "personal"},
+            details={"organization": row.get("organizationName") or "personal"}
+            | ({"disabled": True} if row.get("disabled") else {}),
         )
 
     def list_accounts(self) -> list[Account]:
@@ -282,13 +372,18 @@ class ClaudeAdapter:
         pending = legacy_move_pending()
         if not pending:
             return []
-        return [f"move claude-swap data {pending[0]} -> {pending[1]} (backed up first)"]
+        legacy, target = pending
+        if legacy_collision(legacy, target):
+            return [f"refuse to move {legacy}: {_collision_message(legacy, target)}"]
+        return [f"back up {legacy} to {hswap_home() / 'backups'}/claude-swap-<time>, then move it to {target}"]
 
     def apply_migration(self) -> list[str]:
         pending = legacy_move_pending()
         if not pending:
             return []
         legacy, target = pending
+        if legacy_collision(legacy, target):
+            raise HswapError(_collision_message(legacy, target))
         backup_root = hswap_home() / "backups"
         mkdir_private(backup_root)
         backup = backup_root / f"claude-swap-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -299,13 +394,32 @@ class ClaudeAdapter:
         return [f"backed up {legacy} to {backup}", f"moved {legacy} -> {target}"]
 
     def diagnose(self) -> list[tuple[str, str]]:
+        from claude_swap import __version__ as engine_version
+        from claude_swap import paths as cpaths
+
         out = []
         upstream = shutil.which("cswap")
         if upstream:
-            out.append(
-                ("info", f"upstream cswap at {upstream} shares the Claude store; keep both on the same release line")
-            )
+            try:
+                theirs = spawn.run([upstream, "--version"], capture_output=True, text=True, timeout=15).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                theirs = ""
+            if theirs and _release_line(theirs) == _release_line(engine_version):
+                out.append(("info", f"upstream {theirs} at {upstream} shares the Claude store (same release line)"))
+            else:
+                message = (
+                    f"upstream {theirs or 'cswap (version unknown)'} at {upstream} shares the Claude store, "
+                    f"but hswap's engine is {engine_version}; keep both on the same release line"
+                )
+                out.append(("warn", message))
         pending = legacy_move_pending()
-        if pending:
+        if pending and legacy_collision(*pending):
+            out.append(("error", _collision_message(*pending)))
+        elif pending:
             out.append(("warn", f"legacy claude-swap data at {pending[0]}: run `hswap migrate`"))
+        root = pending[0] if pending else cpaths.get_backup_root()
+        loose = _loose_modes(root)
+        if loose:
+            advice = "chmod 700 the directories and 600 the files"
+            out.append(("warn", f"{len(loose)} path(s) in {root} are accessible to other users, e.g. {loose[0]}; {advice}"))
         return out

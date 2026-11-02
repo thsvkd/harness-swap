@@ -24,6 +24,7 @@ docs/harness-compatibility.md for the evidence and its classification):
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import time
@@ -184,6 +185,12 @@ class CodexAdapter(FileCredentialAdapter):
     hot_reload = False
     fmt = CodexAuthFormat()
     usage_policy = UsagePolicy(min_interval_s=30.0, stale_after_s=3600.0, max_backoff_s=600.0)
+
+    def list_accounts(self) -> list[Account]:
+        accounts = super().list_accounts()
+        if self.credential_store() != "file":  # Codex is not using auth.json, so it says nothing
+            return [dataclasses.replace(a, active=None) for a in accounts]
+        return accounts
 
     def credential_store(self) -> str:
         """``cli_auth_credentials_store`` from config.toml; Codex's default is ``file``."""

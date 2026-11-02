@@ -108,6 +108,17 @@ def resolve_program() -> list[str]:
     into the plist — the very path this module avoids pinning, since a
     reinstall recreates the virtualenv while the symlink keeps its name.
     """
+    from claude_swap.cli import EMBEDDED_PROG
+
+    if EMBEDDED_PROG:
+        # Embedded (hswap): run the host's own command, never an upstream
+        # `cswap` that may be on PATH at another release.
+        host, *sub = EMBEDDED_PROG.split()
+        which = shutil.which(host)
+        if which:
+            return [str(Path(os.path.abspath(which))), *sub]
+        return [sys.executable, "-m", "claude_swap"]
+
     candidate = sys.argv[0] if sys.argv and sys.argv[0] else None
     if candidate is not None:
         absolute = Path(os.path.abspath(candidate))

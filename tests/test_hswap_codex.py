@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from datetime import UTC
@@ -82,7 +83,10 @@ def test_switch_round_trip_and_restart_notice(codex, monkeypatch):
 @pytest.mark.parametrize("mode", ["keyring", "auto", "ephemeral"])
 def test_non_file_credential_stores_are_refused(codex, mode):
     adapter, home = codex
+    login(home, "a@x.com", "user-a", "acct-a")
+    adapter.add_account()
     (home / "config.toml").write_text(f'cli_auth_credentials_store = "{mode}"\n')
+    assert [a.active for a in adapter.list_accounts()] == [None]  # auth.json is not what Codex uses
     caps = adapter.capabilities()
     assert caps[Capability.ACCOUNT_SWITCH].support is Support.UNAVAILABLE
     assert mode in caps[Capability.ACCOUNT_SWITCH].reason
@@ -152,9 +156,37 @@ def test_running_the_active_account_uses_the_default_home(codex, monkeypatch):
         "harness_swap.core.sessions.launch", lambda argv, env, fd: seen.update(argv=argv, env=env, fd=fd) or 5
     )
     assert service.launch(adapter, "1", ["--help"]) == 5
-    assert seen["argv"] == ["/fake/codex", "--help"] and seen["fd"] is None
+    assert seen["argv"] == ["/fake/codex", "--no-daemon", "--help"] and seen["fd"] is not None
     assert seen["env"]["CODEX_HOME"] == str(home)  # inherited, not redirected to a profile
     assert not (adapter.store.account_dir(1) / ".hswap-session.lock").exists()
+    os.close(seen["fd"])
+
+
+def test_a_run_on_the_active_login_blocks_switch_and_remove(codex, monkeypatch):
+    adapter, home = codex
+    login(home, "a@x.com", "user-a", "acct-a")
+    adapter.add_account()
+    login(home, "b@x.com", "user-b", "acct-b")
+    adapter.add_account()  # b is active
+    mode = (home.stat().st_mode & 0o777) if sys.platform != "win32" else None
+    held = {}
+
+    def fake_launch(argv, env, fd):
+        held["fd"] = fd
+        assert "already the active account" in service.switch(adapter, "2").notes  # a no-op is fine
+        with pytest.raises(HswapError, match="session is using the current login"):
+            service.switch(adapter, "1")
+        active = next(a for a in adapter.list_accounts() if a.active)
+        with pytest.raises(HswapError, match="in use"):
+            adapter.remove_account(active)
+        return 0
+
+    monkeypatch.setattr("harness_swap.core.sessions.launch", fake_launch)
+    assert service.launch(adapter, "2", []) == 0
+    os.close(held["fd"])
+    if mode is not None:
+        assert home.stat().st_mode & 0o777 == mode  # the user's home keeps its permissions
+    assert service.switch(adapter, "1").current.slot == 1
 
 
 @posix_only
@@ -268,6 +300,19 @@ def test_switch_by_strategy_uses_usage(codex, tmp_path):
     login(home, "1@x.com", "user-1", "acct-1")  # account 1 is active
     result = service.switch_by_strategy(adapter, "best", UsageService(tmp_path / "cache"), threshold=95.0)
     assert result.current.slot == 2
+    assert not any("without knowing" in n for n in result.notes)
+
+
+def test_next_available_says_when_it_picks_blind(codex, tmp_path):
+    adapter, home = codex
+    for i in (1, 2):
+        login(home, f"{i}@x.com", f"user-{i}", f"acct-{i}")
+        adapter.add_account()
+    result = service.switch_by_strategy(adapter, "next-available", UsageService(tmp_path / "cache"), threshold=95.0)
+    assert result.current.slot == 1
+    assert any("no current usage data for 1@x.com" in n for n in result.notes)
+    again = service.switch(adapter, "1")
+    assert again.previous is None and "already the active account" in again.notes
 
 
 def test_no_network_is_used_for_usage(codex, monkeypatch):

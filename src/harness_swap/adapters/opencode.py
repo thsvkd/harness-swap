@@ -58,10 +58,19 @@ from harness_swap.core.models import (
     unsupported,
 )
 from harness_swap.core.paths import harness_home
-from harness_swap.core.store import AccountStore
+from harness_swap.core.store import AccountStore, mkdir_private
 from harness_swap.infrastructure import spawn
+from harness_swap.infrastructure.locking import FileLock
 
 NATIVE, LEGACY = "native", "legacy"
+
+
+def _failure(out: subprocess.CompletedProcess) -> str:
+    """One readable line from a failed OpenCode command, which prints stack traces."""
+    lines = [line.strip() for line in (out.stderr or out.stdout or "").splitlines()]
+    lines = [line for line in lines if line and not line.startswith(("at ", "[cause]", "}"))]
+    best = next((line for line in lines if line.lower().startswith("error")), lines[0] if lines else None)
+    return (best or f"exit status {out.returncode}")[:300]
 
 
 class LegacyAuthFormat:
@@ -229,7 +238,7 @@ class OpenCodeAdapter:
     def _native_listing(self) -> list[dict]:
         out = self._run("auth", "list", "--format", "json")
         if out.returncode != 0:
-            raise HswapError(f"`opencode auth list` failed: {(out.stderr or '').strip()[:300]}")
+            raise HswapError(f"`opencode auth list` failed: {_failure(out)}")
         try:
             data = json.loads(out.stdout)
         except ValueError:
@@ -347,20 +356,25 @@ class OpenCodeAdapter:
             return self._legacy.remove_account(account)
         out = self._run("auth", "logout", account.provider or "", account.identity)
         if out.returncode != 0:
-            raise HswapError(f"`opencode auth logout` failed: {(out.stderr or '').strip()[:300]}")
+            raise HswapError(f"`opencode auth logout` failed: {_failure(out)}")
 
     def switch_account(self, account: Account, *, force: bool = False) -> SwitchResult:
         if self._require_mode() == LEGACY:
             return self._legacy.switch_account(account, force=force)
-        previous = next(
-            (a for a in self._native_accounts() if a.provider == account.provider and a.active), None
-        )
-        out = self._run("auth", "switch", account.provider or "", account.identity)
-        if out.returncode != 0:
-            raise HswapError(f"`opencode auth switch` failed: {(out.stderr or '').strip()[:300]}")
-        flags = self._active_flags()
-        if flags is not None and not flags.get(account.identity):
-            raise HswapError("OpenCode reported success but a different account is still active")
+        # Serialises hswap's own switches (a separate file: the store lock is
+        # taken inside, and flock is not reentrant). OpenCode's own concurrent
+        # writers are outside hswap's control.
+        mkdir_private(self.store.root)
+        with FileLock(self.store.root / ".switch.lock", timeout=120):
+            previous = next(
+                (a for a in self._native_accounts() if a.provider == account.provider and a.active), None
+            )
+            out = self._run("auth", "switch", account.provider or "", account.identity)
+            if out.returncode != 0:
+                raise HswapError(f"`opencode auth switch` failed: {_failure(out)}")
+            flags = self._active_flags()
+            if flags is not None and not flags.get(account.identity):
+                raise HswapError("OpenCode reported success but a different account is still active")
         return SwitchResult(
             harness=self.id,
             current=dataclasses.replace(account, active=True),

@@ -138,7 +138,8 @@ def test_entry_point_plugin_needs_explicit_trust(tmp_path, monkeypatch, capsys):
     code, out, _ = hswap(Registry({}), capsys, "harnesses")
     assert "untrusted plugin (plugin:acme-hswap)" in out
 
-    monkeypatch.setenv("HSWAP_TRUSTED_PLUGINS", "acme")
+    assert "hswap config set plugins.trusted acme@acme-hswap" in out
+    monkeypatch.setenv("HSWAP_TRUSTED_PLUGINS", "acme@acme-hswap")
     code, out, _ = hswap(Registry({}), capsys, "acme", "list", "--no-usage")
     assert code == 0 and "Acme Code:" in out
 
@@ -181,3 +182,27 @@ def test_shared_code_names_no_harness():
                 if any(n.startswith(("claude_swap", "harness_swap.adapters.")) and "base" not in n for n in names):
                     offenders.append(f"{path.relative_to(root)}:{node.lineno}: imports {names}")
     assert offenders == [], "\n".join(offenders)
+
+
+def test_snapshot_name_must_match_the_live_file(load_example_module=None):
+    module = load_example()
+
+    class Mismatched(module.AcmeAdapter):
+        credential_file = "login.json"
+
+    with pytest.raises(TypeError, match="must equal credential_file"):
+        Mismatched()
+
+
+def test_messages_a_plugin_user_sees(acme, capsys):
+    registry, home = acme
+    login(home, "ann")
+    assert "Added ann@acme.test as acme slot 1" in hswap(registry, capsys, "acme", "add")[1]
+    assert "already acme slot 1; its stored login was refreshed" in hswap(registry, capsys, "acme", "add")[1]
+    with pytest.raises(SystemExit):
+        hswap(registry, capsys, "acme", "run", "1", "whoami")
+    assert "hswap acme run 1 -- whoami" in capsys.readouterr().err
+    login(home, "zed")  # signed in outside hswap
+    code, out, _ = hswap(registry, capsys, "acme", "switch", "1", "--force")
+    (stash,) = (home.parent / "hswap" / "acme" / "stash").iterdir()
+    assert code == 0 and f"saved to {stash}" in out

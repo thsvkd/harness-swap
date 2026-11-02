@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -67,6 +68,13 @@ class FileCredentialAdapter:
 
     def __init__(self) -> None:
         self._installation: Installation | None = None
+        if self.fmt.secret_name != self.credential_file:
+            # The account directory doubles as the harness home of an isolated
+            # session, so the snapshot must carry the live file's name.
+            raise TypeError(
+                f"{type(self).__name__}: fmt.secret_name {self.fmt.secret_name!r} must equal "
+                f"credential_file {self.credential_file!r}"
+            )
 
     # --- locations ------------------------------------------------------------
 
@@ -149,6 +157,9 @@ class FileCredentialAdapter:
         user configuration is linked in so SSO/OIDC settings still apply.
         """
         inst = self._require_installed()
+        for stale in self.store.root.glob("pending-login-*"):  # left by a killed sign-in
+            if time.time() - stale.stat().st_mtime > 86400:
+                shutil.rmtree(stale, ignore_errors=True)
         tmp = self.store.root / f"pending-login-{uuid.uuid4().hex}"
         try:
             sessions.link_shared(tmp, self.home, self.login_shared_names())
@@ -169,7 +180,7 @@ class FileCredentialAdapter:
 
     def remove_account(self, account: Account) -> None:
         def busy(directory):
-            if sessions.in_use(directory):
+            if sessions.in_use(directory) or (account.active and sessions.in_use(self.home)):
                 return f"slot {account.slot} is in use by a running `hswap {self.id} run` session; exit it first"
             return None
 
@@ -181,8 +192,9 @@ class FileCredentialAdapter:
     # --- switching -------------------------------------------------------------------
 
     def switch_account(self, account: Account, *, force: bool = False) -> SwitchResult:
-        target, previous = self.credentials.activate(account.slot, force=force)
-        notes = []
+        creds = self.credentials
+        target, previous = creds.activate(account.slot, force=force)
+        notes = [f"the unmanaged login it replaced was saved to {creds.stashed}"] if creds.stashed else []
         restart = False
         if previous is not None and previous.slot == target.slot:
             notes.append("already the active account")
@@ -201,7 +213,7 @@ class FileCredentialAdapter:
         return SwitchResult(
             harness=self.id,
             current=self._to_account(target, True),
-            previous=self._to_account(previous, False) if previous else None,
+            previous=self._to_account(previous, False) if previous and previous.slot != target.slot else None,
             restart_required=restart,
             notes=tuple(notes),
         )
@@ -242,8 +254,10 @@ class FileCredentialAdapter:
                 live = {}
             if creds.is_active(stored, live):
                 # Already the default login: the default home is the right one,
-                # and a second copy of the token must not be created.
-                argv, env, fd = [inst.executable, *args], dict(os.environ), None
+                # and a second copy of the token must not be created. The lock
+                # on the default home stops a switch or remove underneath it.
+                fd = sessions.acquire(self.home)
+                argv, env = [inst.executable, *self.session_args(), *args], dict(os.environ)
             else:
                 profile = self.store.account_dir(stored.slot)
                 if not (profile / self.credential_file).exists():

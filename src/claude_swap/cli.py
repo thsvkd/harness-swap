@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 
 from claude_swap import __version__, paths, printer
@@ -1308,6 +1309,8 @@ Aliases: ls=list  rm=remove  update=upgrade""",
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,
     )
+    if EMBEDDED_PROG:  # the host upgrades itself; don't advertise the self-upgrade
+        parser.description = re.sub(r"\n  %\(prog\)s upgrade .*|  update=upgrade", "", parser.description)
 
     # Version and debug flags (outside mutually exclusive group)
     parser.add_argument(

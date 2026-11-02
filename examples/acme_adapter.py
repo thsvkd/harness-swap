@@ -19,7 +19,10 @@ Use it as a plugin from your own package::
     [project.entry-points."harness_swap.adapters"]
     acme = "acme_adapter:AcmeAdapter"
 
-then ``hswap config set plugins.trusted acme`` and ``hswap acme list``.
+install it next to hswap (``uv tool install harness-swap --with <your package>``),
+trust it with the command ``hswap harnesses`` prints
+(``hswap config set plugins.trusted acme@<your-distribution>``), then
+``hswap acme list``.
 See docs/adapter-development.md for the walkthrough.
 """
 
@@ -84,7 +87,7 @@ class AcmeAdapter(FileCredentialAdapter):
         need_binary = None if inst.installed else unavailable(f"Acme Code is not installed ({inst.detail})")
         return {
             Capability.ACCOUNT_LIST: supported(),
-            Capability.ACCOUNT_ADD: need_binary or supported(),
+            Capability.ACCOUNT_ADD: supported("current login, or --login (needs the acme binary)"),
             Capability.ACCOUNT_REMOVE: supported(),
             Capability.ACCOUNT_SWITCH: supported("swaps $ACME_HOME/credentials.json"),
             Capability.USAGE_MONITORING: supported("Acme's own quota.json"),

@@ -6,6 +6,8 @@ code path serves every harness and every unsupported case explains itself.
 
 from __future__ import annotations
 
+import dataclasses
+
 from harness_swap.core.adapter import (
     AccountAdder,
     AccountRemover,
@@ -22,10 +24,18 @@ from harness_swap.core.models import (
     Capability,
     SwitchResult,
     UsageSnapshot,
+    UsageState,
     unsupported_usage,
 )
 from harness_swap.core.rotation import select_account
 from harness_swap.core.usage import UsageService
+
+
+def _choice(acc: Account) -> str:
+    slot = acc.slot if acc.slot is not None else acc.identity
+    alias = f" ({acc.alias})" if acc.alias else ""
+    provider = f" [{acc.provider}]" if acc.provider else ""
+    return f"{slot}: {acc.label}{alias}{provider}"
 
 
 def resolve(
@@ -45,14 +55,12 @@ def resolve(
         )
     if not matches:
         scope = f" for provider {provider}" if provider else ""
-        raise AccountNotFound(f"no account matches {identifier!r}{scope}")
+        known = ", ".join(_choice(a) for a in pool) or "none"
+        raise AccountNotFound(f"no account matches {identifier!r}{scope}; known: {known}")
     if len(matches) > 1:
-        options = ", ".join(
-            f"{a.slot if a.slot is not None else a.identity} ({a.provider or '-'})" for a in matches
-        )
-        raise HswapError(
-            f"{identifier!r} is ambiguous: {options}. Use a slot number or --provider"
-        )
+        options = ", ".join(_choice(a) for a in matches)
+        hint = " or --provider" if len({a.provider for a in matches}) > 1 else ""
+        raise HswapError(f"{identifier!r} is ambiguous: {options}. Use the slot number{hint}")
     return matches[0]
 
 
@@ -126,7 +134,11 @@ def switch_by_strategy(
             f"no other {adapter.display_name} account qualifies for '{strategy}' "
             f"(threshold {threshold:g}%); usage may be unknown or stale -- see `hswap {adapter.id} usage`"
         )
-    return switcher.switch_account(target, force=force)
+    result = switcher.switch_account(target, force=force)
+    if usage.get(target.key) is None or usage[target.key].state is not UsageState.AVAILABLE:
+        note = f"no current usage data for {target.label}; '{strategy}' picked it without knowing its headroom"
+        result = dataclasses.replace(result, notes=(*result.notes, note))
+    return result
 
 
 def launch(adapter: HarnessAdapter, identifier: str, args: list[str], provider: str | None = None) -> int:

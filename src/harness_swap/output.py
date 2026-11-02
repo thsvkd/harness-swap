@@ -74,7 +74,8 @@ def account_line(acc: Account, show_provider: bool = False) -> str:
     alias = f" ({acc.alias})" if acc.alias else ""
     provider = f" [{acc.provider}]" if show_provider and acc.provider else ""
     mode = f" {acc.auth_mode}" if acc.auth_mode in ("api_key",) else ""
-    return f" {mark} {slot}  {acc.label}{alias}{provider}{mode}"
+    disabled = " (disabled)" if acc.details.get("disabled") else ""
+    return f" {mark} {slot}  {acc.label}{alias}{provider}{mode}{disabled}"
 
 
 def err(message: str) -> None:

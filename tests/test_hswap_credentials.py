@@ -324,3 +324,24 @@ def test_exclusive_switch_never_drops_the_target_signed_in_under_another_part(tm
     creds.activate(1, force=True)
     (stash,) = (store.root / "stash").iterdir()
     assert stash.read_bytes() == before
+
+
+@pytest.mark.parametrize("damaged", [b"", b"{not json"])
+def test_a_damaged_live_file_needs_force_and_is_stashed(env, damaged):
+    live, _store, creds = env
+    add(creds, live, {"s1": entry("u1", "t1")})
+    live.write_bytes(damaged)
+    with pytest.raises(CredentialError, match="pass --force"):
+        creds.activate(1)
+    assert live.read_bytes() == damaged
+    creds.activate(1, force=True)
+    assert read(live) == {"s1": entry("u1", "t1")}
+    assert creds.stashed is not None and creds.stashed.read_bytes() == damaged
+
+
+def test_alias_with_several_logins_explains_what_to_do(env):
+    live, _store, creds = env
+    write(live, {"s1": entry("u1", "t1"), "s2": entry("u2", "t2")})
+    with pytest.raises(CredentialError, match=r"holds 2 \(u1@x, u2@x\); add without --alias") as exc:
+        creds.add_current(alias="x")
+    assert "--provider" not in str(exc.value)

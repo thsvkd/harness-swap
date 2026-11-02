@@ -166,7 +166,7 @@ def require(
         capability, unsupported(f"{adapter.display_name} does not offer this")
     )
     if not status.usable:
-        raise UnsupportedOperation(str(capability), status.reason or "not available")
+        raise UnsupportedOperation(str(capability), status.reason or "not available", str(status.support))
     if not isinstance(adapter, role):
         raise UnsupportedOperation(
             str(capability),

@@ -105,7 +105,7 @@ def _load_doc(raw: bytes | None, where: Path) -> dict | None:
     try:
         doc = json.loads(raw)
     except ValueError:
-        raise CredentialError(f"{where} is not valid JSON; refusing to touch it") from None
+        raise CredentialError(f"{where} is empty or not valid JSON; refusing to touch it") from None
     if not isinstance(doc, dict):
         raise CredentialError(f"{where} is not a JSON object; refusing to touch it")
     return doc
@@ -124,6 +124,8 @@ class SnapshotCredentials:
         harness_lock: Path | None = None,
         lock_timeout: float = 10.0,
     ):
+        #: where the last forced :meth:`activate` saved the login it replaced
+        self.stashed: Path | None = None
         self.fmt = fmt
         self.store = store
         self.live_path = live_path
@@ -241,9 +243,14 @@ class SnapshotCredentials:
         if only_provider is not None:
             idents = {k: v for k, v in idents.items() if v.provider == only_provider}
         if not idents:
-            raise CredentialError("no login found to add (sign in to the harness first)")
+            raise CredentialError("no login found to add (sign in to the harness first, or use `add --login`)")
         if alias is not None and len(idents) > 1:
-            raise CredentialError("--alias needs exactly one login; pass --provider to pick one")
+            labels = ", ".join(i.label for i in idents.values())
+            hint = " or pass --provider to pick one" if len({i.provider for i in idents.values()}) > 1 else ""
+            raise CredentialError(
+                f"--alias needs exactly one login, but the current login file holds {len(idents)} ({labels}); "
+                f"add without --alias and name each one with the alias command{hint}"
+            )
         parts = self.fmt.parts(doc)
         results = []
         with self.store.lock(self.lock_timeout):
@@ -269,10 +276,19 @@ class SnapshotCredentials:
     def add_current(self, *, alias: str | None = None, provider: str | None = None):
         _raw, doc = self._read_live()
         if doc is None:
-            raise CredentialError(f"not signed in: {self.live_path} does not exist")
+            raise CredentialError(
+                f"not signed in: {self.live_path} does not exist. Sign in with the harness first, or use `add --login`"
+            )
         return self.import_document(doc, alias=alias, only_provider=provider)
 
     # -- switching -----------------------------------------------------------------
+
+    def _refuse_if_live_session(self) -> None:
+        if sessions.in_use(self.live_path.parent):
+            raise HswapError(
+                f"a `hswap run` session is using the current login in {self.live_path.parent}; "
+                "switching would change the account under it. Exit that session first."
+            )
 
     def activate(self, slot: int, *, force: bool = False) -> tuple[StoredAccount, StoredAccount | None]:
         """Make stored ``slot`` the live login. Returns ``(target, previous)``.
@@ -292,7 +308,14 @@ class SnapshotCredentials:
             target = next((a for a in accounts if a.slot == slot), None)
             if target is None:
                 raise AccountNotFound(f"no stored account in slot {slot}")
-            raw, doc = self._read_live()
+            try:
+                raw, doc = self._read_live()
+            except CredentialError as exc:
+                if not force:
+                    raise CredentialError(f"{exc} (pass --force to stash it and switch anyway)") from None
+                self._refuse_if_live_session()
+                raw, doc = self.live_path.read_bytes(), None
+                self.stashed = self._stash(raw)
             doc = doc or {}
             self._capture(accounts, doc)
             key = target.part_key or ""
@@ -303,6 +326,7 @@ class SnapshotCredentials:
             replaced = {k: p for k, p in live_parts.items() if k == key or exclusive}
             if key in replaced and len(replaced) == 1 and self._owner([target], key, replaced[key]):
                 return target, target  # already active; nothing to write
+            self._refuse_if_live_session()
 
             previous, unmanaged = None, []
             for k, p in replaced.items():
@@ -322,7 +346,7 @@ class SnapshotCredentials:
                         f"the current login ({', '.join(unmanaged)}) is not stored by hswap; switching "
                         "would lose it. Add it first, or pass --force to stash it and continue"
                     )
-                self._stash(raw)
+                self.stashed = self._stash(raw)
 
             base = {k: v for k, v in doc.items() if k == key or k not in replaced}
             self._write_live_verified(raw, self.fmt.merge(base, key, part), key, target)

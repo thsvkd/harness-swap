@@ -10,6 +10,7 @@ richer native command line (:class:`NativeCommandLine`) receives
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
@@ -22,7 +23,7 @@ from harness_swap.core.adapter import (
     Migrator,
     NativeCommandLine,
 )
-from harness_swap.core.errors import HswapError
+from harness_swap.core.errors import CredentialConflict, HswapError
 from harness_swap.core.models import Capability, Support
 from harness_swap.core.paths import hswap_home
 from harness_swap.core.registry import Registry, default_registry
@@ -38,6 +39,11 @@ def _version() -> str:
         return version("harness-swap")
     except PackageNotFoundError:
         return "unknown"
+
+
+def _describe(exc: BaseException) -> str:
+    """An error line for one harness; a plugin's own exception keeps its type name."""
+    return str(exc) if isinstance(exc, HswapError) else f"{type(exc).__name__}: {exc}"
 
 
 def _usage_service() -> UsageService:
@@ -81,6 +87,7 @@ def _harness_parser(adapter: HarnessAdapter) -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     provider(sp)
     sp = cmd("run", "run the harness as an account in this terminal only (args after --)")
+    sp.usage = f"hswap {adapter.id} run SLOT|ALIAS|EMAIL [--provider P] [-- HARNESS ARGS...]"
     sp.add_argument("account", metavar="SLOT|ALIAS|EMAIL")
     provider(sp)
     sp = cmd("usage", "show usage for one or all accounts")
@@ -124,8 +131,13 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
     if "--" in argv:
         i = argv.index("--")
         argv, passthrough = argv[:i], argv[i + 1 :]
-    args = _harness_parser(adapter).parse_args(argv)
+    parser = _harness_parser(adapter)
+    args, extra = parser.parse_known_args(argv)
     verb = {"ls": "list", "rm": "remove"}.get(args.verb, args.verb)
+    if extra and verb == "run":
+        parser.error(f"harness arguments go after `--`: hswap {adapter.id} run {args.account} -- {' '.join(extra)}")
+    if extra:
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
     as_json = getattr(args, "json", False)
 
     if verb == "list":
@@ -137,17 +149,28 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
             print(f"{adapter.display_name}:")
             _print_accounts(adapter, accounts, usage)
     elif verb == "status":
-        active = service.active_accounts(adapter)
+        accounts = adapter.list_accounts()
+        active = [a for a in accounts if a.active]
+        known = bool(active) or all(a.active is not None for a in accounts)
         if as_json:
-            output.emit_json({"harness": adapter.id, "active": [a.to_json() for a in active]})
+            output.emit_json({"harness": adapter.id, "active": [a.to_json() for a in active], "activeKnown": known})
+        elif not known:
+            print(f"{adapter.display_name}: the active account could not be determined (see `hswap {adapter.id} list`)")
         elif not active:
             print(f"{adapter.display_name}: no managed account is active")
         else:
             for acc in active:
                 print(f"{adapter.display_name}:{output.account_line(acc, _shows_provider(adapter))}")
     elif verb == "add":
+        known = {a.key for a in adapter.list_accounts()}
         acc = service.add(adapter, alias=args.alias, provider=args.provider, login=args.login)
-        print(f"Added {acc.label} as {adapter.id} slot {acc.slot}")
+        added = [a for a in adapter.list_accounts() if a.key not in known] or [acc]
+        for new in added:
+            if new.key in known:
+                alias = f", alias {new.alias}" if args.alias else ""
+                print(f"{new.label} is already {adapter.id} slot {new.slot}; its stored login was refreshed{alias}")
+            else:
+                print(f"Added {new.label} as {adapter.id} slot {new.slot}")
     elif verb == "remove":
         acc = service.resolve(adapter.list_accounts(), args.account, args.provider)
         if not args.yes and not _confirm(f"Remove {acc.label} (slot {acc.slot}) from hswap?"):
@@ -168,7 +191,10 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
                 force=args.force,
             )
         elif args.account:
-            result = service.switch(adapter, args.account, provider=args.provider, force=args.force)
+            try:
+                result = service.switch(adapter, args.account, provider=args.provider, force=args.force)
+            except CredentialConflict as exc:
+                raise CredentialConflict(f"{exc}. To keep it as an account: `hswap {adapter.id} add`") from None
         else:
             raise HswapError("which account? give SLOT|ALIAS|EMAIL or --strategy")
         if as_json:
@@ -194,7 +220,7 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
         acc = service.set_alias(adapter, args.account, None if args.unset else args.name, args.provider)
         print(f"slot {acc.slot}: alias {acc.alias or '(none)'}")
     elif verb == "capabilities":
-        _print_capabilities([adapter], as_json)
+        return _print_capabilities([adapter], as_json)
     return 0
 
 
@@ -215,54 +241,77 @@ def _targets(registry: Registry, harness: str | None) -> list[HarnessAdapter]:
     return [registry.get(harness)] if harness else registry.available()
 
 
-def _print_capabilities(adapters, as_json: bool) -> None:
+def _print_capabilities(adapters, as_json: bool, load_errors: dict[str, str] | None = None) -> int:
+    table, errors = {}, dict(load_errors or {})
+    for a in adapters:
+        try:
+            table[a.id] = a.capabilities()
+        except Exception as exc:  # noqa: BLE001 - one harness must not hide the others
+            errors[a.id] = _describe(exc)
     if as_json:
         output.emit_json(
             {
                 "harnesses": {
-                    a.id: {
-                        str(c): {"support": str(s.support), "reason": s.reason}
-                        for c, s in a.capabilities().items()
+                    harness_id: {
+                        str(c): {"support": str(caps[c].support), "reason": caps[c].reason}
+                        if c in caps
+                        else {"support": "unsupported", "reason": ""}
+                        for c in Capability
                     }
-                    for a in adapters
-                }
+                    for harness_id, caps in table.items()
+                },
+                "errors": errors,
             }
         )
-        return
+        return 1 if errors else 0
     for a in adapters:
         print(f"{a.display_name} ({a.id})")
-        caps = a.capabilities()
+        if a.id in errors:
+            print(f"  error: {errors[a.id]}")
+            continue
+        caps = table[a.id]
         for cap in Capability:
             status = caps.get(cap)
             support = str(status.support) if status else "unsupported"
             reason = f"  {status.reason}" if status and status.reason else ""
             print(f"  {cap!s:<22} {support:<12}{reason}")
+    for harness_id in errors.keys() - {a.id for a in adapters}:
+        print(f"{harness_id}\n  error: {errors[harness_id]}")
+    return 1 if errors else 0
 
 
 def cmd_harnesses(registry: Registry, as_json: bool) -> int:
     rows = []
     for entry in registry.entries():
         row = {"id": entry.id, "origin": entry.origin, "trusted": entry.trusted}
-        if entry.trusted:
+        if entry.error and not entry.trusted:
+            row["error"] = entry.error
+        elif entry.trusted:
             try:
                 adapter = registry.get(entry.id)
                 inst = adapter.installation()
                 row |= {"name": adapter.display_name, "installed": inst.installed, "version": inst.version}
-            except HswapError as exc:
-                row["error"] = str(exc)
+            except Exception as exc:  # noqa: BLE001 - one harness must not hide the others
+                row["error"] = _describe(exc)
         rows.append(row)
+    notices = [{"subject": s, "message": m} for s, m in registry.notices()]
+    failed = any("error" in r and r["trusted"] for r in rows)
     if as_json:
-        output.emit_json({"harnesses": rows})
-        return 0
+        output.emit_json({"harnesses": rows, "notices": notices})
+        return 1 if failed else 0
     for r in rows:
-        if not r["trusted"]:
-            state = f"untrusted plugin ({r['origin']}); `{registry.trust_command(r['id'])}`"
-        elif "error" in r:
+        if "error" in r:
             state = f"error: {r['error']}"
+        elif not r["trusted"]:
+            state = f"untrusted plugin ({r['origin']}); `{registry.trust_command(r['id'])}`"
         else:
             state = (r["version"] or "installed") if r["installed"] else "not installed"
+            if r["origin"] != "builtin":
+                state += f" ({r['origin']})"
         print(f"{r['id']:<10} {r.get('name', ''):<14} {state}")
-    return 0
+    for n in notices:
+        output.err(f"note: {n['subject']}: {n['message']}")
+    return 1 if failed else 0
 
 
 def cmd_list(registry: Registry, harness: str | None, as_json: bool, with_usage: bool) -> int:
@@ -272,8 +321,10 @@ def cmd_list(registry: Registry, harness: str | None, as_json: bool, with_usage:
             accounts = adapter.list_accounts()
             usage = service.collect_usage(adapter, accounts, _usage_service()) if with_usage else None
             results.append((adapter, accounts, usage))
-        except HswapError as exc:
-            errors[adapter.id] = str(exc)
+        except Exception as exc:  # noqa: BLE001 - one harness must not hide the others
+            errors[adapter.id] = _describe(exc)
+    if harness is None:
+        errors |= _load_errors(registry)
     if as_json:
         output.emit_json(
             {
@@ -281,69 +332,93 @@ def cmd_list(registry: Registry, harness: str | None, as_json: bool, with_usage:
                 "errors": errors,
             }
         )
-        return 0 if results or not errors else 1
+        return 1 if errors else 0
     for adapter, accounts, usage in results:
         print(f"{adapter.display_name} ({adapter.id}):")
         _print_accounts(adapter, accounts, usage)
     for harness_id, message in errors.items():
         output.err(f"{harness_id}: {message}")
-    return 0 if results or not errors else 1
+    return 1 if errors else 0
+
+
+def _load_errors(registry: Registry) -> dict[str, str]:
+    """Trusted adapters that failed to load (after :meth:`Registry.available`)."""
+    return {e.id: e.error for e in registry.entries() if e.trusted and e.error}
 
 
 def cmd_status(registry: Registry, harness: str | None, as_json: bool) -> int:
     rows = []
     for adapter in _targets(registry, harness):
-        inst = adapter.installation()
-        row = {"harness": adapter.id, "installed": inst.installed, "version": inst.version}
+        row = {"harness": adapter.id, "installed": None, "version": None}
         try:
-            row["active"] = [a.to_json() for a in service.active_accounts(adapter)]
-        except HswapError as exc:
-            row["error"] = str(exc)
+            inst = adapter.installation()
+            row |= {"installed": inst.installed, "version": inst.version}
+            accounts = adapter.list_accounts()
+            row["active"] = [a.to_json() for a in accounts if a.active]
+            row["activeKnown"] = bool(row["active"]) or all(a.active is not None for a in accounts)
+        except Exception as exc:  # noqa: BLE001 - one harness must not hide the others
+            row["error"] = _describe(exc)
         rows.append(row)
+    if harness is None:
+        rows += [{"harness": h, "installed": None, "version": None, "error": m} for h, m in _load_errors(registry).items()]
+    errors = {row["harness"]: row["error"] for row in rows if "error" in row}
     if as_json:
-        output.emit_json({"harnesses": rows})
-        return 0
+        output.emit_json({"harnesses": rows, "errors": errors})
+        return 1 if errors else 0
     for row in rows:
         if "error" in row:
             text = f"error: {row['error']}"
+        elif not row["activeKnown"]:
+            text = "active account unknown"
         elif row["active"]:
-            text = ", ".join(a["label"] + (f" [{a['provider']}]" if a["provider"] else "") for a in row["active"])
+            text = ", ".join(
+                a["label"]
+                + (f" ({a['alias']})" if a["alias"] else "")
+                + (f" [{a['provider']}]" if a["provider"] else "")
+                + (" (disabled)" if a.get("details", {}).get("disabled") else "")
+                for a in row["active"]
+            )
         else:
             text = "no managed account active" if row["installed"] else "not installed"
         print(f"{row['harness']:<10} {text}")
-    return 0
+    return 1 if errors else 0
 
 
 def cmd_doctor(registry: Registry, as_json: bool) -> int:
     findings: list[tuple[str, str, str]] = []
     home = hswap_home()
     findings.append(("hswap", "info", f"data directory {home}"))
+    adapters = registry.available()  # attempts every load, so failures are recorded
     for entry in registry.entries():
-        if entry.error:
-            findings.append((entry.id, "error", entry.error))
-    for adapter in registry.available():
-        inst = adapter.installation()
-        if inst.installed and inst.version:
-            findings.append((adapter.id, "info", f"{inst.executable} {inst.version}"))
-        else:
-            findings.append((adapter.id, "warn", inst.detail or f"{inst.executable}: version unknown"))
+        if entry.error:  # a trusted adapter that failed to load is an error; a conflict is not
+            findings.append((entry.id, "error" if entry.trusted else "warn", entry.error))
+    findings += [(subject, "warn", message) for subject, message in registry.notices()]
+    findings += [("hswap", "warn", message) for message in settings.invalid()]
+    for adapter in adapters:
         try:
+            inst = adapter.installation()
+            if inst.installed and inst.version:
+                findings.append((adapter.id, "info", f"{inst.executable} {inst.version}"))
+            else:
+                findings.append((adapter.id, "warn", inst.detail or f"{inst.executable}: version unknown"))
             for cap, status in adapter.capabilities().items():
                 if status.support is Support.UNAVAILABLE:
                     findings.append((adapter.id, "warn", f"{cap}: {status.reason}"))
             if isinstance(adapter, Diagnosable):
                 findings += [(adapter.id, level, msg) for level, msg in adapter.diagnose()]
-        except HswapError as exc:
-            findings.append((adapter.id, "error", str(exc)))
+        except Exception as exc:  # noqa: BLE001 - doctor reports, it does not crash
+            findings.append((adapter.id, "error", _describe(exc)))
         try:
             AccountStore(home / adapter.id).load()
         except HswapError as exc:
             findings.append((adapter.id, "error", str(exc)))
+    findings = list(dict.fromkeys(findings))  # an adapter's diagnose() may repeat the store check
     if as_json:
         output.emit_json({"findings": [{"harness": h, "level": lv, "message": m} for h, lv, m in findings]})
     else:
+        width = min(max(len(h) for h, _, _ in findings), 24)
         for harness_id, level, message in findings:
-            print(f"[{level:<5}] {harness_id:<9} {message}")
+            print(f"[{level:<5}] {harness_id:<{width}} {message}")
     return 1 if any(level == "error" for _, level, _ in findings) else 0
 
 
@@ -356,12 +431,17 @@ def cmd_migrate(registry: Registry, dry_run: bool) -> int:
         if not plan:
             continue
         did_anything = True
+        steps = plan if dry_run else adapter.apply_migration()
         print(f"{adapter.display_name}:")
-        for step in plan if dry_run else adapter.apply_migration():
+        for step in steps:
             print(f"  {'would ' if dry_run else ''}{step}")
     if not did_anything:
         print("Nothing to migrate.")
     return 0
+
+
+def _show(value: object) -> str:
+    return ",".join(value) if isinstance(value, list) else str(value)
 
 
 def cmd_config(argv: list[str]) -> int:
@@ -374,19 +454,24 @@ def cmd_config(argv: list[str]) -> int:
         print(settings.settings_path())
     elif args.action == "list":
         for key, value in settings.load().items():
-            print(f"{key} = {value}")
+            print(f"{key} = {_show(value)}")
     elif args.action == "get":
+        if args.key is None:
+            raise HswapError("usage: hswap config get KEY")
         values = settings.load()
         if args.key not in values:
             raise HswapError(f"unknown setting {args.key!r}; known: {', '.join(values)}")
-        print(values[args.key])
+        print(_show(values[args.key]))
     elif args.action == "set":
         if args.key is None or args.value is None:
             raise HswapError("usage: hswap config set KEY VALUE")
         try:
-            print(f"{args.key} = {settings.set_value(args.key, args.value)}")
-        except (KeyError, ValueError) as exc:
+            value = settings.set_value(args.key, args.value)
+            print(f"{args.key} = {_show(value)}")
+        except KeyError as exc:
             raise HswapError(str(exc).strip("'\"")) from None
+        except ValueError as exc:
+            raise HswapError(f"{args.key}: {exc}") from None
     elif args.action == "unset":
         try:
             settings.unset(args.key)
@@ -425,6 +510,8 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
         else:
             print(HELP.format(harnesses=", ".join(registry.ids())))
             return 0
+    if argv[0] == "--json" and len(argv) > 1:  # `hswap --json status` == `hswap status --json`
+        argv = [*argv[1:], "--json"]
     head, rest = argv[0], argv[1:]
     if head in ("--version", "-V", "version"):
         print(f"hswap {_version()}")
@@ -455,8 +542,8 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
         if head == "status":
             return cmd_status(registry, args.harness, args.json)
         if head == "capabilities":
-            _print_capabilities(_targets(registry, args.harness), args.json)
-            return 0
+            adapters = _targets(registry, args.harness)
+            return _print_capabilities(adapters, args.json, None if args.harness else _load_errors(registry))
         if head == "doctor":
             return cmd_doctor(registry, args.json)
         if head == "migrate":
@@ -471,6 +558,14 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
         else:
             output.err(f"Error: {exc}")
         return 1
+    except Exception as exc:  # an adapter bug (often a plugin): one clean line, not a traceback
+        if os.environ.get("HSWAP_DEBUG"):
+            raise
+        if as_json:
+            output.emit_json(output.error_json(exc))
+        else:
+            output.err(f"Error: {_describe(exc)} (set HSWAP_DEBUG=1 for a traceback)")
+        return 1
     except KeyboardInterrupt:
         output.err("\nCancelled.")
         return 130
@@ -478,4 +573,10 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
 
 
 def main() -> None:
-    sys.exit(run(sys.argv[1:]))
+    try:
+        code = run(sys.argv[1:])
+        sys.stdout.flush()
+    except BrokenPipeError:  # `hswap list | head`: the reader left; not an error
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        code = 0
+    sys.exit(code)

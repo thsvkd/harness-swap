@@ -92,8 +92,13 @@ def in_use(profile: Path) -> bool:
 
 
 def acquire(profile: Path) -> int:
-    """Take the session lock; returns the descriptor that holds it."""
-    mkdir_private(profile)
+    """Take the session lock; returns the descriptor that holds it.
+
+    ``profile`` may also be the harness's default home (a session on the
+    active login); an existing directory keeps its permissions.
+    """
+    if not profile.exists():
+        mkdir_private(profile)
     fd = os.open(profile / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
     if not _try_lock(fd):
         os.close(fd)

@@ -77,7 +77,9 @@ def test_status_and_harnesses_json(native, capsys):
     doc = json.loads(run(reg, capsys, "status", "--json")[1])
     assert doc["schemaVersion"] == 1
     assert doc["harnesses"] == [{"harness": "nat", "installed": True, "version": "9.9",
-                                 "active": [Account("nat", "i1", "n@x", "p", 1, active=True).to_json()]}]
+                                 "active": [Account("nat", "i1", "n@x", "p", 1, active=True).to_json()],
+                                 "activeKnown": True}]
+    assert doc["errors"] == {}
     doc = json.loads(run(reg, capsys, "harnesses", "--json")[1])
     assert doc["harnesses"][0]["id"] == "nat"
 
@@ -226,11 +228,182 @@ async def test_dashboard_renders_and_switches(homes):
         table = app.query_one(DataTable)
         labels = [str(table.get_row_at(i)[3]) for i in range(table.row_count)]
         assert "a@x.com" in labels and "b@x.com" in labels
-        assert any("not installed" in str(table.get_row_at(i)[5]) or str(table.get_row_at(i)[0]) == "Grok Build"
+        assert any("not installed" in str(table.get_row_at(i)[4]) or str(table.get_row_at(i)[1]) == "Grok Build"
                    for i in range(table.row_count))
+        last = table.row_count - 1  # in the last harness's rows, which arrive after a partial fill
+        table.move_cursor(row=last)
+        await pilot.press("r")  # a refresh keeps the highlighted row
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert table.cursor_row == last
         table.move_cursor(row=labels.index("a@x.com"))
         await pilot.press("s")
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert "now a@x.com" in str(app.query_one("#status", Static).render())
     assert json.loads((tmp / "codex" / "auth.json").read_text())["tokens"]["account_id"] == "acct-user-a"
+
+
+def test_dashboard_shows_each_harness_as_soon_as_it_is_read():
+    from types import SimpleNamespace
+
+    from harness_swap.core.models import Installation
+    from harness_swap.ui.tui import collect
+
+    def missing(harness_id):
+        return SimpleNamespace(id=harness_id, installation=lambda: Installation(False, harness_id, None, "missing"))
+
+    seen = []
+    rows = collect(SimpleNamespace(available=lambda: [missing("a"), missing("b")], entries=list), seen.append)
+    assert [[r[0].id for r in partial] for partial in seen] == [["a"]]
+    assert [r[0].id for r in rows] == ["a", "b"]
+
+
+class Crashy(Native):
+    """A trusted plugin with a bug: every probe raises a non-hswap exception."""
+
+    id = "crashy"
+
+    def installation(self):
+        raise RuntimeError("probing exploded")
+
+    def capabilities(self):
+        raise RuntimeError("probing exploded")
+
+    def list_accounts(self):
+        raise RuntimeError("probing exploded")
+
+    run_cli = None  # use the generic verbs
+
+
+@pytest.mark.parametrize("argv", [["harnesses"], ["list"], ["status"], ["capabilities"], ["doctor"]])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_one_broken_adapter_does_not_take_down_cross_harness_commands(native, capsys, tmp_path, monkeypatch, argv, as_json):
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path))
+    reg, _ = native
+    reg.register("crashy", Crashy)
+    code, out, err = run(reg, capsys, *argv, *(["--json"] if as_json else []))
+    assert "Traceback" not in out + err
+    assert "RuntimeError: probing exploded" in out + err
+    if as_json:
+        json.loads(out)
+    assert "nat" in out or "Native" in out  # the healthy harness is still reported
+    assert code == 1  # any harness that failed makes the command fail, with the rest still shown
+
+
+def test_doctor_reports_a_plugin_that_fails_to_load(native, capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path))
+    reg, _ = native
+    reg.register("boom", "tests.no_such_module:Adapter")
+    code, out, _ = run(reg, capsys, "doctor")
+    assert code == 1 and "[error] boom" in out and "failed to load: ModuleNotFoundError" in out
+    code, out, _ = run(reg, capsys, "list", "--json")
+    assert "boom" in json.loads(out)["errors"]
+
+
+def test_trusting_a_plugin_prints_the_list_plainly(capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path))
+    reg = Registry(discover_plugins=False)
+    code, out, _ = run(reg, capsys, "config", "set", "plugins.trusted", "zest@zest-hswap,b@b-pkg")
+    assert code == 0 and out.strip() == "plugins.trusted = b@b-pkg,zest@zest-hswap"
+    code, _, err = run(reg, capsys, "config", "set", "plugins.trusted", "zest")
+    assert code == 1 and "<id>@<distribution>" in err
+
+
+def test_add_reports_every_login_it_stored(homes, capsys):
+    reg, tmp = homes
+    write_json(tmp / "grok" / "auth.json", {
+        "https://auth.example::c1": grok_entry("a@x.com", "user-a"),
+        "xai::api_key": {"key": "synthetic-xai-api-key", "auth_mode": "api_key"},
+    })
+    code, out, _ = run(reg, capsys, "grok", "add")
+    assert code == 0 and "Added a@x.com as grok slot 1" in out and "Added API key sha256:" in out
+    code, out, _ = run(reg, capsys, "grok", "add")
+    assert "already grok slot 1" in out
+
+
+def test_status_says_when_the_active_account_is_unknown(native, capsys):
+    reg, adapter = native
+    adapter.list_accounts = lambda: [Account("nat", "i1", "n@x", "p", 1, active=None)]
+    code, out, _ = run(reg, capsys, "status")
+    assert code == 0 and "nat        active account unknown" in out
+    doc = json.loads(run(reg, capsys, "status", "--json")[1])
+    assert doc["harnesses"][0]["activeKnown"] is False
+    adapter.list_accounts = lambda: [Account("nat", "i1", "n@x", "p", 1, alias="w", active=True, details={"disabled": True})]
+    assert "n@x (w) [p] (disabled)" in run(reg, capsys, "status")[1]
+
+
+def test_output_into_a_closed_pipe_is_not_an_error(monkeypatch):
+    import io
+    import os
+
+    class ClosedPipe(io.StringIO):
+        def write(self, text):
+            raise BrokenPipeError
+
+        def fileno(self):
+            return os.open(os.devnull, os.O_WRONLY)
+
+    monkeypatch.setattr("sys.stdout", ClosedPipe())
+    monkeypatch.setattr("sys.argv", ["hswap", "--version"])
+    monkeypatch.setattr(os, "dup2", lambda a, b: None)
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+
+
+def test_json_flag_may_come_first_and_config_errors_name_the_key(native, capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path))
+    reg, _ = native
+    code, out, _ = run(reg, capsys, "--json", "status")
+    assert code == 0 and json.loads(out)["harnesses"][0]["harness"] == "nat"
+    code, _, err = run(reg, capsys, "config", "set", "rotation.threshold", "20")
+    assert code == 1 and "rotation.threshold: must be between 50 and 99.9" in err
+    code, _, err = run(reg, capsys, "config", "get")
+    assert code == 1 and "usage: hswap config get KEY" in err
+
+
+def test_a_broken_plugin_is_one_clean_error_line_everywhere(native, capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path))
+    monkeypatch.delenv("HSWAP_DEBUG", raising=False)
+    reg, _ = native
+    reg.register("crashy", Crashy)
+    reg.register("boom", "tests.no_such_module:Adapter")
+    for argv in (["crashy", "list"], ["crashy", "status"]):
+        code, out, err = run(reg, capsys, *argv)
+        assert code == 1 and "Traceback" not in err and "RuntimeError: probing exploded" in err
+    code, out, _ = run(reg, capsys, "crashy", "list", "--json")
+    assert code == 1 and json.loads(out)["error"]["type"] == "RuntimeError"
+    code, out, _ = run(reg, capsys, "capabilities", "--json")
+    assert code == 1 and "boom" in json.loads(out)["errors"]
+    code, out, _ = run(reg, capsys, "capabilities")
+    assert "boom\n  error: failed to load: ModuleNotFoundError" in out
+
+    from harness_swap.ui.tui import collect
+
+    assert any(adapter.id == "boom" and "failed to load" in note for adapter, _a, _u, note in collect(reg))
+
+
+def test_ignored_plugins_and_old_trust_entries_are_explained(capsys, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from harness_swap.core import settings
+
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path))
+    ep = SimpleNamespace(name="nat", value="x:Y", dist=SimpleNamespace(name="squatter"))
+    monkeypatch.setattr("harness_swap.core.registry.entry_points", lambda group: [ep])
+    settings.settings_path().write_text(json.dumps({"plugins.trusted": ["zest"]}))  # pre-<id>@<dist> format
+    reg = Registry({"nat": "tests.test_hswap_cli:Native"}, trusted_plugins=set(settings.load()["plugins.trusted"]))
+    code, out, err = run(reg, capsys, "harnesses")
+    assert code == 0 and "note: nat: ignored: squatter declares built-in id 'nat'" in err
+    code, out, _ = run(reg, capsys, "doctor")
+    assert code == 0  # an ignored entry point is a warning, not a failure
+    assert "[warn ] nat" in out and "plugins.trusted in" in out and "is not <id>@<distribution>" in out
+
+
+def test_doctor_reports_a_corrupt_store_once(homes, capsys):
+    reg, tmp = homes
+    (tmp / "hswap" / "codex").mkdir()
+    (tmp / "hswap" / "codex" / "accounts.json").write_text("{broken")
+    code, out, _ = run(reg, capsys, "doctor")
+    assert code == 1 and out.count("accounts.json is not valid JSON") == 1

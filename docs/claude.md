@@ -98,6 +98,8 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 
 Defaults like the threshold and cooldown are configurable with `hswap claude config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
 
+This is the Claude engine's own `auto`: unlike `hswap <codex|grok|opencode|agy> auto` (one `{harness, at, events}` JSON document per check, exit `0` unless it fails, the `rotation.threshold` from `hswap config`), it prints JSON lines, uses the exit codes above, and takes its threshold (default 90) from `hswap claude config`.
+
 </details>
 
 ### Run multiple accounts at the same time (session mode)

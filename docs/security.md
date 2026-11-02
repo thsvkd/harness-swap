@@ -120,12 +120,41 @@ where it always does.
   more than 10 minutes left (Codex: JWT `exp`, else `last_refresh`; Grok: the
   earlier of `expires_at` and JWT `exp`; agy: `token.expiry`). If the expiry is
   unreadable it is not asked.
+- If the live login file of a harness cannot be read, usage reads for every
+  account of that harness return an error snapshot rather than reading a stored
+  copy (which could be the account that is actually live).
 - The child gets no shell and no terminal; error text from it is scrubbed and
   agy output is never echoed. `list --cached` and `usage --cached` start nothing.
 - Limits: a Codex that refreshes after a 401 while hswap is asking cannot be
   detected, OpenCode's active flag and refresh happen inside its own service, and
   every live read is verified only against fake harnesses and real binaries
   without accounts (see [testing.md](testing.md)).
+
+## Keep-alive (`hswap <id> refresh`)
+
+`hswap codex|grok|agy refresh [ACCOUNT]` asks the harness the same usage question
+to keep a stored login from lapsing. It needs no `usage.remote` opt-in (running it
+is the request) and bypasses the usage cache.
+
+- Each account is asked in its own home with that home's session lock held, as
+  above; an account a running session owns is skipped (that session keeps it fresh).
+- The active login is asked in the default home only when no process of that
+  harness is found on this machine, matched by executable name or by an executable
+  on its command line (a Grok started through a wrapper or `qemu` counts); an
+  unreadable process table counts as running. The 10-minute guard does not apply,
+  since nothing else can be refreshing the token.
+- The result compares a SHA-256 of the refresh-relevant fields before and after
+  (`token refreshed`, `token still valid`); tokens, file contents and harness output
+  never appear in it. An authentication failure says `sign in again: ...` and exits 1.
+- Several devices: each device's own `codex login` / `grok login` has its own
+  refresh token, so refreshing this device's stored copy does not affect other
+  devices. The only unsafe case is copying or syncing the same credential file
+  between devices (two holders of one rotating refresh token); do not do that.
+- Limits: the process check runs once, so a harness started by hand on the default
+  home while hswap's harness runs (up to 45 s for Codex, 120 s for Grok) could
+  redeem the same refresh token; Grok's `auth.json.lock` narrows this, Codex has no
+  verified cross-process refresh lock. A Codex read cut off at its timeout while
+  Codex is mid-refresh can lose the rotated token; hswap says so.
 
 ## Rate limits and provider terms
 

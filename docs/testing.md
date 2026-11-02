@@ -18,6 +18,7 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 | Grok adapter | `test_hswap_grok.py` | exclusive scope switch (session ↔ API key), unmanaged scope refused, capability honesty, isolated session, `--login` isolation, no usage read without the opt-in, billing over a fake ACP agent (own home, expiry guard, session-held, states, API-key login, capabilities) |
 | OpenCode adapter | `test_hswap_opencode.py` | V2 emulator over a real SQLite file: probe-based mode, listing + active flags, native switch/login/logout, DB never written and secret column never selected; unknown version refused; legacy provider swap; Go limits through a fake `api` command (windows, null data, auth, timeout, switch lock held, inactive accounts, stale carry-over) |
 | Antigravity adapter | `test_hswap_agy.py` | fake `agy` speaking the `/usage` JSON: identity, switch + restart note, `add --login` refused, capabilities with and without the token file and on darwin, `--gemini_dir` argv/env/no tty, near-expiry and session-held skips, no output echoed, `UNAUTHENTICATED` |
+| Keep-alive (`refresh`) | `test_hswap_codex.py`, `test_hswap_grok.py`, `test_hswap_agy.py`, `test_hswap_opencode.py` | fake harnesses: refreshed vs still valid, API-key login, session-held and running-harness skips, account that just became live, missing login, auth failures (`sign in again`), transport and harness errors never echo output, timeout; OpenCode refused as unsupported; process check sees a Grok started through a wrapper (real `ps`) |
 | Automatic switching | `test_hswap_auto.py` | opt-in, threshold, cooldown, no switch on missing data, `--dry-run`, overlapping runs |
 | Ask-a-harness transport | `test_hswap_jsonrpc.py` | JSON-RPC session over a fake child: deadline, shutdown, errors scrubbed |
 | Claude adapter | `test_hswap_claude_adapter.py` | schema-v1 → core usage mapping, engine embedding (prog name, argv restore, upgrade refused), legacy-store migration gate (no engine path bypasses it) + backup |
@@ -66,13 +67,14 @@ covered by the tests above, except these, which remain known limits:
   a slow harness (e.g. OpenCode starting its service) delays only its own rows;
 - a usage reading of "unknown" is cached like any other for the adapter's
   minimum interval (30 s for Codex's passive log reading, 300 s for every live read);
-- a live read slower than `UsageService`'s 30 s cache lock (Grok 120 s, Codex 45 s
-  timeouts) can make a concurrent process give up waiting.
+- keep-alive's check-then-run race: a harness started by hand after hswap checked
+  can redeem the same refresh token.
 
 ## What is mock-only
 
 These pass against fakes and synthetic files, not against a live service:
 
+- **keep-alive (`refresh`)**: fake harnesses only; whether a real Codex/Grok writes the rotated token as assumed, and agy's `/usage` as a login use, were not seen with a live account;
 - **every live usage read** (Codex `account/rateLimits/read`, Grok `_x.ai/billing`, OpenCode `api experimental.usage.limits`, `agy -p /usage`) and everything built on it, including automatic switching: verified only against fake harnesses that speak the protocol, plus the real binaries in a sandbox with no account (which showed only the signed-out replies and, for OpenCode, `data: null`). No logged-in answer has been seen;
 - Antigravity as a whole: the real `agy` 1.4.8 was run with a synthetic token and a dead or fake endpoint only;
 

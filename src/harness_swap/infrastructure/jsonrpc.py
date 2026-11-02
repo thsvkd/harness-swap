@@ -26,13 +26,17 @@ from harness_swap.infrastructure.secrets import looks_secret
 
 
 class RpcError(Exception):
-    def __init__(self, message: str, code: int | None = None):
+    """``harness`` is True when the harness sent this error (its text is the harness's
+    output); False for hswap's own transport failures (start, exit, timeout)."""
+
+    def __init__(self, message: str, code: int | None = None, *, harness: bool = False):
         self.code = code
+        self.harness = harness
         super().__init__(message)
 
 
 def _clean(text: object) -> str:
-    text = str(text)[:300]
+    text = " ".join(str(text).split())[:300]  # one line: a harness may quote a multi-line server body
     return "(message withheld: looks like it contains a credential)" if looks_secret(text) else text
 
 
@@ -84,7 +88,7 @@ class _Session:
             if "error" in message:
                 err = message["error"] if isinstance(message["error"], dict) else {"message": message["error"]}
                 detail = err.get("data") if isinstance(err.get("data"), str) else err.get("message")
-                raise RpcError(_clean(detail or "error"), err.get("code"))
+                raise RpcError(_clean(detail or "error"), err.get("code"), harness=True)
             return message.get("result")
 
 

@@ -205,6 +205,26 @@ def test_config_round_trip(homes, capsys):
     assert run(reg, capsys, "config", "get", "rotation.threshold")[1].strip() == "95.0"
 
 
+def test_harness_opt_ins_name_known_harnesses_and_their_terms(homes, capsys):
+    reg, _ = homes
+    code, _, err = run(reg, capsys, "config", "set", "usage.remote", "codex,bogus")
+    assert code == 1 and "unknown harness bogus" in err
+    assert run(reg, capsys, "config", "get", "usage.remote")[1].strip() == ""
+    code, _, err = run(reg, capsys, "config", "set", "usage.remote", "codex")
+    assert code == 0 and "never calls a provider API or refreshes a token" in err
+    assert "note: codex terms: OpenAI" in err
+    code, _, err = run(reg, capsys, "config", "set", "auto.enabled", "codex,grok")
+    assert code == 0 and "note: codex terms:" in err and "note: grok terms: xAI" in err
+    code, _, err = run(reg, capsys, "config", "set", "auto.enabled", "grok")
+    assert code == 0 and "note" not in err  # nothing newly enabled
+
+
+def test_an_unknown_provider_is_refused(homes, capsys):
+    reg, _ = homes
+    code, _, err = run(reg, capsys, "codex", "refresh", "--provider", "foo")
+    assert code == 1 and "codex has no provider 'foo'; known: openai" in err
+
+
 def test_migrate_with_nothing_to_do(homes, capsys):
     reg, _ = homes
     code, out, _ = run(reg, capsys, "migrate", "--dry-run")
@@ -257,6 +277,18 @@ def test_dashboard_shows_each_harness_as_soon_as_it_is_read():
     rows = collect(SimpleNamespace(available=lambda: [missing("a"), missing("b")], entries=list), seen.append)
     assert [[r[0].id for r in partial] for partial in seen] == [["a"]]
     assert [r[0].id for r in rows] == ["a", "b"]
+
+    # a harness's accounts show before its (possibly slow) usage read finishes
+    from harness_swap.core.models import Capability, unsupported
+
+    acc = Account("c", "i", "c@x", None, 1)
+    slow = SimpleNamespace(
+        id="c", display_name="C", providers=(), installation=lambda: Installation(True, "c", "1"),
+        list_accounts=lambda: [acc], capabilities=lambda: {Capability.USAGE_MONITORING: unsupported("none")},
+    )
+    seen.clear()
+    collect(SimpleNamespace(available=lambda: [slow], entries=list), seen.append)
+    assert [(r[1], r[2]) for r in seen[0]] == [(acc, "measuring...")]
 
 
 class Crashy(Native):

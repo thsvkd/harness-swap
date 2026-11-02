@@ -59,8 +59,7 @@ def _threshold(value: object) -> float:
 SPECS = {
     "plugins.trusted": ([], _plugin_ids),
     "rotation.threshold": (95.0, _threshold),
-    # Harnesses whose usage hswap may read from the endpoints the harness itself
-    # calls (undocumented; may change), refreshing inactive accounts' tokens to do so.
+    # Harnesses hswap may ask for live usage (the harness's own, undocumented interfaces).
     "usage.remote": ([], _harness_ids),
     # Harnesses `hswap <harness> auto` may switch automatically (opt-in: see the warning).
     "auto.enabled": ([], _harness_ids),
@@ -70,13 +69,15 @@ SPECS = {
 #: Shown when a harness is added to one of these lists.
 WARNINGS = {
     "usage.remote": (
-        "hswap will call the usage endpoints these harnesses use themselves, with your own tokens. "
-        "They are not public APIs: they may change or stop working without notice."
+        "hswap will ask each of these harnesses itself, in each account's own home, for the usage its "
+        "/usage or /status shows; the harness refreshes its own token there. hswap never calls a provider "
+        "API or refreshes a token. These are the harnesses' internal interfaces: they may change or stop "
+        "working without notice."
     ),
     "auto.enabled": (
-        "Automatic switching uses your other accounts when one nears its limit. Several providers' terms "
-        "restrict sharing accounts or using several to get around rate limits; check them. "
-        "You are responsible for complying."
+        "Automatic switching uses your other accounts when one nears its limit. Providers' terms are "
+        "unclear or restrictive about switching accounts to get past limits; you are responsible for "
+        "complying."
     ),
 }
 

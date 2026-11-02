@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -46,7 +49,7 @@ from harness_swap.core.models import (
     unavailable,
     unsupported,
 )
-from harness_swap.infrastructure import spawn
+from harness_swap.infrastructure import processes
 
 TOKEN_FILE = "antigravity-cli/antigravity-oauth-token"
 _WINDOW_S = {"5h": 5 * 3600, "weekly": 7 * 86400}
@@ -106,7 +109,7 @@ def snapshot_from_usage(doc: dict, now: float) -> UsageSnapshot:
     """Normalise ``agy -p /usage --output-format json`` output."""
     if doc.get("status") != "SUCCESS":
         said = f"{doc.get('error')} {doc.get('response')}"  # checked, never echoed
-        if "Authentication expired" in said or "UNAUTHENTICATED" in said:
+        if any(s in said for s in ("Authentication expired", "UNAUTHENTICATED", "authentication failed")):
             return UsageSnapshot(UsageState.AUTHENTICATION_REQUIRED, measured_at=now, source="agy /usage",
                                  detail="agy says the sign-in expired; run agy as this account and sign in again")
         raise HswapError("agy /usage did not succeed")
@@ -151,6 +154,8 @@ class AgyAdapter(FileCredentialAdapter):
     shared_names = ("config", "antigravity-cli/settings.json")
     hot_reload = False
     fmt = AgyTokenFormat()
+    #: The provider's terms on switching accounts, shown when it is opted in to usage.remote/auto.enabled.
+    terms = _TERMS
     # Each read starts a 200 MB agy binary that also signs in and phones home.
     usage_policy = UsagePolicy(min_interval_s=300.0, stale_after_s=1800.0, max_backoff_s=3600.0)
 
@@ -189,7 +194,10 @@ class AgyAdapter(FileCredentialAdapter):
             Capability.ACCOUNT_REMOVE: supported("forgets hswap's copy; the live login is untouched"),
             Capability.ACCOUNT_SWITCH: blocked or supported(f"swaps ~/.gemini/{TOKEN_FILE}; restart running agy"),
             Capability.NATIVE_ACCOUNT_SWITCH: unsupported("agy keeps one Google login; /login replaces it"),
-            Capability.CREDENTIAL_REFRESH: unsupported("agy refreshes its own tokens; hswap never does"),
+            Capability.CREDENTIAL_REFRESH: blocked or supported(
+                "`hswap agy refresh` runs `agy -p /usage` in the account's own home (no agent turn, no quota "
+                "spent), which makes agy use its refresh token; hswap never refreshes tokens itself"
+            ),
             Capability.USAGE_MONITORING: usage,
             Capability.AUTOMATIC_ROTATION: experimental(_TERMS) if usage.usable
             else unavailable(f"needs usage monitoring ({usage.reason})"),
@@ -229,6 +237,21 @@ class AgyAdapter(FileCredentialAdapter):
                     )
             return snapshot_from_usage(self._ask_usage(home, active), time.time())
 
+    def keep_alive(self, account: Account) -> str:
+        """Ask agy ``/usage`` so it uses the stored refresh token (needs no opt-in)."""
+        with self.usage_home(account) as (home, active):
+            if home is None:
+                return "skipped: a running session keeps it fresh"
+            if active and processes.find({self.executable}) != []:
+                return f"skipped: {self.display_name} is running and refreshes the active login itself"
+            if not (home / self.credential_file).exists():  # agy would block on an interactive sign-in
+                raise HswapError("sign in again: this account's login is missing from its agy home")
+            doc = self._ask_usage(home, active)
+        # ponytail: agy refreshes in memory and rarely rewrites the file, so no before/after hash to compare.
+        if doc.get("status") != "SUCCESS" and snapshot_from_usage(doc, 0).state is UsageState.AUTHENTICATION_REQUIRED:
+            raise HswapError("sign in again: agy could not use or refresh this login")
+        return "login used (Google refresh tokens do not rotate)"
+
     @staticmethod
     def _token_life(path: Path) -> float | None:
         try:
@@ -241,23 +264,73 @@ class AgyAdapter(FileCredentialAdapter):
         inst = self._require_installed()
         home_args = [] if active else self.home_overrides(home)[1]  # default home: no flag
         try:
-            out = spawn.run(
-                [inst.executable, *home_args, "-p", "/usage", "--output-format", "json"],
+            proc = subprocess.Popen(
+                [str(inst.executable), *home_args, "-p", "/usage", "--output-format", "json"],
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=_USAGE_TIMEOUT_S,
+                errors="replace",
                 # No session bus: agy then skips the keyring (one login per desktop, not scoped by
                 # --gemini_dir) and uses this home's file, so the quota and any refresh stay with this account.
                 env={**{k: v for k, v in os.environ.items() if k != "DBUS_SESSION_BUS_ADDRESS"},
                      "AGY_CLI_DISABLE_AUTO_UPDATE": "1"},
+                start_new_session=os.name == "posix",  # no terminal; its helpers end with it
             )
+        except OSError as exc:
+            raise HswapError(f"could not start agy: {exc.strerror}") from None
+        lines: queue.Queue = queue.Queue()
+        for stream in (proc.stdout, proc.stderr):
+            threading.Thread(target=_pump, args=(stream, stream is proc.stderr, lines), daemon=True).start()
+        out, open_streams, deadline = [], 2, time.monotonic() + _USAGE_TIMEOUT_S
+        try:
+            while open_streams:
+                try:
+                    is_err, line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+                except queue.Empty:
+                    raise HswapError(f"agy /usage did not answer within {_USAGE_TIMEOUT_S}s") from None
+                if line is None:
+                    open_streams -= 1
+                elif is_err and _LOGIN_PROMPT in line:
+                    # The login could not be used or refreshed: agy now waits for a browser sign-in.
+                    return {"status": "ERROR", "error": "authentication failed or timed out"}
+                elif not is_err:
+                    out.append(line)
+                    if isinstance(doc := _json("".join(out)), dict):  # agy may linger after answering
+                        return doc
+            returncode = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             raise HswapError(f"agy /usage did not answer within {_USAGE_TIMEOUT_S}s") from None
-        try:
-            doc = json.loads(out.stdout)
-        except ValueError:
-            doc = None
-        if not isinstance(doc, dict):  # never echo agy's output: it may carry account data
-            raise HswapError(f"agy /usage exited with status {out.returncode} without a JSON result")
-        return doc
+        finally:
+            _stop(proc)
+        # never echo agy's output: it may carry account data
+        raise HswapError(f"agy /usage exited with status {returncode} without a JSON result")
+
+
+#: What agy prints on stderr when it falls back to an interactive (browser) sign-in.
+_LOGIN_PROMPT = "Authentication required"
+
+
+def _pump(stream, is_err: bool, lines: queue.Queue) -> None:
+    for line in stream:
+        lines.put((is_err, line))
+    lines.put((is_err, None))
+
+
+def _json(text: str) -> object:
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    """End agy and anything it started (Google refresh tokens do not rotate, so nothing is lost)."""
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except OSError:
+        pass
+    proc.wait()

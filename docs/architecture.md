@@ -155,9 +155,24 @@ the default home when active, `None` when a running session owns it, in which ca
 the adapter returns `stale` and the service keeps the last measurement (the STALE
 convention). `home_flag` (agy's `--gemini_dir=`) is the flag counterpart of
 `home_env`. `list --cached` / `usage --cached` serve the cache only: no
-network and no token refresh. `UsageService` holds a 30 s cache lock across a
-read, so a read slower than that (Grok 120 s, Codex 45 s) can make a second
-process give up waiting; this is known and not yet fixed.
+network and no token refresh. `UsageService` does not hold its lock while the harness answers: it claims the
+measurement in the cache, runs the read unlocked, then stores the result, and
+other processes serve the last numbers meanwhile. A claim names its process: an
+interrupted read releases it, and a killed one's claim is ignored (POSIX). Each
+entry records the `UsagePolicy` it was measured under, so a policy change (Codex
+when `usage.remote` changes) reads again at once. The JSON-RPC client starts the
+child in its own process group and stops the whole group on shutdown or timeout.
+If the live login file is unreadable, every account of that harness gets an error
+snapshot instead of a read from a stored copy.
+
+**Keep-alive.** `hswap <id> refresh [ACCOUNT] [--json]` calls the optional
+`keep_alive(account)` role, gated by `credential_refresh`. It asks the harness the
+same question as a usage read, in the account's own home (`usage_home`), without
+the opt-in or the cache. Codex and Grok compare a hash of the refresh-relevant
+credential fields before and after; agy only reports that the login was used.
+OpenCode does not implement it. The process check behind it
+(`infrastructure/processes.find`) also matches executables on a command line, so
+wrapped binaries count.
 
 `rotation.select_account` is pure: `best` requires fresh `available` evidence
 below the threshold; `next-available` skips only accounts known to be exhausted.

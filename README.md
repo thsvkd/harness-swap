@@ -24,12 +24,17 @@ harness can implement.
 `agy -p /usage`) and never calls a provider API or refreshes a token. Without the
 opt-in Codex still shows the last snapshot it logged locally. Verified against
 fake harnesses and the real binaries without accounts only, never a live paid
-account. `list --cached` / `usage --cached` read the cache: no network, no refresh.
+account. OpenCode reports Go-plan limits only for OpenCode Console logins, not
+API keys. Turning the opt-in on or off takes effect on the next read.
+`list --cached` / `usage --cached` read the cache: no usage read, no token
+refresh (hswap still runs each harness's version probe, and OpenCode's
+`auth list`, to list accounts).
 ⁴ opt-in per harness: `hswap config set auto.enabled <ids>`, then
 `hswap <harness> auto`. Needs live usage, and every provider's terms are
 unclear or restrictive about switching accounts to get past limits (Google's
-are the strictest); `hswap capabilities` prints the warning. Claude keeps
-`hswap claude auto`.
+are the strictest); `hswap capabilities` and `config set` print the warning. Claude keeps
+`hswap claude auto`, with its own threshold, JSON lines and exit codes
+([docs/claude.md](docs/claude.md)).
 ⁵ file-backed login only (Linux; not the macOS/Windows keychain); `add --login`
 is unavailable. Cursor and Gemini CLI are not supported. See
 [docs/harness-compatibility.md](docs/harness-compatibility.md) for the evidence
@@ -114,6 +119,27 @@ hswap list --cached                                      # no network, no token 
 hswap config set auto.enabled codex                      # allow automatic switching
 hswap codex auto [--once | --interval S] [--dry-run] [--json]
 ```
+
+### Keep logins alive
+
+```bash
+hswap codex refresh [ACCOUNT] [--json]    # also: grok, agy
+# crontab: keep stored logins fresh on a machine you rarely use
+0 */6 * * * hswap codex refresh
+```
+
+`refresh` asks the harness (in each account's own home) so the harness refreshes
+a due token itself; hswap never calls a provider. It needs no opt-in, skips an
+account a running session owns and the active login while that harness runs (any
+process whose command line names the harness executable counts, e.g. a sandbox
+that binds it), and
+prints `token refreshed` / `token still valid` (agy: `login used`), or
+`sign in again: ...` with exit 1. OpenCode is unsupported: switch to an idle
+account (`hswap opencode switch`) before its token lapses. Claude: the engine
+refreshes tokens when it reads usage, so run `hswap claude list` or
+`hswap claude auto --once` from cron. Verified against fake harnesses only, never
+a live account. Why it is safe with several devices:
+[docs/security.md](docs/security.md#keep-alive-hswap-id-refresh).
 
 `auto` switches only on fresh usage at or over `rotation.threshold`, at most once
 per `auto.cooldown` (default 600 s), and never on missing data. Read the terms

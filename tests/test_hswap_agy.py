@@ -58,6 +58,10 @@ answer = answers[email]
 if answer == "crash":
     print("synthetic-access-LEAK")
     sys.exit(3)
+if answer == "login-prompt":  # a login agy cannot refresh: it waits for a browser sign-in
+    print("Authentication required. Please visit the URL to log in:", file=sys.stderr, flush=True)
+    import time
+    time.sleep(30)
 print(json.dumps(answer))
 """
 
@@ -221,3 +225,60 @@ def test_usage_failures_never_echo_output(agy):
         adapter.read_usage(a)
     assert "LEAK" not in str(exc.value) and "status 3" in str(exc.value)
     assert adapter.read_usage(b).state is UsageState.AUTHENTICATION_REQUIRED
+
+
+def test_keep_alive_asks_agy_without_opt_in_and_never_echoes(agy, monkeypatch):
+    adapter, home, tmp = agy
+    a, b = two_accounts(adapter, home)
+    assert adapter.capabilities()[Capability.CREDENTIAL_REFRESH].support is Support.SUPPORTED
+    assert "hswap agy refresh" in adapter.capabilities()[Capability.CREDENTIAL_REFRESH].reason
+    write_json(tmp / "answers.json", {"a@x.com": usage_doc(group("G", bucket("5h", 1.0))),
+                                      "B@x.com": usage_doc(group("G", bucket("5h", 1.0)))})
+    sign_in(home, "a@x.com", expires_in=60)  # nearly expired active token: no 10-minute guard here
+    assert adapter.keep_alive(a) == "login used (Google refresh tokens do not rotate)"
+    assert adapter.keep_alive(b) == "login used (Google refresh tokens do not rotate)"
+    c_active, c_other = calls(tmp)
+    assert c_active["args"] == ["-p", "/usage", "--output-format", "json"] and not c_active["tty"]
+    assert c_other["home"] != str(home) and c_other["dbus"] is None
+    # a running agy owns the active login: leave it alone
+    monkeypatch.setattr("harness_swap.infrastructure.processes.find", lambda names: [1])
+    assert "skipped" in adapter.keep_alive(a) and len(calls(tmp)) == 2
+    assert adapter.keep_alive(b).startswith("login used")  # inactive account is not that process's
+    # a running hswap session owns b
+    fd = sessions.acquire(adapter.store.account_dir(b.slot))
+    try:
+        assert adapter.keep_alive(b) == "skipped: a running session keeps it fresh"
+    finally:
+        os.close(fd)
+
+
+def test_keep_alive_auth_failure_and_missing_login(agy):
+    adapter, home, tmp = agy
+    a, b = two_accounts(adapter, home)
+    write_json(tmp / "answers.json", {
+        "a@x.com": {"status": "ERROR", "response": "", "error": "401 UNAUTHENTICATED synthetic-access-LEAK"},
+        "B@x.com": "crash",
+    })
+    with pytest.raises(HswapError, match="sign in again") as exc:
+        adapter.keep_alive(a)
+    assert "LEAK" not in str(exc.value)
+    with pytest.raises(HswapError) as exc:
+        adapter.keep_alive(b)
+    assert "LEAK" not in str(exc.value)
+    (adapter.store.account_dir(b.slot) / TOKEN_FILE).unlink()
+    n = len(calls(tmp))
+    with pytest.raises(HswapError, match="no stored credentials"):
+        adapter.keep_alive(b)
+    assert len(calls(tmp)) == n  # agy never started: it would wait for an interactive sign-in
+
+
+def test_a_login_agy_cannot_refresh_says_sign_in_again_at_once(agy):
+    adapter, home, tmp = agy
+    _a, b = two_accounts(adapter, home)
+    settings.set_value("usage.remote", "agy")
+    write_json(tmp / "answers.json", {"a@x.com": "login-prompt", "B@x.com": "login-prompt"})
+    started = time.monotonic()
+    with pytest.raises(HswapError, match="sign in again"):
+        adapter.keep_alive(b)
+    assert adapter.read_usage(b).state is UsageState.AUTHENTICATION_REQUIRED
+    assert time.monotonic() - started < 15  # not agy's 60 s wait for a browser

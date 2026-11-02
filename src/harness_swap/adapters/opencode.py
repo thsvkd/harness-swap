@@ -173,6 +173,8 @@ class OpenCodeAdapter:
     #: Seconds allowed for one OpenCode command (it may start its service).
     timeout = 120
     usage_policy = _USAGE_POLICY
+    #: The provider's terms on switching accounts, shown when it is opted in to usage.remote/auto.enabled.
+    terms = _TERMS
 
     def __init__(self) -> None:
         self._installation: Installation | None = None
@@ -266,6 +268,11 @@ class OpenCodeAdapter:
                 Capability.ACCOUNT_REMOVE: supported("runs `opencode auth logout <integration> <id>`"),
                 Capability.ACCOUNT_SWITCH: supported("runs `opencode auth switch <integration> <id>`"),
                 Capability.NATIVE_ACCOUNT_SWITCH: supported("OpenCode keeps several saved accounts per integration"),
+                Capability.CREDENTIAL_REFRESH: unsupported(
+                    "OpenCode keeps inactive logins in its own database and refreshes an account only when it is "
+                    "the active one; hswap does not write that database, so to keep an idle account usable switch "
+                    "to it (`hswap opencode switch`) before its token lapses (OpenCode Console tokens last weeks)"
+                ),
             }
         return common | {
             Capability.ACCOUNT_ADD: experimental("snapshots provider entries of the legacy auth.json"),

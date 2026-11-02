@@ -359,6 +359,14 @@ for line in sys.stdin:
     if msg.get("method") == "initialize":
         print(json.dumps({"id": msg["id"], "result": {"userAgent": "hswap/0.166.0"}}), flush=True)
     elif msg.get("method") == "account/rateLimits/read":
+        if reply.get("hang"):  # never answers: hswap's deadline ends it
+            continue
+        if os.environ.get("FAKE_ROTATE"):  # Codex refreshes a due token in its home
+            path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
+            doc = json.load(open(path))
+            doc["tokens"]["refresh_token"] += "-rotated"
+            doc["last_refresh"] = "2026-11-03T00:00:00Z"
+            json.dump(doc, open(path, "w"))
         print(json.dumps({"method": "account/rateLimits/updated", "params": {}}), flush=True)
         print(json.dumps({"id": msg["id"], **reply}), flush=True)
 """
@@ -530,6 +538,12 @@ def test_remote_usage_states(remote):
     assert ask(1, app_server_reply(account="acct-1", ordinaryUsageAllowed=False)).state is UsageState.RATE_LIMITED
     auth = ask(1, {"error": {"code": -32600, "message": "codex account authentication required to read rate limits"}})
     assert auth.state is UsageState.AUTHENTICATION_REQUIRED
+    body = 'body={\n  "error": {\n    "message": "Could not parse your authentication token"\n  }\n}'
+    unauthorized = ask(1, {"error": {"code": -32603, "message": f"GET https://x.invalid/usage failed: 401 Unauthorized; {body}"}})
+    assert unauthorized.state is UsageState.AUTHENTICATION_REQUIRED and "Could not" not in unauthorized.detail
+    with pytest.raises(Exception, match=r"^failed: 500 body=\{ \"error\": 1 \}$") as exc:
+        ask(1, {"error": {"code": -32603, "message": 'failed: 500 body={\n  "error": 1\n}'}})
+    assert "\n" not in str(exc.value)
     with pytest.raises(HswapError, match="different account"):
         ask(1, app_server_reply(account="acct-2"))
     with pytest.raises(Exception, match="withheld"):
@@ -553,3 +567,116 @@ def test_capabilities_follow_the_opt_ins(codex):
     assert "https://" in rotation.reason
     adapter._installation = Installation(False, detail="`codex` not found on PATH")
     assert adapter.capabilities()[Capability.AUTOMATIC_ROTATION].support is Support.UNAVAILABLE
+
+
+# -- keep-alive (`hswap codex refresh`) ------------------------------------------------------
+
+
+def keep(adapter, slot):
+    return adapter.keep_alive(next(a for a in adapter.list_accounts() if a.slot == slot))
+
+
+@posix_only
+def test_keep_alive_lets_codex_refresh_in_the_account_home(remote, monkeypatch):
+    from harness_swap.core import settings
+
+    adapter, home, _ask, calls = remote
+    settings.set_value("usage.remote", "")  # an explicit refresh needs no opt-in
+    write_json(Path(os.environ["FAKE_REPLY"]), app_server_reply(account="acct-1"))
+    live = (home / "auth.json").read_bytes()
+    assert keep(adapter, 1) == "token still valid"
+    monkeypatch.setenv("FAKE_ROTATE", "1")
+    result = keep(adapter, 1)
+    assert result == "token refreshed" and "synthetic" not in result
+    stored = json.loads((adapter.store.account_dir(1) / "auth.json").read_text())
+    assert stored["tokens"]["refresh_token"] == "synthetic-refresh-1-rotated"
+    assert (home / "auth.json").read_bytes() == live
+    assert [c["home"] for c in calls() if "argv" in c] == [str(adapter.store.account_dir(1))] * 2
+
+
+@posix_only
+def test_keep_alive_touches_the_active_login_only_while_no_codex_runs(remote, monkeypatch):
+    adapter, home, _ask, calls = remote
+    write_json(Path(os.environ["FAKE_REPLY"]), app_server_reply(account="acct-2"))
+    for running in ([4242], None):
+        monkeypatch.setattr("harness_swap.infrastructure.processes.find", lambda names, r=running: r)
+        assert keep(adapter, 2) == "skipped: Codex CLI is running and refreshes the active login itself"
+    assert calls() == []
+    monkeypatch.setattr("harness_swap.infrastructure.processes.find", lambda names: [])
+    set_live_token(home, exp=int(time.time()) + 60)  # no 10-minute guard: nothing else can refresh it
+    monkeypatch.setenv("FAKE_ROTATE", "1")
+    assert keep(adapter, 2) == "token refreshed"
+    assert calls()[0]["home"] == str(home)
+
+
+@posix_only
+def test_keep_alive_skips_an_account_a_session_runs(remote):
+    adapter, _home, _ask, calls = remote
+    fd = sessions.acquire(adapter.store.account_dir(1))
+    try:
+        assert keep(adapter, 1) == "skipped: a running session keeps it fresh"
+    finally:
+        os.close(fd)
+    assert calls() == []
+
+
+@posix_only
+def test_keep_alive_failures_never_echo_codex(remote):
+    adapter, _home, _ask, _calls = remote
+    reply = Path(os.environ["FAKE_REPLY"])
+    write_json(reply, {"error": {"code": -32600, "message": "codex account authentication required to read rate limits"}})
+    with pytest.raises(HswapError, match="^sign in again: "):
+        keep(adapter, 1)
+    write_json(reply, {"error": {"code": -32603, "message": "failed to fetch codex rate limits: GET x failed: 401 Unauthorized"}})
+    with pytest.raises(HswapError, match="^sign in again: "):
+        keep(adapter, 1)
+    write_json(reply, {"error": {"code": -32603, "message": "failed to fetch codex rate limits: 503 body=SECRETBODY"}})
+    with pytest.raises(HswapError) as exc:
+        keep(adapter, 1)
+    assert "SECRETBODY" not in str(exc.value) and "sign in" not in str(exc.value)
+    assert "(error -32603)" in str(exc.value)
+    write_json(reply, {"error": "plain SECRETBODY"})  # a harness error without a code is still Codex's text
+    with pytest.raises(HswapError) as exc:
+        keep(adapter, 1)
+    assert "SECRETBODY" not in str(exc.value) and str(exc.value).startswith("Codex could not check this login;")
+
+
+@posix_only
+def test_keep_alive_timeout_is_not_called_harmless(remote, monkeypatch):
+    adapter, _home, _ask, _calls = remote
+    monkeypatch.setattr("harness_swap.adapters.codex._RPC_TIMEOUT_S", 1.0)
+    write_json(Path(os.environ["FAKE_REPLY"]), {"hang": True})
+    with pytest.raises(HswapError) as exc:
+        keep(adapter, 1)
+    message = str(exc.value)
+    assert message.startswith("no answer to account/rateLimits/read in time")
+    assert "may need to sign in again" in message and "nothing changed" not in message
+
+
+def test_keep_alive_reports_a_missing_login(codex):
+    adapter, home = codex
+    login(home, "1@x.com", "user-1", "acct-1")
+    adapter.add_account()
+    login(home, "2@x.com", "user-2", "acct-2")
+    adapter.add_account()
+    (adapter.store.account_dir(1) / "auth.json").write_text("not json")
+    with pytest.raises(HswapError, match="^sign in again: "):
+        keep(adapter, 1)
+
+
+def test_keep_alive_has_nothing_to_refresh_for_api_keys(codex):
+    adapter, home = codex
+    write_json(home / "auth.json", {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-synthetic-0123456789abcdef"})
+    adapter.add_account()
+    assert keep(adapter, 1) == "API-key login: nothing to refresh"
+
+
+def test_credential_refresh_capability(codex):
+    adapter, home = codex
+    status = adapter.capabilities()[Capability.CREDENTIAL_REFRESH]
+    assert status.support is Support.SUPPORTED and "hswap codex refresh" in status.reason
+    (home / "config.toml").write_text('cli_auth_credentials_store = "keyring"\n')
+    assert adapter.capabilities()[Capability.CREDENTIAL_REFRESH].support is Support.UNAVAILABLE
+    (home / "config.toml").unlink()
+    adapter._installation = Installation(False, detail="`codex` not found on PATH")
+    assert adapter.capabilities()[Capability.CREDENTIAL_REFRESH].support is Support.UNAVAILABLE

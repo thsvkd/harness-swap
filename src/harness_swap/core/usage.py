@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 from harness_swap.core.adapter import UsageReader
+from harness_swap.core.errors import HswapError
 from harness_swap.core.models import Account, QuotaWindow, UsageSnapshot, UsageState
 from harness_swap.core.store import mkdir_private
 from harness_swap.infrastructure.fsutil import atomic_write_text
@@ -42,6 +44,25 @@ def _to_cache(s: UsageSnapshot) -> dict:
 def _from_cache(d: dict) -> UsageSnapshot:
     windows = tuple(QuotaWindow(**w) for w in d.get("windows", ()))
     return UsageSnapshot(**{**d, "state": UsageState(d["state"]), "windows": windows})
+
+
+def _describe(exc: Exception) -> str:
+    """One line: hswap's own errors as they are, anything else with its type name."""
+    text = " ".join(str(exc).split())
+    return text if isinstance(exc, HswapError) else f"{type(exc).__name__}: {text}"
+
+
+def _alive(pid: object) -> bool:
+    """Whether the process that claimed a measurement still runs (unknown counts as alive)."""
+    if not isinstance(pid, int) or os.name != "posix":  # os.kill(pid, 0) is not a probe on Windows
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 class UsageService:
@@ -74,6 +95,14 @@ class UsageService:
         except (TypeError, ValueError, KeyError, AttributeError):
             return {}, None  # written by another hswap version: start over
 
+    def _release(self, key: str) -> None:
+        with self._lock():
+            cache = self._load()
+            entry, _last = self._entry(cache, key)
+            if entry.pop("claimed_until", None) is not None:
+                cache[key] = entry
+                atomic_write_text(self._path(), json.dumps(cache, indent=1))
+
     def get(self, reader: UsageReader, account: Account) -> UsageSnapshot:
         """The account's usage, measuring it when the policy allows.
 
@@ -83,31 +112,39 @@ class UsageService:
         numbers instead of starting a second measurement.
         """
         policy = reader.usage_policy
+        # A measurement taken under another policy (e.g. before `usage.remote` changed) is not reused.
+        mode = list(dataclasses.astuple(policy))
         now = self.clock()
         with self._lock():
             cache = self._load()
             entry, last = self._entry(cache, account.key)
             failures = entry.get("failures", 0)
-            if failures and now < entry.get("retry_at", 0.0):
+            same_mode = entry.get("policy") == mode
+            if same_mode and failures and now < entry.get("retry_at", 0.0):
                 return self._failed(last, entry.get("error", "usage read failed"))
-            if not failures and last is not None and now < entry.get("fetched_at", 0.0) + policy.min_interval_s:
+            fresh = now < entry.get("fetched_at", 0.0) + policy.min_interval_s
+            if same_mode and not failures and last is not None and fresh:
                 return self._aged(last, policy.stale_after_s, now)
-            if now < entry.get("claimed_until", 0.0):
+            if now < entry.get("claimed_until", 0.0) and _alive(entry.get("claimed_by")):
                 if last is None:
                     return UsageSnapshot(UsageState.UNKNOWN, detail="being measured by another hswap process")
                 return self._aged(last, policy.stale_after_s, now)
-            cache[account.key] = {**entry, "claimed_until": now + self.CLAIM_S}
+            cache[account.key] = {**entry, "claimed_until": now + self.CLAIM_S, "claimed_by": os.getpid()}
             atomic_write_text(self._path(), json.dumps(cache, indent=1))
         try:
             snap = reader.read_usage(account)
             keep_last = snap.state is UsageState.STALE and not snap.windows and last is not None
             error = None
         except Exception as exc:  # noqa: BLE001 - any adapter failure becomes an error snapshot
-            snap, keep_last, error = None, False, f"{type(exc).__name__}: {exc}"
+            snap, keep_last, error = None, False, _describe(exc)
+        except BaseException:  # Ctrl-C: let the next run measure instead of waiting out the claim
+            self._release(account.key)
+            raise
         with self._lock():
             cache = self._load()
             entry, last = self._entry(cache, account.key)
             entry.pop("claimed_until", None)
+            entry.pop("claimed_by", None)
             if keep_last and last is not None:
                 # The adapter cannot measure right now (e.g. the account is not
                 # the active one): keep serving the last measurement.
@@ -115,10 +152,10 @@ class UsageService:
             elif error is not None:
                 failures = entry.get("failures", 0) + 1
                 delay = min(policy.min_interval_s * 2**failures, policy.max_backoff_s)
-                entry = {**entry, "failures": failures, "retry_at": now + delay, "error": error}
+                entry = {**entry, "failures": failures, "retry_at": now + delay, "error": error, "policy": mode}
                 snap = self._failed(last, error)
             else:
-                entry = {"snapshot": _to_cache(snap), "fetched_at": now, "failures": 0}  # type: ignore[arg-type]
+                entry = {"snapshot": _to_cache(snap), "fetched_at": now, "failures": 0, "policy": mode}  # type: ignore[arg-type]
             cache[account.key] = entry
             atomic_write_text(self._path(), json.dumps(cache, indent=1))
         return self._aged(snap, policy.stale_after_s, now)  # type: ignore[arg-type]

@@ -30,10 +30,16 @@ Verified against Grok Build 1.0.70 and its bundled user guide
   access token has more than 10 minutes left: a Grok the user started may
   refresh the same refresh token, and Grok deletes the credential after a
   permanent refresh failure.
+* Keep-alive (``hswap grok refresh``): the same ``_x.ai/billing`` question,
+  without the opt-in, makes Grok refresh a due token in the account's own home
+  under its own lock. The active login is touched only while no Grok runs on
+  this machine (then nothing else can be refreshing it). The answer compares a
+  hash of the scope's access and refresh tokens before and after.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -57,7 +63,7 @@ from harness_swap.core.models import (
     unavailable,
     unsupported,
 )
-from harness_swap.infrastructure import jsonrpc
+from harness_swap.infrastructure import jsonrpc, processes
 
 #: The active login is asked about only with more token life than this left.
 _MIN_TOKEN_LIFE_S = 600.0
@@ -172,6 +178,8 @@ class GrokAdapter(FileCredentialAdapter):
     shared_names = ("config.toml", "rules", "skills", "memory", "installed-plugins", "trusted_folders.toml")
     hot_reload = True
     fmt = GrokAuthFormat()
+    #: The provider's terms on switching accounts, shown when it is opted in to usage.remote/auto.enabled.
+    terms = _TERMS
     usage_policy = _POLICY
 
     @property
@@ -197,7 +205,12 @@ class GrokAdapter(FileCredentialAdapter):
             Capability.ACCOUNT_REMOVE: supported("forgets hswap's copy; the live login is untouched"),
             Capability.ACCOUNT_SWITCH: blocked or supported("replaces one login scope in $GROK_HOME/auth.json"),
             Capability.NATIVE_ACCOUNT_SWITCH: unsupported("`grok login` replaces the single cached session"),
-            Capability.CREDENTIAL_REFRESH: unsupported("Grok refreshes its own tokens; hswap captures them before a switch"),
+            Capability.CREDENTIAL_REFRESH: blocked
+            or supported(
+                "`hswap grok refresh` asks Grok (`grok agent stdio`, `_x.ai/billing`) in each account's own home, "
+                "so Grok refreshes a due token there under its own lock; skips accounts a session runs, and the "
+                "active login while Grok is running. API-key logins have nothing to refresh"
+            ),
             Capability.USAGE_MONITORING: usage_status,
             Capability.AUTOMATIC_ROTATION: rotation_status,
             Capability.PARALLEL_SESSIONS: blocked
@@ -217,16 +230,12 @@ class GrokAdapter(FileCredentialAdapter):
             if home is None:
                 return UsageSnapshot(UsageState.STALE, detail="in use by a running session; showing the last measurement")
             if not active and (why := self._maybe_live(account)):
-                return UsageSnapshot(UsageState.STALE, detail=why)
+                return UsageSnapshot(UsageState.STALE, detail=f"{why}; showing the last measurement")
             entry = self._entry(home / self.credential_file, account.identity)
             if active and (why := token_expiring(entry, time.time())):
                 return UsageSnapshot(UsageState.STALE, detail=why)
-            env_add, home_args = self.home_overrides(home)
-            argv = [str(inst.executable), *home_args, "agent", "--no-leader", "stdio"]
             try:
-                with jsonrpc.session(argv, {**os.environ, **env_add}, timeout=_RPC_TIMEOUT_S, version_tag=True) as rpc:
-                    rpc.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
-                    result = rpc.request("_x.ai/billing", {})
+                result = self._billing(str(inst.executable), home)
             except jsonrpc.RpcError as exc:
                 text = str(exc).lower()
                 if "requires auth with grok.com" in text:
@@ -242,6 +251,49 @@ class GrokAdapter(FileCredentialAdapter):
         plan = _TIERS[tier] if isinstance(tier, int) and 0 <= tier < len(_TIERS) else None
         return snapshot_from_billing(result, plan, time.time())
 
+    def keep_alive(self, account: Account) -> str:
+        if account.auth_mode == "api_key":
+            return "API-key login: nothing to refresh"
+        inst = self._require_installed()
+        with self.usage_home(account) as (home, active):
+            if home is None:
+                return "skipped: a running session keeps it fresh"
+            # Grok processes elsewhere hold the active refresh token in memory; only refresh
+            # it when none runs (unknown counts as running).
+            if active and processes.find({self.executable}) != []:
+                return f"skipped: {self.display_name} is running and refreshes the active login itself"
+            if not active and (why := self._maybe_live(account)):
+                return f"skipped: {why}"
+            auth_file = home / self.credential_file
+            before = self._entry(auth_file, account.identity)
+            if before is None:
+                raise HswapError("sign in again: this account's login is missing from its Grok home")
+            try:
+                self._billing(str(inst.executable), home)
+            except jsonrpc.RpcError as exc:
+                text = str(exc).lower()
+                if "authentication required" in text:
+                    raise HswapError("sign in again: Grok has no usable login for this account") from None
+                # Billing is refused for non-grok.com logins after authentication, so the token was still checked.
+                if not exc.harness:  # hswap's own text: timeout, exit, start failure
+                    raise HswapError(str(exc)) from None
+                if "requires auth with grok.com" not in text:
+                    # Grok's own error text is not repeated: it may quote server responses.
+                    code = f" (error {exc.code})" if exc.code is not None else ""
+                    raise HswapError(f"Grok could not check this login{code}") from None
+            after = self._entry(auth_file, account.identity)
+        if after is None:
+            raise HswapError("sign in again: Grok removed this login after its token refresh failed")
+        return "token refreshed" if _token_hash(after) != _token_hash(before) else "token still valid"
+
+    def _billing(self, executable: str, home: Path) -> object:
+        """Ask Grok (``_x.ai/billing`` over ACP) with ``home`` as its ``GROK_HOME``."""
+        env_add, home_args = self.home_overrides(home)
+        argv = [executable, *home_args, "agent", "--no-leader", "stdio"]
+        with jsonrpc.session(argv, {**os.environ, **env_add}, timeout=_RPC_TIMEOUT_S, version_tag=True) as rpc:
+            rpc.request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+            return rpc.request("_x.ai/billing", {})
+
     def _maybe_live(self, account: Account) -> str | None:
         """Why ``account``'s stored copy must not be used now (``None``: it is not live).
 
@@ -252,9 +304,9 @@ class GrokAdapter(FileCredentialAdapter):
         try:
             live = self.credentials.live_identities()
         except CredentialError:
-            return "Grok's live auth.json cannot be read right now, so this account may be live; showing the last measurement"
+            return "Grok's live auth.json cannot be read right now, so this account may be live"
         if any(ident.identity == account.identity for ident in live.values()):
-            return "this account just became the live login; showing the last measurement"
+            return "this account just became the live login"
         return None
 
     def _entry(self, auth_file: Path, identity: str) -> dict | None:
@@ -268,6 +320,11 @@ class GrokAdapter(FileCredentialAdapter):
             if ident and ident.identity == identity:
                 return part
         return None
+
+
+def _token_hash(entry: dict) -> str:
+    """A digest of the refresh-relevant fields, to tell whether Grok rotated them without showing them."""
+    return hashlib.sha256(json.dumps([entry.get("key"), entry.get("refresh_token")]).encode()).hexdigest()
 
 
 def token_expiring(entry: dict | None, now: float) -> str | None:

@@ -538,3 +538,20 @@ def test_legacy_and_missing_opencode_report_no_usage(tmp_path, monkeypatch):
     assert caps[Capability.USAGE_MONITORING].support is Support.UNSUPPORTED
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     assert OpenCodeAdapter().capabilities()[Capability.USAGE_MONITORING].support is Support.UNAVAILABLE
+
+
+def test_refresh_is_unsupported_in_native_mode_and_the_cli_refuses_it(v2, capsys):
+    from harness_swap import cli
+    from harness_swap.core.registry import Registry
+
+    adapter, _ = v2
+    status = adapter.capabilities()[Capability.CREDENTIAL_REFRESH]
+    assert status.support is Support.UNSUPPORTED
+    assert "hswap opencode switch" in status.reason and "database" in status.reason
+    reg = Registry(discover_plugins=False)
+    reg.register("opencode", lambda: adapter)
+    code = cli.run(["opencode", "refresh"], reg)
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "credential_refresh is not supported" in captured.out + captured.err
+    assert "hswap opencode switch" in captured.out + captured.err

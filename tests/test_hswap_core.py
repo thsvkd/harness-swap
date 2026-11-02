@@ -229,6 +229,48 @@ class TestUsageService:
         reader = CountingReader(UsageSnapshot(UsageState.AVAILABLE, (), measured_at=800.0))
         assert UsageService(tmp_path, lambda: clock[0]).get(reader, acct(1)).state is UsageState.STALE
 
+    def test_a_policy_change_is_measured_at_once(self, tmp_path):
+        """Turning `usage.remote` on (or off) changes the policy: the old entry is not reused."""
+        clock = [1000.0]
+        svc = UsageService(tmp_path, lambda: clock[0])
+        passive, live = CountingReader(snap(10)), CountingReader(snap(50))
+        live.usage_policy = UsagePolicy(min_interval_s=300, stale_after_s=1800, max_backoff_s=3600)
+        svc.get(passive, acct(1))
+        clock[0] += 5
+        assert svc.get(live, acct(1)).windows[0].used_percent == 50 and live.calls == 1
+        failing = CountingReader(RuntimeError("boom"))
+        clock[0] += 400
+        svc.get(failing, acct(1))  # backs off under its own policy ...
+        assert svc.get(live, acct(1)).windows[0].used_percent == 50 and live.calls == 2  # ... not another's
+
+    def test_a_dead_or_interrupted_claim_does_not_block(self, tmp_path):
+        clock = [1000.0]
+        svc = UsageService(tmp_path, lambda: clock[0])
+
+        class Interrupted(CountingReader):
+            def read_usage(self, account):
+                raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            svc.get(Interrupted(None), acct(1))
+        reader = CountingReader(snap(10))
+        svc.get(reader, acct(1))
+        assert reader.calls == 1
+        cache = json.loads((tmp_path / "usage-cache.json").read_text())
+        dead = 2**22 + 12345  # above Linux's pid_max default: no such process
+        cache[acct(2).key] = {"claimed_until": clock[0] + 300, "claimed_by": dead}  # a killed hswap
+        (tmp_path / "usage-cache.json").write_text(json.dumps(cache))
+        if os.name == "posix":
+            svc.get(reader, acct(2))
+            assert reader.calls == 2
+
+    def test_errors_are_one_line(self, tmp_path):
+        svc = UsageService(tmp_path, lambda: 1000.0)
+        result = svc.get(CountingReader(RuntimeError('body={\n  "error": 1\n}')), acct(1))
+        assert result.detail == 'RuntimeError: body={ "error": 1 }'
+        result = svc.get(CountingReader(HswapError("x\ny")), acct(2))
+        assert result.detail == "x y"
+
     def test_cache_holds_no_credentials(self, tmp_path):
         reader = CountingReader(snap(10))
         UsageService(tmp_path).get(reader, acct(1))

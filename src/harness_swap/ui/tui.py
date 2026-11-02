@@ -40,6 +40,8 @@ def collect(registry: Registry, progress: Callable[[list[tuple]], None] | None =
                 rows.append((adapter, None, "", f"not installed: {inst.detail}"))
                 continue
             accounts = adapter.list_accounts()
+            if progress:  # the accounts at once; asking a harness for usage can take a while
+                progress(rows + [(adapter, acc, "measuring...", "") for acc in accounts])
             usage = service.collect_usage(adapter, accounts, usage_service)
             switch = adapter.capabilities().get(Capability.ACCOUNT_SWITCH)
         except Exception as exc:  # noqa: BLE001 - one harness must not take the dashboard down

@@ -35,11 +35,17 @@ docs/harness-compatibility.md for the evidence and its classification):
   ``rateLimitsByLimitId`` are not read. If a read is cut off at the timeout
   while Codex is mid-refresh, the rotated refresh token may be lost and that
   account must sign in again.
+* ``hswap codex refresh`` keeps stored logins usable the same way: one
+  ``account/rateLimits/read`` in the account's own home, so Codex refreshes
+  a due token and stores the rotated one there. No opt-in needed (the user
+  asked); the active login only while no Codex runs on this machine, since
+  that Codex could redeem the same single-use refresh token.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -65,7 +71,7 @@ from harness_swap.core.models import (
     unavailable,
     unsupported,
 )
-from harness_swap.infrastructure import jsonrpc, spawn
+from harness_swap.infrastructure import jsonrpc, processes, spawn
 
 _AUTH_CLAIMS = "https://api.openai.com/auth"
 #: Newest session logs examined per home when looking for a usage snapshot.
@@ -243,6 +249,24 @@ def refresh_due(auth_file: Path, now: float) -> str | None:
     )
 
 
+def _token_hash(auth_file: Path) -> str | None:
+    """A digest of what a refresh changes, so the outcome is told without showing a token."""
+    try:
+        doc = json.loads(auth_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    doc = doc if isinstance(doc, dict) else {}
+    tokens = doc.get("tokens") if isinstance(doc.get("tokens"), dict) else {}
+    fields = [tokens.get("refresh_token"), tokens.get("access_token"), doc.get("last_refresh")]
+    return hashlib.sha256(json.dumps(fields).encode()).hexdigest()
+
+
+def _auth_failed(exc: jsonrpc.RpcError) -> bool:
+    """Codex's "no login" answer, a refresh it gave up on, or a 401 from its backend."""
+    text = str(exc).lower()
+    return any(s in text for s in ("authentication required", "sign in again", "401 unauthorized"))
+
+
 def _hswap_version() -> str:
     try:
         return importlib.metadata.version("harness-swap")
@@ -288,6 +312,8 @@ class CodexAdapter(FileCredentialAdapter):
     shared_names = ("config.toml", "AGENTS.md", "rules", "prompts", "skills", "hooks", "hooks.json")
     hot_reload = False
     fmt = CodexAuthFormat()
+    #: The provider's terms on switching accounts, shown when it is opted in to usage.remote/auto.enabled.
+    terms = _TERMS
 
     @property
     def remote_usage(self) -> bool:
@@ -365,8 +391,10 @@ class CodexAdapter(FileCredentialAdapter):
             Capability.ACCOUNT_REMOVE: supported("forgets hswap's copy; the live login is untouched"),
             Capability.ACCOUNT_SWITCH: blocked or supported("swaps $CODEX_HOME/auth.json; restart running Codex"),
             Capability.NATIVE_ACCOUNT_SWITCH: unsupported("Codex has one login per CODEX_HOME"),
-            Capability.CREDENTIAL_REFRESH: unsupported(
-                "Codex refreshes its own tokens; hswap captures rotated tokens before every switch"
+            Capability.CREDENTIAL_REFRESH: blocked or supported(
+                f"`hswap {self.id} refresh` asks Codex (`codex app-server`, the request /status uses) in each "
+                "account's own home, so Codex refreshes a due token and stores it there; skips an account a "
+                "session runs, and the active login while Codex runs"
             ),
             Capability.USAGE_MONITORING: usage_status,
             Capability.AUTOMATIC_ROTATION: rotation_status,
@@ -406,15 +434,10 @@ class CodexAdapter(FileCredentialAdapter):
                 return UsageSnapshot(UsageState.STALE, detail="in use by a running session; showing the last measurement")
             if active and (why := refresh_due(home / self.credential_file, time.time())):
                 return UsageSnapshot(UsageState.STALE, detail=why)
-            env_add, home_args = self.home_overrides(home)
-            argv = [str(inst.executable), *home_args, "app-server", "--listen", "stdio://"]
             try:
-                with jsonrpc.session(argv, {**os.environ, **env_add}, timeout=_RPC_TIMEOUT_S, version_tag=False) as rpc:
-                    rpc.request("initialize", {"clientInfo": {"name": "hswap", "version": _hswap_version()}})
-                    rpc.notify("initialized")
-                    result = rpc.request("account/rateLimits/read", {"excludeResetCreditDetails": True})
+                result = self._rate_limits(inst.executable, home)
             except jsonrpc.RpcError as exc:
-                if "authentication required" not in str(exc):
+                if not (exc.harness and _auth_failed(exc)):
                     raise
                 return UsageSnapshot(
                     UsageState.AUTHENTICATION_REQUIRED,
@@ -425,3 +448,45 @@ class CodexAdapter(FileCredentialAdapter):
         if answered_for and answered_for != account_id:
             raise HswapError("Codex answered for a different account; not recording it")
         return snapshot_from_app_server(result, time.time())
+
+    def _rate_limits(self, executable: str | None, home: Path) -> object:
+        """``account/rateLimits/read`` from ``codex app-server`` run in ``home``."""
+        env_add, home_args = self.home_overrides(home)
+        argv = [str(executable), *home_args, "app-server", "--listen", "stdio://"]
+        with jsonrpc.session(argv, {**os.environ, **env_add}, timeout=_RPC_TIMEOUT_S, version_tag=False) as rpc:
+            rpc.request("initialize", {"clientInfo": {"name": "hswap", "version": _hswap_version()}})
+            rpc.notify("initialized")
+            return rpc.request("account/rateLimits/read", {"excludeResetCreditDetails": True})
+
+    def keep_alive(self, account: Account) -> str:
+        """Ask Codex something that needs the login, so it refreshes a due token in that home."""
+        if account.auth_mode == "api_key":
+            return "API-key login: nothing to refresh"
+        inst = self._require_installed()
+        with self.usage_home(account) as (home, active):
+            if home is None:
+                return "skipped: a running session keeps it fresh"
+            if active and processes.find({self.executable}) != []:
+                return f"skipped: {self.display_name} is running and refreshes the active login itself"
+            auth = home / self.credential_file
+            before, error = _token_hash(auth), None
+            if before is None:
+                raise HswapError("sign in again: this account's login is missing from its Codex home")
+            try:
+                self._rate_limits(inst.executable, home)
+            except jsonrpc.RpcError as exc:
+                error = exc
+            changed = _token_hash(auth) != before
+        if error is not None and error.harness and _auth_failed(error):
+            raise HswapError("sign in again: Codex could not use or refresh this login") from None
+        if changed:
+            return "token refreshed"
+        if error is not None and not error.harness:  # hswap's own text: timeout, exit, start failure
+            raise HswapError(
+                f"{error}; if Codex was refreshing the token, this account may need to sign in again"
+            ) from None
+        if error is not None:
+            # Codex's own error text is not repeated: it may quote server responses.
+            code = f" (error {error.code})" if error.code is not None else ""
+            raise HswapError(f"Codex could not check this login{code}; nothing changed, try again later") from None
+        return "token still valid"

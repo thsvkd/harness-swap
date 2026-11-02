@@ -20,7 +20,7 @@ hswap's tests or copied.
 | account_remove | supported | supported | supported | supported (native) | experimental | supported |
 | account_switch | supported | supported¹ | supported | supported (native) | experimental | supported⁵ |
 | native_account_switch | unsupported | unsupported | unsupported | supported | unsupported | unsupported |
-| credential_refresh (by hswap) | supported | unsupported | unsupported | unsupported | unsupported | unsupported |
+| credential_refresh (by hswap) | supported | supported⁷ | supported⁷ | unsupported | unsupported | supported⁷ |
 | usage_monitoring | supported | experimental⁴ | experimental⁴ | experimental⁴ | unsupported | experimental⁴ |
 | automatic_rotation | supported | experimental⁶ | experimental⁶ | experimental⁶ | unsupported | experimental⁶ |
 | parallel_sessions | experimental | supported² | experimental | unsupported | unsupported | experimental⁵ |
@@ -35,6 +35,13 @@ passive log reading, also experimental). Read by asking the harness; only ever
 checked against fake harnesses and the real binaries without accounts.
 ⁵ `unavailable` unless the login is file-backed (see Antigravity below); `add --login` is unavailable.
 ⁶ opt-in (`auto.enabled`) and only when usage is usable; the reason quotes the provider's terms.
+⁷ `hswap <id> refresh` (no opt-in) asks the harness in each account's own home, so
+the harness refreshes a due token there; hswap never refreshes it. Skipped for an
+account a session runs, and for the active login while that harness may be running
+(see [security.md](security.md#keep-alive-hswap-id-refresh)). Codex and Grok report
+`token refreshed` or `token still valid`; agy reports `login used` (its refresh token
+does not rotate). `unavailable` when the harness is not installed or the login is not file-backed.
+OpenCode 2.x: unsupported, because it keeps inactive logins in its own database and refreshes an account only while it is active; switch to an idle account before its token lapses. Claude: the engine refreshes tokens when it reads usage (`hswap claude list`, or `hswap claude auto --once` from cron). Keep-alive is verified against fake harnesses only.
 Run `hswap capabilities` for your install.
 
 ## Claude Code
@@ -199,6 +206,7 @@ Facts from agy 1.4.8 on Linux; `agy` has no sign-in command that exits when done
 | access token about 1 h; agy refreshes at start when near expiry and rewrites the file; refresh token normally unchanged | verified | fake endpoint capture |
 | `agy -p /usage --output-format json` prints quota groups and buckets without an agent turn or spending quota | documented (changelog) + verified | fake endpoint and a third-party sample; never a real paid account |
 | with no token file it starts an interactive login and waits 60 s | verified | hswap never asks without a token file |
+| with a token it cannot refresh it prints `Authentication required` on stderr and waits 60 s for a browser sign-in | verified (agy 1.4.8, synthetic expired token) | hswap stops agy at that line and reports `sign in again` |
 | `AGY_CLI_DISABLE_AUTO_UPDATE` disables the updater | inferred | string in the binary; hswap sets it for usage calls |
 | plan tier / credits are not in `/usage` | verified | `plan` and `balance` stay empty |
 | installation id per app data dir, device signals sent at start | verified | each `--gemini_dir` gets its own; several accounts from one host are visible server-side (inferred) |

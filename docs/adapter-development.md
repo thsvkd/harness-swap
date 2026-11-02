@@ -203,6 +203,20 @@ automatically. Automatic switching (`hswap acme auto`, opt-in through
 reason that quotes the provider's terms (clause, URL, date) or says plainly that
 the provider has not said. Only report `supported` if the terms clearly allow it.
 
+### KeepAlive (optional)
+
+Implement `keep_alive(account) -> str` and report `credential_refresh` as
+`supported` only if the harness refreshes its own due token when asked (reuse the
+usage question). Enter `usage_home(account)`; return `skipped: ...` when `home`
+is `None` or, for the active login, when `processes.find({...})` is non-empty or
+`None`. Do not apply the 10-minute guard. Report the outcome from a hash of the
+refresh-relevant fields before and after (`token refreshed` / `token still valid`)
+or, if the file does not change, say the login was used. Raise
+`HswapError("sign in again: ...")` for an authentication failure and a fixed
+message otherwise; never repeat harness text. No opt-in and no usage cache.
+If the harness keeps inactive logins itself (OpenCode 2.x), leave it out and
+report the capability as `unsupported` with the action to take instead.
+
 ## 7. Errors
 
 Raise `harness_swap.core.errors` types: `UnsupportedOperation(capability,

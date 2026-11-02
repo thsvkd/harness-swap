@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -12,9 +13,10 @@ import pytest
 from harness_swap.adapters.grok import GrokAdapter, _epoch, snapshot_from_billing
 from harness_swap.core import accounts as service
 from harness_swap.core import sessions, settings
-from harness_swap.core.errors import CredentialError
+from harness_swap.core.errors import CredentialError, HswapError
 from harness_swap.core.models import Capability, Installation, Support, UsageState
 from harness_swap.core.usage import UsageService
+from harness_swap.infrastructure import processes
 from tests.hswap_helpers import fake_executable, grok_entry, jwt, write_json
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="fake executables are POSIX scripts")
@@ -153,6 +155,17 @@ for line in sys.stdin:
     if msg.get("method") == "initialize":
         print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}}), flush=True)
     elif msg.get("method") == "_x.ai/billing":
+        if reply.get("hang"):  # never answers: hswap's deadline ends it
+            continue
+        if reply.pop("delete", False):  # Grok drops a credential whose refresh failed for good
+            path = os.path.join(os.environ["GROK_HOME"], "auth.json")
+            json.dump({}, open(path, "w"))
+        if reply.pop("rotate", False):  # Grok refreshed a due token and stored it in its home
+            path = os.path.join(os.environ["GROK_HOME"], "auth.json")
+            doc = json.load(open(path))
+            for entry in doc.values():
+                entry["key"], entry["refresh_token"] = "synthetic-new-access", "synthetic-new-refresh"
+            json.dump(doc, open(path, "w"))
         print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], **reply}), flush=True)
 """
 
@@ -179,10 +192,9 @@ def entry(email, user, exp=None, tier=5):
 
 
 @pytest.fixture
-def remote(grok, tmp_path, monkeypatch):
-    """Two accounts (1 inactive, 2 active), usage.remote on, a fake `grok agent stdio`."""
+def agent(grok, tmp_path, monkeypatch):
+    """Two accounts (1 inactive, 2 active) and a fake `grok agent stdio`; no usage opt-in."""
     adapter, home = grok
-    settings.set_value("usage.remote", "grok")
     for i in (1, 2):
         write_json(home / "auth.json", {SCOPE: entry(f"{i}@x.com", f"user-{i}", exp=int(time.time()) + 3600)})
         adapter.add_account()
@@ -200,6 +212,13 @@ def remote(grok, tmp_path, monkeypatch):
         return [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
 
     return adapter, home, ask, calls
+
+
+@pytest.fixture
+def remote(agent):
+    """`agent` with usage.remote on."""
+    settings.set_value("usage.remote", "grok")
+    return agent
 
 
 def set_live(home, **fields):
@@ -316,3 +335,128 @@ def test_billing_parsing_edges():
     nested = {"config": {"creditUsagePercent": 10, "subscriptionTier": "SuperGrok"}}
     assert snapshot_from_billing(nested, "free", 0.0).plan == "SuperGrok"
     assert snapshot_from_billing({"config": {"creditUsagePercent": 10}}, "free", 0.0).plan == "free"
+
+
+# -- keep-alive (`hswap grok refresh`): Grok refreshes in the account's own home ---------------
+
+
+def keep(adapter, reply, slot, answer=None):
+    write_json(reply, answer or billing_reply())
+    return adapter.keep_alive(next(a for a in adapter.list_accounts() if a.slot == slot))
+
+
+@posix_only
+def test_keep_alive_asks_grok_in_the_stored_home_without_the_opt_in(agent, tmp_path, monkeypatch):
+    adapter, home, _ask, calls = agent
+    monkeypatch.setattr(processes, "find", lambda names: [4242])  # a Grok runs: only the active login waits
+    live, stored = (home / "auth.json").read_bytes(), adapter.store.account_dir(1) / "auth.json"
+    reply = tmp_path / "reply.json"
+    result = keep(adapter, reply, 1, {**billing_reply(), "rotate": True})
+    assert result == "token refreshed" and "synthetic" not in result
+    assert json.loads(stored.read_text())[SCOPE]["refresh_token"] == "synthetic-new-refresh"
+    assert (home / "auth.json").read_bytes() == live
+    assert calls()[0]["home"] == str(adapter.store.account_dir(1)) and not calls()[0]["tty"]
+    assert keep(adapter, reply, 1) == "token still valid"
+    assert keep(adapter, reply, 2).startswith("skipped: Grok Build is running")
+
+
+@posix_only
+@pytest.mark.parametrize("running", [[4242], None])
+def test_active_login_waits_while_grok_runs_or_may_run(agent, tmp_path, monkeypatch, running):
+    adapter, _home, _ask, calls = agent
+    monkeypatch.setattr(processes, "find", lambda names: running)
+    assert keep(adapter, tmp_path / "reply.json", 2) == "skipped: Grok Build is running and refreshes the active login itself"
+    assert calls() == []
+
+
+@posix_only
+def test_active_login_is_touched_when_no_grok_runs_even_near_expiry(agent, tmp_path, monkeypatch):
+    adapter, home, _ask, calls = agent
+    monkeypatch.setattr(processes, "find", lambda names: [])
+    set_live(home, exp=int(time.time()) + 60)  # read_usage would wait; nothing else can refresh it now
+    assert keep(adapter, tmp_path / "reply.json", 2, {**billing_reply(), "rotate": True}) == "token refreshed"
+    assert calls()[0]["home"] == str(home)
+    assert json.loads((home / "auth.json").read_text())[SCOPE]["key"] == "synthetic-new-access"
+
+
+@posix_only
+def test_keep_alive_skips_an_account_a_session_runs(agent, tmp_path):
+    adapter, _home, _ask, calls = agent
+    fd = sessions.acquire(adapter.store.account_dir(1))
+    try:
+        assert keep(adapter, tmp_path / "reply.json", 1) == "skipped: a running session keeps it fresh"
+    finally:
+        os.close(fd)
+    assert calls() == []
+
+
+@posix_only
+def test_keep_alive_failures_say_sign_in_again_without_grok_output(agent, tmp_path):
+    adapter, _home, _ask, _calls = agent
+    reply = tmp_path / "reply.json"
+    auth = {"error": {"code": -32000, "message": "Authentication required", "data": "Authentication required"}}
+    with pytest.raises(HswapError, match="^sign in again: "):
+        keep(adapter, reply, 1, auth)
+    with pytest.raises(HswapError) as err:
+        keep(adapter, reply, 1, {"error": {"code": -32603, "message": "upstream said synthetic-detail"}})
+    assert "synthetic-detail" not in str(err.value) and "-32603" in str(err.value)
+    grok_com = {"error": {"code": -32000, "message": "Billing data requires auth with grok.com"}}
+    assert keep(adapter, reply, 1, grok_com) == "token still valid"
+    with pytest.raises(HswapError) as err:  # a harness error without a code is still Grok's text
+        keep(adapter, reply, 1, {"error": "upstream said synthetic-detail"})
+    assert str(err.value) == "Grok could not check this login"
+    with pytest.raises(HswapError, match="^sign in again: Grok removed this login"):
+        keep(adapter, reply, 1, {**billing_reply(), "delete": True})
+
+
+@posix_only
+def test_keep_alive_timeout_shows_hswaps_own_message(agent, tmp_path, monkeypatch):
+    adapter, _home, _ask, _calls = agent
+    monkeypatch.setattr("harness_swap.adapters.grok._RPC_TIMEOUT_S", 1.0)
+    with pytest.raises(HswapError, match="^no answer to _x.ai/billing in time$"):
+        keep(adapter, tmp_path / "reply.json", 1, {"hang": True})
+
+
+@posix_only
+def test_keep_alive_skips_an_account_that_just_became_live(agent, tmp_path, monkeypatch):
+    from harness_swap.core.credentials import SnapshotCredentials
+
+    adapter, _home, _ask, calls = agent
+    first = next(a for a in adapter.list_accounts() if a.slot == 1)
+    real, seen = SnapshotCredentials.live_identities, []
+
+    def live_identities(self):  # account 1 becomes live right after usage_home chose its stored home
+        seen.append(1)
+        return real(self) if len(seen) == 1 else {SCOPE: first}
+
+    monkeypatch.setattr(SnapshotCredentials, "live_identities", live_identities)
+    write_json(tmp_path / "reply.json", billing_reply())
+    assert adapter.keep_alive(first) == "skipped: this account just became the live login"
+    assert calls() == []
+
+
+@posix_only
+def test_process_check_sees_a_grok_started_through_a_wrapper(tmp_path):
+    """qemu or a launcher shows up under its own name; the native binary is on its command line."""
+    native = fake_executable(tmp_path / "downloads", "grok-linux-aarch64", "")
+    proc = subprocess.Popen(["/bin/sh", "-c", "sleep 30; :", str(native)])
+    try:
+        assert proc.pid in processes.find({"grok"})
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@posix_only
+def test_keep_alive_api_key_has_nothing_to_refresh(agent):
+    adapter, home, _ask, calls = agent
+    write_json(home / "auth.json", {"xai::api_key": {"key": "synthetic-xai-api-key", "auth_mode": "api_key"}})
+    assert adapter.keep_alive(adapter.add_account()) == "API-key login: nothing to refresh" and calls() == []
+
+
+def test_credential_refresh_capability_needs_only_the_install(grok):
+    adapter, _home = grok
+    status = adapter.capabilities()[Capability.CREDENTIAL_REFRESH]
+    assert status.support is Support.SUPPORTED and "hswap grok refresh" in status.reason
+    adapter._installation = Installation(False, detail="`grok` not found on PATH")
+    assert adapter.capabilities()[Capability.CREDENTIAL_REFRESH].support is Support.UNAVAILABLE

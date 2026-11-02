@@ -154,6 +154,8 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
     if extra:
         parser.error(f"unrecognized arguments: {' '.join(extra)}")
     as_json = getattr(args, "json", False)
+    if getattr(args, "provider", None) and adapter.providers and args.provider not in adapter.providers:
+        raise HswapError(f"{adapter.id} has no provider {args.provider!r}; known: {', '.join(adapter.providers)}")
 
     if verb == "list":
         if args.cached:
@@ -274,7 +276,7 @@ def _auto(adapter: HarnessAdapter, args) -> int:
 
 def _refresh(adapter: HarnessAdapter, args) -> int:
     keeper = require(adapter, Capability.CREDENTIAL_REFRESH, KeepAlive)
-    accounts = adapter.list_accounts()
+    accounts = [a for a in adapter.list_accounts() if args.provider in (None, a.provider)]
     if args.account:
         accounts = [service.resolve(accounts, args.account, args.provider)]
     rows, failed = [], False
@@ -516,7 +518,27 @@ def _show(value: object) -> str:
     return ",".join(value) if isinstance(value, list) else str(value)
 
 
-def cmd_config(argv: list[str]) -> int:
+def _check_harness_ids(registry: Registry, key: str, value: object) -> None:
+    """A harness-list setting names harnesses hswap knows (a typo would silently do nothing)."""
+    if key not in settings.WARNINGS or not isinstance(value, list):
+        return
+    unknown = sorted(set(value) - {e.id for e in registry.entries()})
+    if unknown:
+        raise HswapError(f"{key}: unknown harness {', '.join(unknown)}; known: {', '.join(registry.ids())}")
+
+
+def _opt_in_notes(registry: Registry, added: set[str]) -> None:
+    """Each newly opted-in harness's own terms warning (what `hswap capabilities` shows)."""
+    for harness_id in sorted(added):
+        try:
+            terms = getattr(registry.get(harness_id), "terms", None)
+        except HswapError:
+            continue
+        if terms:
+            output.err(f"note: {harness_id} terms: {terms}")
+
+
+def cmd_config(argv: list[str], registry: Registry) -> int:
     p = argparse.ArgumentParser(prog="hswap config")
     p.add_argument("action", nargs="?", default="list", choices=("list", "get", "set", "unset", "path"))
     p.add_argument("key", nargs="?")
@@ -539,11 +561,14 @@ def cmd_config(argv: list[str]) -> int:
             raise HswapError("usage: hswap config set KEY VALUE")
         try:
             before = settings.load().get(args.key)
+            if args.key in settings.SPECS:
+                _check_harness_ids(registry, args.key, settings.SPECS[args.key][1](args.value))
             value = settings.set_value(args.key, args.value)
             print(f"{args.key} = {_show(value)}")
             added = set(value) - set(before or []) if isinstance(value, list) else set()
             if added and args.key in settings.WARNINGS:
                 output.err(f"note: {settings.WARNINGS[args.key]}")
+                _opt_in_notes(registry, added)
         except KeyError as exc:
             raise HswapError(str(exc).strip("'\"")) from None
         except ValueError as exc:
@@ -608,7 +633,7 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
         if head == "migrate":
             p.add_argument("--dry-run", action="store_true")
         if head == "config":
-            return cmd_config(rest)
+            return cmd_config(rest, registry)
         if head != "migrate" and head != "tui":
             p.add_argument("--json", action="store_true")
         args = p.parse_args(rest)

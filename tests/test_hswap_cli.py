@@ -105,7 +105,7 @@ def test_emit_json_refuses_credential_shaped_text(capsys):
 def test_alias_and_config_mistakes_are_clean_errors(native, capsys, tmp_path, monkeypatch):
     reg, _ = native
     monkeypatch.setenv("HSWAP_HOME", str(tmp_path / "h"))
-    code, out, err = run(reg, capsys, "config", "get", "nope")
+    code, _out, err = run(reg, capsys, "config", "get", "nope")
     assert code == 1 and "unknown setting" in err and "Traceback" not in err
     code, _out, err = run(reg, capsys, "config", "unset", "nope")
     assert code == 1 and "unknown setting" in err

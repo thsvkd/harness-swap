@@ -109,7 +109,7 @@ def test_cross_harness_commands_and_dashboard_see_it(acme, capsys):
     registry, home = acme
     login(home, "ann")
     hswap(registry, capsys, "acme", "add")
-    code, out, _ = hswap(registry, capsys, "harnesses", "--json")
+    _code, out, _ = hswap(registry, capsys, "harnesses", "--json")
     assert {"id": "acme", "origin": "runtime", "trusted": True, "name": "Acme Code",
             "installed": True, "version": "acme 1.0.0"} in json.loads(out)["harnesses"]
     _code, out, _ = hswap(registry, capsys, "capabilities", "acme", "--json")

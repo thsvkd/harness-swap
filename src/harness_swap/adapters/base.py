@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from harness_swap.core import sessions
@@ -55,7 +57,10 @@ class FileCredentialAdapter:
     display_name: str
     providers: tuple[str, ...] = ()
     executable: str
-    home_env: str
+    #: Environment variable that moves the harness home; or, for a harness that
+    #: takes it as a flag, ``home_flag`` (e.g. ``"--gemini_dir="``, value appended).
+    home_env: str | None = None
+    home_flag: str | None = None
     default_home: str  # relative to the user's home directory, e.g. ".codex"
     credential_file = "auth.json"
     harness_lock_name: str | None = None
@@ -80,7 +85,14 @@ class FileCredentialAdapter:
 
     @property
     def home(self) -> Path:
-        return env_dir(self.home_env, Path.home() / self.default_home)
+        default = Path.home() / self.default_home
+        return env_dir(self.home_env, default) if self.home_env else default
+
+    def home_overrides(self, home: Path) -> tuple[dict[str, str], list[str]]:
+        """Environment variables and leading arguments that point the harness at ``home``."""
+        if self.home_flag:
+            return {}, [f"{self.home_flag}{home}"]
+        return {self.home_env: str(home)} if self.home_env else {}, []
 
     @property
     def store(self) -> AccountStore:
@@ -163,8 +175,8 @@ class FileCredentialAdapter:
         tmp = self.store.root / f"pending-login-{uuid.uuid4().hex}"
         try:
             sessions.link_shared(tmp, self.home, self.login_shared_names())
-            env = {**os.environ, self.home_env: str(tmp)}
-            code = subprocess.call([inst.executable, *self.login_args], env=env)
+            env_add, home_args = self.home_overrides(tmp)
+            code = subprocess.call([inst.executable, *home_args, *self.login_args], env={**os.environ, **env_add})
             if code != 0:
                 raise HswapError(f"{self.executable} login exited with status {code}; nothing added")
             try:
@@ -265,6 +277,42 @@ class FileCredentialAdapter:
                 mkdir_private(profile)
                 sessions.link_shared(profile, self.home, self.shared_names)
                 fd = sessions.acquire(profile)
-                argv = [inst.executable, *self.session_args(), *args]
-                env = {**os.environ, self.home_env: str(profile)}
+                env_add, home_args = self.home_overrides(profile)
+                argv = [inst.executable, *home_args, *self.session_args(), *args]
+                env = {**os.environ, **env_add}
         return sessions.launch(argv, env, fd)
+
+    # --- usage read by the harness itself ------------------------------------------
+
+    @contextmanager
+    def usage_home(self, account: Account) -> Iterator[tuple[Path | None, bool]]:
+        """``(home, active)`` to ask the harness about ``account``'s usage, with
+        that home's session lock held for the read.
+
+        The active account is read in the default home; any other in its own
+        account directory, so the harness refreshes that copy itself and
+        nothing else holds the same refresh token. ``home`` is ``None`` when a
+        running session already owns the account: a second process could
+        refresh the same rotating token, so the caller must not start one.
+        """
+        creds = self.credentials
+        with self.store.lock():
+            stored = self._stored(account)
+            try:
+                live = creds.live_identities()
+            except CredentialError:
+                live = {}
+            active = creds.is_active(stored, live)
+            home = self.home if active else self.store.account_dir(stored.slot)
+            if not active and not (home / self.credential_file).exists():
+                raise CredentialError(f"slot {stored.slot} has no stored credentials")
+            fd = None
+            if not sessions.in_use(home):
+                if not active:
+                    sessions.link_shared(home, self.home, self.shared_names)
+                fd = sessions.acquire(home)
+        try:
+            yield (home if fd is not None else None), active
+        finally:
+            if fd is not None:
+                os.close(fd)

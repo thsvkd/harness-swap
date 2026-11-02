@@ -312,6 +312,14 @@ class ClaudeAdapter:
         self._rows = None  # always a fresh engine pass for a listing
         return [self._account(r) for r in self._list_rows().values()]
 
+    def cached_view(self) -> tuple[list[Account], dict[str, UsageSnapshot]]:
+        """The engine's cached usage only: ``fetch=set()`` lets no account be
+        fetched, so no network call and no token refresh happen."""
+        payload = self._switcher().list_accounts(json_output=True, fetch=set()) or {}
+        rows = [r for r in payload.get("accounts", [])]
+        accounts = [self._account(r) for r in rows]
+        return accounts, {a.key: usage_from_row(r) for a, r in zip(accounts, rows, strict=True)}
+
     def read_usage(self, account: Account) -> UsageSnapshot:
         row = self._list_rows().get(str(account.slot))
         if row is None:

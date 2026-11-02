@@ -229,6 +229,33 @@ class SnapshotCredentials:
             _raw, doc = self._read_live()
             return self._capture(accounts, doc or {})
 
+    # -- usage reads ---------------------------------------------------------------
+
+    def _account(self, slot: int) -> StoredAccount:
+        acc = next((a for a in self.store.load() if a.slot == slot), None)
+        if acc is None:
+            raise AccountNotFound(f"no stored account in slot {slot}")
+        return acc
+
+    def usage_part(self, slot: int) -> tuple[dict, bool]:
+        """The credential part to read ``slot``'s usage with, and whether its
+        token is maintained elsewhere (so hswap must not refresh it).
+
+        The active account's live part is newer than its snapshot (the harness
+        refreshes it in place), and an isolated session refreshes the account's
+        snapshot itself; for every other account the snapshot is the only copy.
+        """
+        acc = self._account(slot)
+        key = acc.part_key or ""
+        try:
+            _raw, doc = self._read_live()
+        except CredentialError:
+            doc = None
+        live = self.fmt.parts(doc or {}).get(key)
+        if live is not None and self._owner([acc], key, live):
+            return live, True
+        return self.stored_part(acc), sessions.in_use(self.store.account_dir(slot))
+
     # -- adding ------------------------------------------------------------------
 
     def import_document(

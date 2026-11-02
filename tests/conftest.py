@@ -154,6 +154,7 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             (Path.home() / ".codex", False),
             (Path.home() / ".grok", False),
             (Path.home() / ".local" / "share" / "opencode", False),
+            (Path.home() / ".gemini" / "antigravity-cli", False),
         )
 
     ambient_specs = _resolve()

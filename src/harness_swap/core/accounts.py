@@ -13,6 +13,7 @@ from harness_swap.core.adapter import (
     AccountRemover,
     AccountSwitcher,
     AliasStore,
+    CachedUsageView,
     HarnessAdapter,
     SessionLauncher,
     UsageReader,
@@ -100,15 +101,25 @@ def switch(
 
 
 def collect_usage(
-    adapter: HarnessAdapter, accounts: list[Account], service: UsageService
+    adapter: HarnessAdapter, accounts: list[Account], service: UsageService, *, cached: bool = False
 ) -> dict[str, UsageSnapshot]:
     """Usage for each account; an ``unsupported`` snapshot when the harness
-    offers none, so callers never have to special-case it."""
+    offers none, so callers never have to special-case it. ``cached`` reads
+    only what earlier runs measured: no network, no token refresh."""
     status = adapter.capabilities().get(Capability.USAGE_MONITORING)
     if status is None or not status.usable or not isinstance(adapter, UsageReader):
         reason = status.reason if status else f"{adapter.display_name} reports no usage"
         return {a.key: unsupported_usage(reason) for a in accounts}
-    return {a.key: service.get(adapter, a) for a in accounts}
+    read = service.peek if cached else service.get
+    return {a.key: read(adapter, a) for a in accounts}
+
+
+def cached_view(adapter: HarnessAdapter, service: UsageService) -> tuple[list[Account], dict[str, UsageSnapshot]]:
+    """Accounts and their last measured usage: no network call, no token refresh."""
+    if isinstance(adapter, CachedUsageView):
+        return adapter.cached_view()
+    accounts = adapter.list_accounts()
+    return accounts, collect_usage(adapter, accounts, service, cached=True)
 
 
 def switch_by_strategy(

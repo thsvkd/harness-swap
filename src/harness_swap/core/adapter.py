@@ -100,6 +100,15 @@ class UsageReader(Protocol):
 
 
 @runtime_checkable
+class CachedUsageView(Protocol):
+    """For a harness whose engine keeps its own usage cache: accounts and their
+    last measured usage without any network call or token refresh. Others get
+    the same from hswap's usage cache (``UsageService.peek``)."""
+
+    def cached_view(self) -> tuple[list[Account], dict[str, UsageSnapshot]]: ...
+
+
+@runtime_checkable
 class SessionLauncher(Protocol):
     def launch(self, account: Account, args: list[str]) -> int:
         """Run the harness as ``account`` without touching the default login.

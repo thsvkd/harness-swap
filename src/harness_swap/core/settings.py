@@ -12,7 +12,7 @@ import math
 from pathlib import Path
 
 from harness_swap.core.paths import hswap_home
-from harness_swap.core.registry import parse_trust
+from harness_swap.core.registry import check_id, parse_trust
 from harness_swap.core.store import mkdir_private
 from harness_swap.infrastructure.fsutil import atomic_write_text
 
@@ -22,6 +22,27 @@ def _plugin_ids(value: object) -> list[str]:
     if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
         raise ValueError("expected a comma-separated list of <id>@<distribution>")
     return sorted({parse_trust(i) for i in items if i.strip()})
+
+
+def _harness_ids(value: object) -> list[str]:
+    items = value.split(",") if isinstance(value, str) else value
+    if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+        raise ValueError("expected a comma-separated list of harness ids")
+    ids = sorted({i.strip().lower() for i in items if i.strip()})
+    bad = [i for i in ids if check_id(i)]
+    if bad:
+        raise ValueError(f"not a harness id: {', '.join(bad)}")
+    return ids
+
+
+def _seconds(value: object) -> float:
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("expected a number of seconds") from None
+    if math.isnan(seconds) or not 60 <= seconds <= 86400:
+        raise ValueError("must be between 60 and 86400 seconds")
+    return seconds
 
 
 def _threshold(value: object) -> float:
@@ -38,7 +59,31 @@ def _threshold(value: object) -> float:
 SPECS = {
     "plugins.trusted": ([], _plugin_ids),
     "rotation.threshold": (95.0, _threshold),
+    # Harnesses whose usage hswap may read from the endpoints the harness itself
+    # calls (undocumented; may change), refreshing inactive accounts' tokens to do so.
+    "usage.remote": ([], _harness_ids),
+    # Harnesses `hswap <harness> auto` may switch automatically (opt-in: see the warning).
+    "auto.enabled": ([], _harness_ids),
+    "auto.cooldown": (600.0, _seconds),
 }
+
+#: Shown when a harness is added to one of these lists.
+WARNINGS = {
+    "usage.remote": (
+        "hswap will call the usage endpoints these harnesses use themselves, with your own tokens. "
+        "They are not public APIs: they may change or stop working without notice."
+    ),
+    "auto.enabled": (
+        "Automatic switching uses your other accounts when one nears its limit. Several providers' terms "
+        "restrict sharing accounts or using several to get around rate limits; check them. "
+        "You are responsible for complying."
+    ),
+}
+
+
+def opted_in(key: str, harness_id: str) -> bool:
+    """Whether ``harness_id`` is in the list setting ``key`` (``usage.remote``, ``auto.enabled``)."""
+    return harness_id in load()[key]
 
 
 def settings_path() -> Path:

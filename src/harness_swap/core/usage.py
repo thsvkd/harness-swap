@@ -78,6 +78,10 @@ class UsageService:
                 return self._aged(last, policy.stale_after_s, now)
             try:
                 snap = reader.read_usage(account)
+                if snap.state is UsageState.STALE and not snap.windows and last is not None:
+                    # The adapter cannot measure right now (e.g. the account is
+                    # not the active one): keep serving the last measurement.
+                    return dataclasses.replace(last, state=UsageState.STALE, detail=snap.detail)
                 entry = {"snapshot": _to_cache(snap), "fetched_at": now, "failures": 0}
             except Exception as exc:  # noqa: BLE001 - any adapter failure becomes an error snapshot
                 failures += 1
@@ -88,6 +92,20 @@ class UsageService:
             cache[account.key] = entry
             atomic_write_text(self._path(), json.dumps(cache, indent=1))
         return self._aged(snap, policy.stale_after_s, now)
+
+    def peek(self, reader: UsageReader, account: Account) -> UsageSnapshot:
+        """The cached measurement only: no adapter call, no network, no token
+        refresh. ``unknown`` when nothing was measured yet."""
+        entry = self._load().get(account.key)
+        try:
+            last = _from_cache(entry["snapshot"]) if isinstance(entry, dict) and "snapshot" in entry else None
+        except (TypeError, ValueError, KeyError, AttributeError):
+            last = None
+        if last is None:
+            return UsageSnapshot(UsageState.UNKNOWN, detail="not measured yet (cached read)")
+        if isinstance(entry, dict) and entry.get("failures"):
+            return self._failed(last, entry.get("error", "usage read failed"))
+        return self._aged(last, reader.usage_policy.stale_after_s, self.clock())
 
     @staticmethod
     def _failed(last: UsageSnapshot | None, detail: str) -> UsageSnapshot:

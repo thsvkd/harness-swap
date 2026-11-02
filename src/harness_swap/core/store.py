@@ -133,7 +133,9 @@ class AccountStore:
             return None
 
     def write_secret(self, slot: int, name: str, data: bytes) -> None:
-        atomic_write_bytes(self.ensure_account_dir(slot) / name, data, mode=0o600)
+        path = self.ensure_account_dir(slot) / name  # ``name`` may be nested ("dir/file")
+        mkdir_private(path.parent)
+        atomic_write_bytes(path, data, mode=0o600)
 
     # -- registry operations (call with the lock held) ------------------------
 

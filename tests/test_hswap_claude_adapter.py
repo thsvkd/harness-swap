@@ -73,7 +73,8 @@ class FakeEngine:
     def __init__(self):
         self.switched = []
 
-    def list_accounts(self, json_output=False):
+    def list_accounts(self, json_output=False, fetch=None):
+        self.fetch = fetch
         active = self.switched[-1] if self.switched else "2"
         rows = [
             dict(ROW, number=1, email="b@x.com", organizationUuid="", alias=None, active=active == "1"),
@@ -314,3 +315,14 @@ def test_an_embedded_menubar_service_runs_hswap_not_an_upstream_cswap(monkeypatc
     assert launch_agent.resolve_program() == [found["hswap"], "claude"]
     monkeypatch.setattr(launch_agent.shutil, "which", lambda name: None)
     assert launch_agent.resolve_program() == [sys.executable, "-m", "claude_swap"]
+
+
+def test_cached_view_lets_the_engine_fetch_nothing():
+    from harness_swap.core import accounts as service_mod
+    from harness_swap.core.usage import UsageService
+
+    adapter = ClaudeAdapter()
+    adapter._engine = FakeEngine()
+    accounts, usage = service_mod.cached_view(adapter, UsageService(Path("/nonexistent")))
+    assert adapter._engine.fetch == set()
+    assert [a.slot for a in accounts] == [1, 2] and usage[accounts[1].key].state is UsageState.AVAILABLE

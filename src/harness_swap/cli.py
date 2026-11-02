@@ -12,11 +12,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from importlib.metadata import PackageNotFoundError, version
 
 from harness_swap import output
 from harness_swap.core import accounts as service
-from harness_swap.core import settings
+from harness_swap.core import autorotate, settings
 from harness_swap.core.adapter import (
     Diagnosable,
     HarnessAdapter,
@@ -70,6 +71,7 @@ def _harness_parser(adapter: HarnessAdapter) -> argparse.ArgumentParser:
     sp = cmd("list", "list accounts with usage", "ls")
     sp.add_argument("--json", action="store_true")
     sp.add_argument("--no-usage", action="store_true", help="skip usage collection")
+    sp.add_argument("--cached", action="store_true", help="last measured usage only: no network, no token refresh")
     sp = cmd("status", "show the active account")
     sp.add_argument("--json", action="store_true")
     sp = cmd("add", "add the current login (or sign in a new one with --login)")
@@ -92,6 +94,13 @@ def _harness_parser(adapter: HarnessAdapter) -> argparse.ArgumentParser:
     provider(sp)
     sp = cmd("usage", "show usage for one or all accounts")
     sp.add_argument("account", nargs="?", metavar="SLOT|ALIAS|EMAIL")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--cached", action="store_true", help="last measured usage only: no network, no token refresh")
+    provider(sp)
+    sp = cmd("auto", "switch automatically when the active account nears its limit (opt-in: auto.enabled)")
+    sp.add_argument("--once", action="store_true", help="one decision, then exit (for cron)")
+    sp.add_argument("--interval", type=float, default=300.0, help="seconds between checks (default 300)")
+    sp.add_argument("--dry-run", action="store_true", help="say what would happen, switch nothing")
     sp.add_argument("--json", action="store_true")
     provider(sp)
     sp = cmd("alias", "set or clear an account alias")
@@ -141,8 +150,11 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
     as_json = getattr(args, "json", False)
 
     if verb == "list":
-        accounts = adapter.list_accounts()
-        usage = None if args.no_usage else service.collect_usage(adapter, accounts, _usage_service())
+        if args.cached:
+            accounts, usage = service.cached_view(adapter, _usage_service())
+        else:
+            accounts = adapter.list_accounts()
+            usage = None if args.no_usage else service.collect_usage(adapter, accounts, _usage_service())
         if as_json:
             output.emit_json(_harness_json(adapter, accounts, usage))
         else:
@@ -206,10 +218,13 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
     elif verb == "run":
         return service.launch(adapter, args.account, passthrough, args.provider)
     elif verb == "usage":
-        accounts = adapter.list_accounts()
+        if args.cached:
+            accounts, usage = service.cached_view(adapter, _usage_service())
+        else:
+            accounts, usage = adapter.list_accounts(), None
         if args.account:
             accounts = [service.resolve(accounts, args.account, args.provider)]
-        usage = service.collect_usage(adapter, accounts, _usage_service())
+        usage = usage or service.collect_usage(adapter, accounts, _usage_service())
         if as_json:
             output.emit_json(_harness_json(adapter, accounts, usage))
         else:
@@ -219,9 +234,34 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
             raise HswapError("give a NAME or --unset")
         acc = service.set_alias(adapter, args.account, None if args.unset else args.name, args.provider)
         print(f"slot {acc.slot}: alias {acc.alias or '(none)'}")
+    elif verb == "auto":
+        return _auto(adapter, args)
     elif verb == "capabilities":
         return _print_capabilities([adapter], as_json)
     return 0
+
+
+def _auto(adapter: HarnessAdapter, args) -> int:
+    values = settings.load()
+    while True:
+        events = autorotate.run_once(
+            adapter,
+            _usage_service(),
+            threshold=values["rotation.threshold"],
+            cooldown_s=values["auto.cooldown"],
+            provider=args.provider,
+            dry_run=args.dry_run,
+        )
+        if args.json:
+            output.emit_json({"harness": adapter.id, "at": time.time(), "events": events})
+        else:
+            for e in events:
+                target = f" -> {e['target']['label']}" if "target" in e else ""
+                print(f"{time.strftime('%H:%M:%S')} {adapter.display_name}: {e['action']}{target} ({e['reason']})")
+        sys.stdout.flush()
+        if args.once:
+            return 0
+        time.sleep(max(args.interval, 30.0))
 
 
 def _harness_json(adapter, accounts, usage) -> dict:
@@ -314,12 +354,15 @@ def cmd_harnesses(registry: Registry, as_json: bool) -> int:
     return 1 if failed else 0
 
 
-def cmd_list(registry: Registry, harness: str | None, as_json: bool, with_usage: bool) -> int:
+def cmd_list(registry: Registry, harness: str | None, as_json: bool, with_usage: bool, cached: bool = False) -> int:
     results, errors = [], {}
     for adapter in _targets(registry, harness):
         try:
-            accounts = adapter.list_accounts()
-            usage = service.collect_usage(adapter, accounts, _usage_service()) if with_usage else None
+            if cached:
+                accounts, usage = service.cached_view(adapter, _usage_service())
+            else:
+                accounts = adapter.list_accounts()
+                usage = service.collect_usage(adapter, accounts, _usage_service()) if with_usage else None
             results.append((adapter, accounts, usage))
         except Exception as exc:  # noqa: BLE001 - one harness must not hide the others
             errors[adapter.id] = _describe(exc)
@@ -466,8 +509,12 @@ def cmd_config(argv: list[str]) -> int:
         if args.key is None or args.value is None:
             raise HswapError("usage: hswap config set KEY VALUE")
         try:
+            before = settings.load().get(args.key)
             value = settings.set_value(args.key, args.value)
             print(f"{args.key} = {_show(value)}")
+            added = set(value) - set(before or []) if isinstance(value, list) else set()
+            if added and args.key in settings.WARNINGS:
+                output.err(f"note: {settings.WARNINGS[args.key]}")
         except KeyError as exc:
             raise HswapError(str(exc).strip("'\"")) from None
         except ValueError as exc:
@@ -487,7 +534,7 @@ Switch between multiple accounts across AI coding harnesses.
 
 Across harnesses:
   hswap harnesses              installed harnesses and adapters
-  hswap list [HARNESS]         accounts and usage (--json, --no-usage)
+  hswap list [HARNESS]         accounts and usage (--json, --no-usage, --cached)
   hswap status [HARNESS]       active account per harness (--json)
   hswap capabilities [HARNESS] what each harness supports on this machine
   hswap doctor                 check installs, stores and permissions
@@ -496,7 +543,7 @@ Across harnesses:
   hswap tui                    dashboard (also: bare hswap in a terminal)
 
 Per harness ({harnesses}):
-  hswap <harness> list | status | add [--login] | remove | switch | run | usage | alias | capabilities
+  hswap <harness> list | status | add [--login] | remove | switch | run | usage | auto | alias | capabilities
   Harnesses with a richer command set of their own take it here instead
   (see `hswap <harness> help`).
 """
@@ -528,6 +575,7 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
             p.add_argument("harness", nargs="?")
         if head in ("list", "ls"):
             p.add_argument("--no-usage", action="store_true")
+            p.add_argument("--cached", action="store_true")
         if head == "migrate":
             p.add_argument("--dry-run", action="store_true")
         if head == "config":
@@ -538,7 +586,7 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
         if head == "harnesses":
             return cmd_harnesses(registry, args.json)
         if head in ("list", "ls"):
-            return cmd_list(registry, args.harness, args.json, not args.no_usage)
+            return cmd_list(registry, args.harness, args.json, not args.no_usage, args.cached)
         if head == "status":
             return cmd_status(registry, args.harness, args.json)
         if head == "capabilities":

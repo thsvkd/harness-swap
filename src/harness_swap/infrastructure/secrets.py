@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import re
 
-# JWTs, and the common vendor key/token prefixes followed by a long body.
+# JWTs, and common vendor key/token prefixes followed by a long, mixed-case,
+# digit-bearing body. Requiring both keeps lowercase names that merely start
+# with a prefix ("rt-notifications-team@corp.com", alias "sk-personal") out.
 _SECRET_RE = re.compile(
     r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"
-    r"\b(?:sk|sk-ant|sk-proj|xai|rt|sess|ghp|gho|github_pat)[-_][A-Za-z0-9_-]{16,}"
+    r"\b(?:sk|sk-ant|sk-proj|xai|rt|sess|ghp|gho|github_pat)[-_]"
+    r"(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{20,}"
 )
 
 

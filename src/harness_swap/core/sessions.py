@@ -13,16 +13,18 @@ skills) are linked in, while credentials and session history stay per
 account. Links are made only for names that exist in the default home and
 not yet in the profile, and existing files are never replaced.
 
-Liveness: :func:`launch` takes an exclusive lock on ``<home>/.hswap-session.lock``
-and hands the open descriptor to the harness process (POSIX ``exec``) or
-holds it while waiting (Windows). The kernel releases it when that process
-exits -- including on Ctrl+C or a crash -- so :func:`in_use` is exact
-without pid files.
+Liveness: hswap takes an exclusive lock on ``<home>/.hswap-session.lock``
+(under the account store's lock, so it cannot race a switch), starts the
+harness as its child and keeps the lock until the child exits. The
+descriptor is not inheritable, so servers or shells the harness leaves
+behind never keep a session "in use". The kernel drops the lock if hswap
+itself dies, so :func:`in_use` needs no pid files.
 """
 
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -97,23 +99,32 @@ def acquire(profile: Path) -> int:
     return fd
 
 
-def launch(argv: list[str], env: dict[str, str], lock_fd: int) -> int:
-    """Run ``argv`` with ``env`` while ``lock_fd`` stays locked.
+def launch(argv: list[str], env: dict[str, str], lock_fd: int | None = None) -> int:
+    """Run ``argv`` with ``env`` in the foreground; return its exit status.
 
-    POSIX: the lock descriptor is made inheritable and the process is
-    replaced with ``exec``, so the harness itself owns the lock (and the
-    terminal, signals and exit status). Never returns.
-
-    Windows: runs the harness as a child, keeps the lock until it exits,
-    and returns its exit code. Ctrl+C reaches the child through the shared
-    console; this process just keeps waiting for it.
+    The harness shares the terminal and process group, so Ctrl+C / Ctrl+Z
+    reach it directly; this process ignores SIGINT/SIGQUIT while waiting and
+    forwards SIGTERM/SIGHUP. ``lock_fd`` (the session lock) is released after
+    the child exits. A child killed by signal N yields ``128 + N``, as a
+    shell reports it.
     """
+    proc = subprocess.Popen(argv, env=env)
+    forwarded = {}
     if sys.platform != "win32":
-        os.set_inheritable(lock_fd, True)
-        os.execvpe(argv[0], argv, env)
-    proc = subprocess.Popen(argv, env=env)  # pragma: no cover - Windows path
-    while True:  # pragma: no cover - Windows path
-        try:
-            return proc.wait()
-        except KeyboardInterrupt:
-            continue
+        for sig in (signal.SIGINT, signal.SIGQUIT):
+            forwarded[sig] = signal.signal(sig, signal.SIG_IGN)
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            forwarded[sig] = signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
+    try:
+        while True:
+            try:
+                code = proc.wait()
+                break
+            except KeyboardInterrupt:  # Windows: the console delivers Ctrl+C to both
+                continue
+    finally:
+        for sig, handler in forwarded.items():
+            signal.signal(sig, handler)
+        if lock_fd is not None:
+            os.close(lock_fd)
+    return 128 - code if code < 0 else code

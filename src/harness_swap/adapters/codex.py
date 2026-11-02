@@ -64,7 +64,8 @@ class CodexAuthFormat:
         tokens = part.get("tokens")
         if isinstance(tokens, dict) and isinstance(tokens.get("id_token"), str):
             claims = jwt_claims(tokens["id_token"])
-            auth = claims.get(_AUTH_CLAIMS) or {}
+            auth = claims.get(_AUTH_CLAIMS)
+            auth = auth if isinstance(auth, dict) else {}
             account_id = tokens.get("account_id") or auth.get("chatgpt_account_id")
             user_id = auth.get("chatgpt_user_id") or auth.get("user_id")
             if not (account_id and user_id):

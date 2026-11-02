@@ -231,3 +231,77 @@ def test_add_with_nothing_signed_in(env):
     _live, _store, creds = env
     with pytest.raises(CredentialError, match="not signed in"):
         creds.add_current()
+
+
+def test_a_slot_running_in_a_session_is_not_overwritten_by_sync_back(env):
+    """Race regression: the global file holds an older copy of an account whose
+    isolated session has since rotated the token in its own snapshot."""
+    import os
+
+    from harness_swap.core import sessions
+
+    live, store, creds = env
+    add(creds, live, {"s": entry("alice", "a-1")})
+    add(creds, live, {"s": entry("bob", "b-1")})
+    write(store.account_dir(1) / "auth.json", {"s": entry("alice", "a-2-rotated-by-session")})
+    write(live, {"s": entry("alice", "a-1")})  # stale global copy of alice
+    fd = sessions.acquire(store.account_dir(1))
+    try:
+        with pytest.raises(Exception, match="isolated session"):
+            creds.activate(1)
+        creds.activate(2)
+    finally:
+        os.close(fd)
+    assert read(store.account_dir(1) / "auth.json")["s"]["token"] == "a-2-rotated-by-session"
+    assert read(live)["s"]["user"] == "bob"
+
+
+class ExclusiveFormat(ScopedFormat):
+    exclusive = True
+
+
+def test_exclusive_format_drops_other_managed_parts_only(tmp_path):
+    live = tmp_path / "home" / "auth.json"
+    live.parent.mkdir()
+    store = AccountStore(tmp_path / "store")
+    creds = SnapshotCredentials(ExclusiveFormat(), store, live)
+    write(live, {"s1": entry("alice", "a-1"), "s2": entry("bob", "b-1"), "plain": 1})
+    creds.add_current()
+    write(live, {"s1": entry("alice", "a-2"), "s2": entry("bob", "b-2"), "plain": 1})
+    creds.activate(2)
+    assert read(live) == {"s2": entry("bob", "b-2"), "plain": 1}
+    assert read(store.account_dir(1) / "auth.json")["s1"]["token"] == "a-2"  # captured before dropping
+    write(live, {"s2": entry("bob", "b-2"), "s3": entry("carol", "c-1")})
+    with pytest.raises(CredentialConflict, match="carol"):
+        creds.activate(1)
+
+
+def _switch_many(store_root, live, slots, rounds):
+    from harness_swap.core.errors import LockError as _LockError
+
+    creds = SnapshotCredentials(ScopedFormat(), AccountStore(store_root), live, lock_timeout=5)
+    for _ in range(rounds):
+        for slot in slots:
+            try:
+                creds.activate(slot)
+            except _LockError:
+                pass
+
+
+def test_concurrent_switches_across_processes(env):
+    import multiprocessing
+
+    live, store, creds = env
+    users = ["alice", "bob", "carol"]
+    for u in users:
+        add(creds, live, {"s": entry(u, f"{u}-1")})
+    ctx = multiprocessing.get_context("spawn")
+    procs = [ctx.Process(target=_switch_many, args=(store.root, live, order, 5)) for order in ([1, 2, 3], [3, 2, 1], [2, 1, 3])]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+        assert p.exitcode == 0
+    assert read(live)["s"]["user"] in users
+    for slot, user in enumerate(users, start=1):
+        assert read(store.account_dir(slot) / "auth.json")["s"] == entry(user, f"{user}-1")

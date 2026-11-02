@@ -70,7 +70,10 @@ Rules the code follows (and `tests/test_hswap_contract.py` checks):
 - The Claude engine (`claude_swap`) is only imported by `adapters/claude.py`.
   Its generic leaf modules (`fsutil`, `locking`, `spawn`) now live in
   `harness_swap.infrastructure`; `claude_swap.fsutil` etc. are aliases of the
-  same module objects, so the engine and its 2900 existing tests are unchanged.
+  same module objects. The engine's other changes are an embedding hook in
+  `cli.py` (`EMBEDDED_PROG`), `ClaudeSwitchError` deriving from `HswapError`,
+  and the alias validator moving to `core.models`; its 2900 existing tests
+  pass unmodified.
 
 ## The adapter contract
 
@@ -148,10 +151,13 @@ offers a documented quota API to rotate on.
 (`CODEX_HOME`, `GROK_HOME`, ...) at the account's own directory in hswap's
 store, which already holds that account's credentials, so the harness refreshes
 them in place. User configuration named by the adapter is symlinked in; history
-stays per account. The process holds an exclusive lock on
-`<home>/.hswap-session.lock` (inherited through `exec`), so hswap knows exactly
-when a session is live — including after Ctrl+C or a crash — and refuses to
-activate that account globally meanwhile.
+stays per account. hswap takes an exclusive lock on
+`<home>/.hswap-session.lock` under the account store's lock (so a switch cannot
+interleave), runs the harness as its child in the foreground, and releases the
+lock when the child exits. The descriptor is not inheritable, so servers the
+harness leaves behind do not keep the session "in use"; the kernel drops the
+lock if hswap itself dies. Meanwhile that account cannot be activated globally,
+and sync-back never overwrites its snapshot, which the session keeps fresher.
 
 ## Data
 

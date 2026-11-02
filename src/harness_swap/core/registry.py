@@ -60,10 +60,12 @@ class Registry:
     ):
         self._entries: dict[str, AdapterEntry] = {}
         self._loaded: dict[str, HarnessAdapter] = {}
+        self._trusted: set[str] = set()
         for adapter_id, target in (builtins or {}).items():
             self._entries[adapter_id] = AdapterEntry(adapter_id, "builtin", True, target)
         if discover_plugins:
             trusted = set(trusted_plugins or ())
+            self._trusted = set(trusted)
             env = os.environ.get("HSWAP_TRUSTED_PLUGINS", "")
             trusted |= {i.strip().lower() for i in env.split(",") if i.strip()}
             self._discover(trusted)
@@ -82,6 +84,10 @@ class Registry:
         self._entries[adapter_id] = AdapterEntry(adapter_id, "runtime", True, target)
         self._loaded.pop(adapter_id, None)
 
+    def trust_command(self, adapter_id: str) -> str:
+        """The config command that trusts ``adapter_id`` and keeps the others trusted."""
+        return f"hswap config set plugins.trusted {','.join(sorted(self._trusted | {adapter_id}))}"
+
     def entries(self) -> list[AdapterEntry]:
         return sorted(self._entries.values(), key=lambda e: (e.origin != "builtin", e.id))
 
@@ -97,7 +103,7 @@ class Registry:
         if not entry.trusted:
             raise HarnessNotFound(
                 f"{adapter_id!r} comes from {entry.origin} and is not trusted; "
-                f"run `hswap config set plugins.trusted {adapter_id}` to allow it"
+                f"run `{self.trust_command(adapter_id)}` to allow it"
             )
         if adapter_id not in self._loaded:
             try:

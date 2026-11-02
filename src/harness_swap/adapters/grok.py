@@ -8,8 +8,11 @@ Verified against Grok Build 1.0.70 and its bundled user guide
   reloader ignores it and would keep watching the default file.
 * ``auth.json`` (0600, guarded by ``auth.json.lock``) maps a login *scope*
   (``<issuer>::<client id>``, or ``xai::api_key``) to its credential, and
-  can hold several scopes. A switch replaces only the target account's
-  scope and keeps every other scope as it was.
+  can hold several scopes. Which one Grok uses is Grok's decision (session
+  tokens outrank API keys), so a switch leaves the target as the only
+  credential scope: other scopes that hswap stores are synced back first and
+  dropped; one it does not store makes the switch stop (``--force`` stashes
+  the file first). Non-credential keys are kept.
 * "Grok picks up changes to ``~/.grok/auth.json`` automatically ... without
   a restart" (documented hot reload), so a switch reaches running sessions.
 * ``grok login`` *replaces* the cached session, so ``add --login`` runs it
@@ -35,6 +38,7 @@ from harness_swap.core.models import (
 
 class GrokAuthFormat:
     secret_name = "auth.json"
+    exclusive = True
 
     def parts(self, doc: dict) -> dict[str, dict]:
         return {

@@ -143,20 +143,31 @@ def test_isolated_run_uses_the_account_home_and_no_daemon(codex, monkeypatch):
     assert json.loads((home / "auth.json").read_text())["tokens"]["account_id"] == "acct-b"
 
 
-def test_running_the_active_account_execs_plain_codex(codex, monkeypatch):
+def test_running_the_active_account_uses_the_default_home(codex, monkeypatch):
     adapter, home = codex
     login(home, "a@x.com", "user-a", "acct-a")
     adapter.add_account()
-    class Exec(Exception):
-        pass
+    seen = {}
+    monkeypatch.setattr(
+        "harness_swap.core.sessions.launch", lambda argv, env, fd: seen.update(argv=argv, env=env, fd=fd) or 5
+    )
+    assert service.launch(adapter, "1", ["--help"]) == 5
+    assert seen["argv"] == ["/fake/codex", "--help"] and seen["fd"] is None
+    assert seen["env"]["CODEX_HOME"] == str(home)  # inherited, not redirected to a profile
+    assert not (adapter.store.account_dir(1) / ".hswap-session.lock").exists()
 
-    def fake_exec(exe, argv):
-        raise Exec(argv)
 
-    monkeypatch.setattr("os.execvp", fake_exec)
-    with pytest.raises(Exec) as exc:
-        service.launch(adapter, "1", ["--help"])
-    assert exc.value.args[0] == ["/fake/codex", "--help"]
+@posix_only
+def test_add_login_with_a_taken_alias_fails_before_signing_in(codex, tmp_path):
+    adapter, home = codex
+    login(home, "a@x.com", "user-a", "acct-a")
+    adapter.add_account(alias="work")
+    marker = tmp_path / "ran"
+    exe = fake_executable(tmp_path / "bin", "codex", f"open({str(marker)!r}, 'w').write('x')")
+    adapter._installation = Installation(True, str(exe), "codex-cli 0.166.0")
+    with pytest.raises(HswapError, match="already used"):
+        adapter.add_account(login=True, alias="work")
+    assert not marker.exists()
 
 
 @posix_only

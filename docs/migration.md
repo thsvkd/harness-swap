@@ -27,15 +27,16 @@ no Keychain item is moved.
 
 **One exception.** Very old claude-swap installs on Linux kept their data in
 `~/.claude-swap-backup`; the engine moves it to the XDG location the first time
-it starts. hswap does not let that happen as a side effect: any Claude command
-stops with an explanation instead, and
+it starts. hswap does not let that happen as a side effect: every Claude command
+except `hswap claude help`/`--version` (including bare `hswap claude`) stops
+with an explanation instead, and
 
 ```bash
 hswap migrate --dry-run   # would move ~/.claude-swap-backup -> ~/.local/share/claude-swap
 hswap migrate             # backs it up to <hswap home>/backups/claude-swap-<time>, then moves it
 ```
 
-The backup is a plain copy (0700 directory); delete it once you are satisfied.
+The backup is a plain copy inside a 0700 directory; delete it once you are satisfied.
 To roll back, move the backup back to `~/.claude-swap-backup` and remove the new
 directory.
 

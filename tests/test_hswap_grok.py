@@ -33,21 +33,37 @@ def sign_in(home, email, user, extra=None):
     return write_json(home / "auth.json", doc)
 
 
-def test_switch_replaces_only_the_account_scope(grok):
+def test_switch_leaves_the_target_as_the_only_credential_scope(grok):
     adapter, home = grok
     api_scope = {"xai::api_key": {"key": "synthetic-xai-api-key", "auth_mode": "api_key"}}
-    sign_in(home, "a@x.com", "user-a", api_scope)
-    adapter.add_account(provider=None)
-    sign_in(home, "b@x.com", "user-b", api_scope)
+    sign_in(home, "a@x.com", "user-a", {**api_scope, "preferences": {"theme": "dark"}})
+    adapter.add_account()  # stores both the session login and the API key
+    sign_in(home, "b@x.com", "user-b", {"preferences": {"theme": "dark"}})
     adapter.add_account()
-    accounts = {a.label: a for a in adapter.list_accounts()}
-    assert set(accounts) >= {"a@x.com", "b@x.com"}
+    labels = {a.label for a in adapter.list_accounts()}
+    assert {"a@x.com", "b@x.com"} <= labels and any(lbl.startswith("API key") for lbl in labels)
     result = service.switch(adapter, "a@x.com")
     doc = json.loads((home / "auth.json").read_text())
-    assert doc[SCOPE]["user_id"] == "user-a"
-    assert doc["xai::api_key"] == api_scope["xai::api_key"]
-    assert not result.restart_required
-    assert "next request" in result.notes[0]
+    assert doc[SCOPE]["user_id"] == "user-a" and doc["preferences"] == {"theme": "dark"}
+    assert not result.restart_required and "next request" in result.notes[0]
+    # switching to the API key drops the session scope Grok would otherwise prefer
+    key_account = next(a for a in adapter.list_accounts() if a.auth_mode == "api_key")
+    result = service.switch(adapter, str(key_account.slot))
+    doc = json.loads((home / "auth.json").read_text())
+    assert SCOPE not in doc and doc["xai::api_key"]["key"] == "synthetic-xai-api-key"
+    assert result.previous.label == "a@x.com"
+    assert [a.label for a in adapter.list_accounts() if a.active] == [key_account.label]
+
+
+def test_unmanaged_other_scope_blocks_the_switch(grok):
+    adapter, home = grok
+    sign_in(home, "a@x.com", "user-a")
+    adapter.add_account()
+    sign_in(home, "b@x.com", "user-b", {"https://other::c2": grok_entry("x@y.com", "user-x")})
+    before = (home / "auth.json").read_bytes()
+    with pytest.raises(Exception, match="x@y.com"):
+        service.switch(adapter, "a@x.com")
+    assert (home / "auth.json").read_bytes() == before
 
 
 def test_capabilities_are_honest(grok):

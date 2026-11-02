@@ -93,9 +93,22 @@ def test_emit_json_refuses_credential_shaped_text(capsys):
     with pytest.raises(output.SecretLeak):
         output.emit_json({"x": "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4eHh4eHgifQ.sig"})
     with pytest.raises(output.SecretLeak):
-        output.emit_json({"x": "sk-proj-abcdefghijklmnopqrstuvwxyz"})
-    output.emit_json({"identity": "user-abcdefghijklmnopqrstuvwxyz/acct-0123456789"})
-    assert "user-abc" in capsys.readouterr().out
+        output.emit_json({"x": "sk-proj-Ab3dEfGh1jKlMn0pQrStUvWxYz12"})
+    # ordinary names that merely start like a key prefix are fine
+    output.emit_json({
+        "identity": "user-abcdefghijklmnopqrstuvwxyz/acct-0123456789",
+        "labels": ["rt-notifications-team@corp.com", "sess-shared-account-1@x.io", "sk-personal-account"],
+    })
+    assert "rt-notifications-team" in capsys.readouterr().out
+
+
+def test_alias_and_config_mistakes_are_clean_errors(native, capsys, tmp_path, monkeypatch):
+    reg, _ = native
+    monkeypatch.setenv("HSWAP_HOME", str(tmp_path / "h"))
+    code, out, err = run(reg, capsys, "config", "get", "nope")
+    assert code == 1 and "unknown setting" in err and "Traceback" not in err
+    code, _out, err = run(reg, capsys, "config", "unset", "nope")
+    assert code == 1 and "unknown setting" in err
 
 
 # -- end to end through the real built-in adapters, on synthetic homes ---------------------------
@@ -137,6 +150,18 @@ def test_no_credential_material_reaches_any_output(homes, capsys):
     for secret in ("SECRETREFRESH", "SECRETGROKKEY", "SECRETB", "eyJ"):
         assert secret not in blob
     assert "a@x.com" in blob and "g@x.com" in blob
+
+
+def test_alias_collisions_are_clean_errors(homes, capsys):
+    reg, tmp = homes
+    for user in ("a", "b"):
+        write_json(tmp / "codex" / "auth.json", codex_auth(f"{user}@x.com", f"user-{user}", f"acct-{user}"))
+        run(reg, capsys, "codex", "add")
+    assert run(reg, capsys, "codex", "alias", "1", "work")[0] == 0
+    code, _, err = run(reg, capsys, "codex", "alias", "2", "work")
+    assert code == 1 and "already used by slot 1" in err
+    code, _, err = run(reg, capsys, "codex", "alias", "2", "123")
+    assert code == 1 and "numeric" in err
 
 
 def test_remove_needs_confirmation_or_yes(homes, capsys, monkeypatch):

@@ -34,7 +34,8 @@ Run `hswap capabilities` for your install.
 
 ## Claude Code
 
-Unchanged claude-swap engine; see [claude.md](claude.md) and its tests (2900+).
+The claude-swap engine (unchanged apart from a small embedding hook); see
+[claude.md](claude.md) and its tests (2900+).
 
 - `CLAUDE_CONFIG_DIR` relocates the config home; credentials in
   `.credentials.json` (0600) on Linux/Windows, Keychain on macOS — verified
@@ -69,6 +70,13 @@ Not done: automatic rotation (no documented quota API; rotating accounts to get
 around rate limits may breach OpenAI's terms), keyring/auto/ephemeral stores,
 killing running Codex processes.
 
+Known risk: if a running Codex is in the middle of refreshing its token when you
+switch, the server may rotate the old account's refresh token after hswap has
+captured it; Codex then refuses to write it back (account mismatch), and that
+account needs `codex login` again. Whether Codex holds `auth.lock` across the
+network refresh is not documented. Switch while Codex is idle where you can;
+hswap reports running Codex processes after every switch.
+
 ## Grok Build
 
 Bundled user guide (`~/.grok/docs/user-guide/`, 1.0.70) and xai-org/grok-build:
@@ -84,8 +92,11 @@ Bundled user guide (`~/.grok/docs/user-guide/`, 1.0.70) and xai-org/grok-build:
 | leader process caches credentials? | unknown | leader mode is off by default; not documented |
 | quota API | none | `grok usage` prints per-session token cost; docs describe OTEL token metrics only |
 
-What hswap does: switches one scope inside `auth.json` and keeps every other
-scope; signs new accounts in with `GROK_HOME=<throwaway>` (config.toml linked so
+What hswap does: makes the target the only credential scope in `auth.json`
+(Grok, not hswap, chooses between several, and a session token outranks an
+API key), after syncing the other stored scopes back; a scope hswap does not
+store stops the switch unless `--force` stashes the file; non-credential keys
+are kept; signs new accounts in with `GROK_HOME=<throwaway>` (config.toml linked so
 OIDC settings apply); isolated sessions with `GROK_HOME=<account dir>`, linking
 `config.toml`, `rules`, `skills`, `memory`, `installed-plugins` and
 `trusted_folders.toml` (experimental: session history is per account, and
@@ -115,8 +126,8 @@ usage (no quota interface; `opencode stats` is local statistics).
 
 - Isolated sessions link shared files with symlinks on POSIX only; on Windows
   a session starts without them.
-- On Windows `run` waits for the harness as a child process (no `exec`), holding
-  the session lock until it exits.
+- `run` starts the harness as a child process and waits for it on every
+  platform, holding the session lock until it exits; exit status is passed through.
 - Fake-executable tests (login flows, OpenCode emulator) are POSIX-only; the
   remaining hswap tests and the full engine suite are platform-neutral.
 - Only Linux was exercised in this change; macOS/Windows behaviour of the new

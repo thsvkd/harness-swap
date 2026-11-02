@@ -1330,7 +1330,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=(
             "Emit machine-readable JSON to stdout (use with 'list', 'status', "
-            "or 'switch'). See README 'JSON output for scripting'."
+            "or 'switch'). See docs/claude.md 'JSON output for scripting'."
         ),
     )
     parser.add_argument(

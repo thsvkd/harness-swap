@@ -50,5 +50,9 @@ class CredentialConflict(CredentialError):
     """The live login is not one hswap manages, so overwriting it would lose it."""
 
 
+class ValidationError(HswapError, ValueError):
+    """User input (an alias, a setting) failed validation."""
+
+
 class StoreVersionError(HswapError):
     """An hswap data file was written by a newer, incompatible hswap."""

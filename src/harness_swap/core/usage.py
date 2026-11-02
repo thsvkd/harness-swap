@@ -7,8 +7,9 @@ manners without reimplementing them:
 * never more than once per ``UsagePolicy.min_interval_s`` per account, even
   across concurrent ``hswap`` processes (the cache is shared on disk and
   updated under a lock);
-* after a failure, exponential backoff up to ``max_backoff_s``, serving the
-  last good measurement marked ``stale`` in the meantime;
+* after a failure, exponential backoff up to ``max_backoff_s``; meanwhile
+  the result is an ``error`` snapshot that still carries the last good
+  numbers (so it is never mistaken for fresh headroom);
 * a measurement older than ``stale_after_s`` is reported ``stale``;
 * an adapter exception becomes an ``error`` snapshot, never a crash.
 
@@ -53,9 +54,10 @@ class UsageService:
 
     def _load(self) -> dict:
         try:
-            return json.loads(self._path().read_text(encoding="utf-8"))
+            data = json.loads(self._path().read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError):
             return {}
+        return data if isinstance(data, dict) else {}
 
     def get(self, reader: UsageReader, account: Account) -> UsageSnapshot:
         policy = reader.usage_policy
@@ -63,28 +65,40 @@ class UsageService:
         mkdir_private(self.cache_dir)
         with FileLock(self.cache_dir / ".usage.lock", timeout=30.0):
             cache = self._load()
-            entry = cache.get(account.key, {})
-            last = _from_cache(entry["snapshot"]) if "snapshot" in entry else None
-            due = max(entry.get("fetched_at", 0.0) + policy.min_interval_s, entry.get("retry_at", 0.0))
-            if last is not None and now < due:
+            entry = cache.get(account.key)
+            entry = entry if isinstance(entry, dict) else {}
+            try:
+                last = _from_cache(entry["snapshot"]) if "snapshot" in entry else None
+            except (TypeError, ValueError, KeyError):
+                entry, last = {}, None  # written by another hswap version: start over
+            failures = entry.get("failures", 0)
+            if failures and now < entry.get("retry_at", 0.0):
+                return self._failed(last, entry.get("error", "usage read failed"))
+            if not failures and last is not None and now < entry.get("fetched_at", 0.0) + policy.min_interval_s:
                 return self._aged(last, policy.stale_after_s, now)
             try:
                 snap = reader.read_usage(account)
                 entry = {"snapshot": _to_cache(snap), "fetched_at": now, "failures": 0}
             except Exception as exc:  # noqa: BLE001 - any adapter failure becomes an error snapshot
-                failures = entry.get("failures", 0) + 1
+                failures += 1
+                error = f"{type(exc).__name__}: {exc}"
                 delay = min(policy.min_interval_s * 2**failures, policy.max_backoff_s)
-                entry = {**entry, "failures": failures, "retry_at": now + delay}
-                snap = UsageSnapshot(
-                    UsageState.ERROR,
-                    windows=last.windows if last else (),
-                    measured_at=last.measured_at if last else None,
-                    source=last.source if last else "",
-                    detail=f"{type(exc).__name__}: {exc}",
-                )
+                entry = {**entry, "failures": failures, "retry_at": now + delay, "error": error}
+                snap = self._failed(last, error)
             cache[account.key] = entry
             atomic_write_text(self._path(), json.dumps(cache, indent=1))
         return self._aged(snap, policy.stale_after_s, now)
+
+    @staticmethod
+    def _failed(last: UsageSnapshot | None, detail: str) -> UsageSnapshot:
+        """An ``error`` snapshot that still carries the last good numbers."""
+        return UsageSnapshot(
+            UsageState.ERROR,
+            windows=last.windows if last else (),
+            measured_at=last.measured_at if last else None,
+            source=last.source if last else "",
+            detail=detail,
+        )
 
     @staticmethod
     def _aged(snap: UsageSnapshot, stale_after_s: float, now: float) -> UsageSnapshot:

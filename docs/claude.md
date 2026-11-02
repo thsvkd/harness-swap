@@ -179,7 +179,7 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
-<img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
+<img src="../assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
 
@@ -420,6 +420,9 @@ uv tool uninstall claude-swap
 # or
 pipx uninstall claude-swap
 ```
+
+Under hswap: `hswap claude purge` removes the Claude data, and hswap itself is
+uninstalled with `uv tool uninstall harness-swap` (see [migration.md](migration.md)).
 
 ## Requirements
 

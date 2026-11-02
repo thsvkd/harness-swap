@@ -2,7 +2,7 @@
 
 ```bash
 uv sync
-uv run pytest                 # parallel (pytest-xdist), ~40 s on 4 cores
+uv run pytest                 # parallel (pytest-xdist), ~40–60 s on 4 cores
 uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 ```
 
@@ -10,13 +10,14 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 
 | Area | File | Notes |
 |---|---|---|
-| Claude engine (regression) | `tests/test_*.py` (pre-existing, ~2900) | unchanged; must stay green |
+| Claude engine (regression) | `tests/test_*.py` (pre-existing, ~2900) | not modified; must stay green |
 | Core: store, rotation, usage service, registry, dispatch, resolution | `test_hswap_core.py` | |
-| Credential activation guarantees | `test_hswap_credentials.py` | sync-back, conflict/stash, part isolation, rollback on interrupted write and on failed verification, tampered snapshot, harness lock, lock file not truncated, concurrent switches, no secrets in errors |
+| Credential activation guarantees | `test_hswap_credentials.py` | sync-back, conflict/stash, part isolation, exclusive formats, rollback on interrupted write and on failed verification, tampered snapshot, harness lock, lock file not truncated, concurrent switches (threads and processes), session-owned snapshot never overwritten, no secrets in errors |
+| Isolated sessions | `test_hswap_sessions.py` | lock held while running and released after, not inherited by the harness's background children, exit status/signals, removed slot not reused, remove refused while running |
 | Codex adapter | `test_hswap_codex.py` | identity, workspaces, API keys, switch + restart notice, credential-store modes, missing binary, isolated session (env, `--no-daemon`, links, lock), `--login` isolation, usage attribution and states, strategy switch, no network |
-| Grok adapter | `test_hswap_grok.py` | scope-only switch, capability honesty, unsupported usage, isolated session, `--login` isolation |
+| Grok adapter | `test_hswap_grok.py` | exclusive scope switch (session ↔ API key), unmanaged scope refused, capability honesty, unsupported usage, isolated session, `--login` isolation |
 | OpenCode adapter | `test_hswap_opencode.py` | V2 emulator over a real SQLite file: probe-based mode, listing + active flags, native switch/login/logout, DB never written and secret column never selected; unknown version refused; legacy provider swap |
-| Claude adapter | `test_hswap_claude_adapter.py` | schema-v1 → core usage mapping, engine embedding (prog name, argv restore, upgrade refused), legacy-store migration gate + backup |
+| Claude adapter | `test_hswap_claude_adapter.py` | schema-v1 → core usage mapping, engine embedding (prog name, argv restore, upgrade refused), legacy-store migration gate (no engine path bypasses it) + backup |
 | CLI and dashboard | `test_hswap_cli.py` | native passthrough, errors and JSON envelopes, confirmations, failed switch keeps login, config, **no credential in any output**, Textual pilot test of the dashboard |
 | Extensibility acceptance | `test_hswap_contract.py` | the example adapter registered at runtime and as a trusted/untrusted entry-point plugin, driven through CLI, services and dashboard; static check that shared code names no harness and imports no adapter |
 

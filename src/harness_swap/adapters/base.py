@@ -134,6 +134,8 @@ class FileCredentialAdapter:
         self, *, alias: str | None = None, provider: str | None = None, login: bool = False
     ) -> Account:
         if login:
+            if alias is not None:
+                alias = self.store.check_new_alias(alias)  # fail before the user signs in
             results = self._login_isolated(alias=alias, provider=provider)
         else:
             results = self.credentials.add_current(alias=alias, provider=provider)
@@ -166,12 +168,12 @@ class FileCredentialAdapter:
         return self.shared_names
 
     def remove_account(self, account: Account) -> None:
-        if account.slot is not None and sessions.in_use(self.store.account_dir(account.slot)):
-            raise HswapError(
-                f"slot {account.slot} is in use by a running `hswap {self.id} run` session; "
-                "exit it first"
-            )
-        self.store.delete(account.slot, (self.credential_file,))
+        def busy(directory):
+            if sessions.in_use(directory):
+                return f"slot {account.slot} is in use by a running `hswap {self.id} run` session; exit it first"
+            return None
+
+        self.store.delete(account.slot, (self.credential_file,), refuse=busy)
 
     def set_alias(self, account: Account, alias: str | None) -> Account:
         return self._to_account(self.store.set_alias(account.slot, alias), account.active)
@@ -179,12 +181,6 @@ class FileCredentialAdapter:
     # --- switching -------------------------------------------------------------------
 
     def switch_account(self, account: Account, *, force: bool = False) -> SwitchResult:
-        if sessions.in_use(self.store.account_dir(account.slot)):
-            raise HswapError(
-                f"slot {account.slot} is running in an isolated `hswap {self.id} run` session, "
-                "which refreshes that login on its own; activating it globally too would make two "
-                "processes rotate one refresh token. Exit that session first."
-            )
         target, previous = self.credentials.activate(account.slot, force=force)
         notes = []
         restart = False
@@ -197,8 +193,8 @@ class FileCredentialAdapter:
             restart = bool(running)
             if running:
                 notes.append(
-                    f"{len(running)} running {self.display_name} process(es) keep the previous "
-                    "account until restarted"
+                    f"{len(running)} {self.display_name} process(es) are running; those using "
+                    f"{self.home} keep the previous account until restarted"
                 )
             elif running is None:
                 notes.append(f"restart any running {self.display_name} to use the new account")
@@ -235,15 +231,26 @@ class FileCredentialAdapter:
 
     def launch(self, account: Account, args: list[str]) -> int:
         inst = self._require_installed()
-        if account.active:
-            # Already the default login: the default home is the right one,
-            # and a second copy of the token must not be created.
-            os.execvp(inst.executable, [inst.executable, *args])
-        profile = self.store.account_dir(account.slot)
-        if not (profile / self.credential_file).exists():
-            raise CredentialError(f"slot {account.slot} has no stored credentials to run with")
-        mkdir_private(profile)
-        sessions.link_shared(profile, self.home, self.shared_names)
-        fd = sessions.acquire(profile)
-        env = {**os.environ, self.home_env: str(profile)}
-        return sessions.launch([inst.executable, *self.session_args(), *args], env, fd)
+        creds = self.credentials
+        # Decide and take the session lock under the store lock, so a switch
+        # (which checks the session lock under the same lock) cannot interleave.
+        with self.store.lock():
+            stored = self._stored(account)
+            try:
+                live = creds.live_identities()
+            except CredentialError:
+                live = {}
+            if creds.is_active(stored, live):
+                # Already the default login: the default home is the right one,
+                # and a second copy of the token must not be created.
+                argv, env, fd = [inst.executable, *args], dict(os.environ), None
+            else:
+                profile = self.store.account_dir(stored.slot)
+                if not (profile / self.credential_file).exists():
+                    raise CredentialError(f"slot {stored.slot} has no stored credentials to run with")
+                mkdir_private(profile)
+                sessions.link_shared(profile, self.home, self.shared_names)
+                fd = sessions.acquire(profile)
+                argv = [inst.executable, *self.session_args(), *args]
+                env = {**os.environ, self.home_env: str(profile)}
+        return sessions.launch(argv, env, fd)

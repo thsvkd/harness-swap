@@ -215,3 +215,35 @@ def test_missing_binary(monkeypatch, tmp_path):
     adapter = OpenCodeAdapter()
     assert not adapter.installation().installed
     assert not adapter.capabilities()[Capability.ACCOUNT_SWITCH].usable
+
+
+def test_a_hanging_opencode_is_reported_not_fatal(v2, monkeypatch):
+    adapter, _ = v2
+    import subprocess
+
+    def hang(*a, **k):
+        raise subprocess.TimeoutExpired(a[0], 120)
+
+    monkeypatch.setattr("harness_swap.adapters.opencode.spawn.run", hang)
+    caps = adapter.capabilities()
+    assert caps[Capability.ACCOUNT_SWITCH].support is Support.UNAVAILABLE
+    assert "did not finish" in caps[Capability.ACCOUNT_SWITCH].reason
+
+
+def test_odd_listing_shapes(v2, monkeypatch):
+    import subprocess
+
+    adapter, _ = v2
+    adapter.mode()
+    listing = {"out": '[{"id": "x", "connections": null}, "junk", {"id": "y", "connections": '
+               '["junk", {"type": "credential", "id": "c1", "label": "l"}]}]'}
+
+    def fake_run(*args, capture=True):
+        out = listing["out"] if args[:2] == ("auth", "list") else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(adapter, "_run", fake_run)
+    assert [a.identity for a in adapter.list_accounts()] == ["c1"]
+    listing["out"] = '{"not": "a list"}'
+    with pytest.raises(Exception, match="JSON list"):
+        adapter.list_accounts()

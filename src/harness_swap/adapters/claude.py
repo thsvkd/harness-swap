@@ -1,7 +1,8 @@
 """Claude Code adapter: the claude-swap engine behind hswap's contracts.
 
-The engine (``claude_swap``) is the proven implementation of everything
-Claude-specific -- Keychain/file credential routing, Claude Code's own
+The engine (``claude_swap``, unchanged apart from a small embedding hook, its
+error base class and two leaf modules that moved to ``harness_swap``) is the
+proven implementation of everything Claude-specific -- Keychain/file credential routing, Claude Code's own
 locks, refresh-token lineage checks, MCP/plugin OAuth preservation, the
 usage store, auto-rotation and session profiles. This adapter does not
 reimplement any of it:
@@ -15,8 +16,8 @@ reimplement any of it:
 
 The engine keeps using the claude-swap data directory in place, so cswap and
 hswap see the same accounts. If the engine's own one-time move of a legacy
-``~/.claude-swap-backup`` would run, hswap stops and asks for
-``hswap migrate`` instead of moving it as a side effect of a read.
+``~/.claude-swap-backup`` would run, every Claude command except help stops
+and asks for ``hswap migrate`` instead of moving it as a side effect.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from harness_swap.core.models import (
     UsageState,
     experimental,
     supported,
+    unavailable,
     unsupported,
 )
 from harness_swap.core.paths import hswap_home
@@ -146,7 +148,10 @@ class ClaudeAdapter:
         return self._engine
 
     def run_cli(self, argv: list[str]) -> int:
-        if legacy_move_pending() and argv[:1] not in ([], ["help"], ["-h"], ["--help"], ["config"]):
+        # Only help/version run before a pending legacy move: every other
+        # engine path (including bare `hswap claude` and `config`) may start
+        # the engine, which would move the store as a side effect.
+        if legacy_move_pending() and argv not in (["help"], ["-h"], ["--help"], ["--version"]):
             self._switcher()  # raises the explanatory error
         from claude_swap import cli as engine_cli
 
@@ -170,6 +175,8 @@ class ClaudeAdapter:
 
     def capabilities(self) -> dict[Capability, CapabilityStatus]:
         macos = sys.platform == "darwin"
+        inst = self.installation()
+        no_binary = None if inst.installed else unavailable(f"Claude Code is not installed ({inst.detail})")
         return {
             Capability.ACCOUNT_LIST: supported(),
             Capability.ACCOUNT_ADD: supported("adds the current Claude Code login (`add`, `add-token`)"),
@@ -179,8 +186,9 @@ class ClaudeAdapter:
             Capability.CREDENTIAL_REFRESH: supported("refreshes stored tokens for usage reads, lineage-checked"),
             Capability.USAGE_MONITORING: supported("Anthropic OAuth usage: 5-hour, 7-day and per-model windows"),
             Capability.AUTOMATIC_ROTATION: supported("`hswap claude auto` (threshold, priority, cooldown)"),
-            Capability.PARALLEL_SESSIONS: experimental("`hswap claude run <account>`: per-account CLAUDE_CONFIG_DIR"),
-            Capability.SESSION_RESUME: supported("`hswap claude run <account> -- --resume`"),
+            Capability.PARALLEL_SESSIONS: no_binary
+            or experimental("`hswap claude run <account>`: per-account CLAUDE_CONFIG_DIR"),
+            Capability.SESSION_RESUME: no_binary or supported("`hswap claude run <account> -- --resume`"),
             Capability.CREDENTIAL_HOT_RELOAD: (
                 experimental("picked up after the macOS Keychain cache expires; restart to apply at once")
                 if macos

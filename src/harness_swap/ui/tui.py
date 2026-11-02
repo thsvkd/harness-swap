@@ -14,7 +14,6 @@ from typing import ClassVar
 
 from harness_swap import output
 from harness_swap.core import accounts as service
-from harness_swap.core.errors import HswapError
 from harness_swap.core.models import Account, Capability
 from harness_swap.core.paths import hswap_home
 from harness_swap.core.registry import Registry
@@ -33,12 +32,12 @@ def collect(registry: Registry) -> list[tuple]:
         try:
             accounts = adapter.list_accounts()
             usage = service.collect_usage(adapter, accounts, usage_service)
-        except HswapError as exc:
+            switch = adapter.capabilities().get(Capability.ACCOUNT_SWITCH)
+        except Exception as exc:  # noqa: BLE001 - one harness must not take the dashboard down
             rows.append((adapter, None, "", f"error: {exc}"))
             continue
         if not accounts:
             rows.append((adapter, None, "", f"no accounts (hswap {adapter.id} add)"))
-        switch = adapter.capabilities().get(Capability.ACCOUNT_SWITCH)
         for acc in accounts:
             note = "" if switch and switch.usable else "switching unavailable"
             rows.append((adapter, acc, output.usage_text(usage.get(acc.key)), note))
@@ -117,7 +116,7 @@ def build_app(registry: Registry):
             try:
                 result = service.switch(adapter, str(acc.slot) if acc.slot is not None else acc.identity, provider=acc.provider)
                 message = f"{adapter.display_name}: now {result.current.label}. " + " ".join(result.notes)
-            except HswapError as exc:
+            except Exception as exc:  # noqa: BLE001 - shown in the status line, not a crash
                 message = f"{adapter.display_name}: {exc}"
             self.call_from_thread(self._say, message)
             self.call_from_thread(self.action_refresh)

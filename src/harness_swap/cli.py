@@ -256,7 +256,7 @@ def cmd_harnesses(registry: Registry, as_json: bool) -> int:
         return 0
     for r in rows:
         if not r["trusted"]:
-            state = f"untrusted plugin ({r['origin']}); `hswap config set plugins.trusted {r['id']}`"
+            state = f"untrusted plugin ({r['origin']}); `{registry.trust_command(r['id'])}`"
         elif "error" in r:
             state = f"error: {r['error']}"
         else:
@@ -327,11 +327,14 @@ def cmd_doctor(registry: Registry, as_json: bool) -> int:
             findings.append((adapter.id, "info", f"{inst.executable} {inst.version}"))
         else:
             findings.append((adapter.id, "warn", inst.detail or f"{inst.executable}: version unknown"))
-        for cap, status in adapter.capabilities().items():
-            if status.support is Support.UNAVAILABLE:
-                findings.append((adapter.id, "warn", f"{cap}: {status.reason}"))
-        if isinstance(adapter, Diagnosable):
-            findings += [(adapter.id, level, msg) for level, msg in adapter.diagnose()]
+        try:
+            for cap, status in adapter.capabilities().items():
+                if status.support is Support.UNAVAILABLE:
+                    findings.append((adapter.id, "warn", f"{cap}: {status.reason}"))
+            if isinstance(adapter, Diagnosable):
+                findings += [(adapter.id, level, msg) for level, msg in adapter.diagnose()]
+        except HswapError as exc:
+            findings.append((adapter.id, "error", str(exc)))
         try:
             AccountStore(home / adapter.id).load()
         except HswapError as exc:
@@ -373,7 +376,10 @@ def cmd_config(argv: list[str]) -> int:
         for key, value in settings.load().items():
             print(f"{key} = {value}")
     elif args.action == "get":
-        print(settings.load()[args.key])
+        values = settings.load()
+        if args.key not in values:
+            raise HswapError(f"unknown setting {args.key!r}; known: {', '.join(values)}")
+        print(values[args.key])
     elif args.action == "set":
         if args.key is None or args.value is None:
             raise HswapError("usage: hswap config set KEY VALUE")
@@ -382,7 +388,10 @@ def cmd_config(argv: list[str]) -> int:
         except (KeyError, ValueError) as exc:
             raise HswapError(str(exc).strip("'\"")) from None
     elif args.action == "unset":
-        settings.unset(args.key)
+        try:
+            settings.unset(args.key)
+        except KeyError as exc:
+            raise HswapError(str(exc).strip("'\"")) from None
     return 0
 
 
@@ -456,8 +465,8 @@ def run(argv: list[str], registry: Registry | None = None) -> int:
             from harness_swap.ui.tui import run as run_tui
 
             return run_tui(registry)
-    except HswapError as exc:
-        if as_json:
+    except (HswapError, output.SecretLeak) as exc:
+        if as_json and not isinstance(exc, output.SecretLeak):
             output.emit_json(output.error_json(exc))
         else:
             output.err(f"Error: {exc}")

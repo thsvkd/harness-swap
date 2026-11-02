@@ -147,7 +147,9 @@ acme = "acme_adapter:AcmeAdapter"
 
 Installed plugins are listed by `hswap harnesses` but not imported until the
 user trusts them: `hswap config set plugins.trusted acme` (or
-`HSWAP_TRUSTED_PLUGINS=acme`). A plugin cannot take over a built-in id, and an
+`HSWAP_TRUSTED_PLUGINS=acme`). The setting is the complete list —
+`hswap config set plugins.trusted acme,other` — and the hint hswap prints
+already includes the ids you trust. A plugin cannot take over a built-in id, and an
 object that does not satisfy the contract under its id is rejected. Avoid ids
 that are hswap commands (`list`, `status`, `config`, ...).
 

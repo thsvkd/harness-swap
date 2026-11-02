@@ -47,8 +47,11 @@ For every file-backed harness (`core/credentials.py`):
    any mismatch or error the original bytes are restored (or the file removed
    if there was none). A tampered or mismatched stored snapshot is refused
    before anything is written.
-5. **No double refreshers.** An account running in an isolated session cannot
-   be activated globally (or removed) until that session exits.
+5. **No double refreshers.** For file-backed harnesses (Codex, Grok), an
+   account running in an isolated session cannot be activated globally (or
+   removed) until that session exits; the check and the session start both
+   happen under the store lock, and sync-back skips that account's snapshot,
+   which the session keeps fresher. Claude's `run` follows the claude-swap rules.
 
 `add --login` signs a new account in inside a throwaway harness home, so the
 current login is never replaced or logged out (which could revoke its refresh
@@ -89,3 +92,5 @@ protective controls.
   credentials without its lock can still race a switch; the read-back check
   then fails the switch and restores the original.
 - Windows: permission bits are not applied; files inherit the user profile's ACLs.
+- A Codex token refresh that is in flight during a switch can leave the outgoing
+  account needing a fresh `codex login` (see harness-compatibility.md).

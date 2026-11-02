@@ -35,10 +35,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from harness_swap.core import sessions
 from harness_swap.core.errors import (
     AccountNotFound,
     CredentialConflict,
     CredentialError,
+    HswapError,
     LockError,
 )
 from harness_swap.core.store import AccountStore, StoredAccount, mkdir_private
@@ -74,15 +76,20 @@ class CredentialFormat(Protocol):
         """``doc`` with ``part_key`` set to ``part``, everything else kept."""
         ...
 
+    # Optional: ``exclusive = True`` makes a switch drop every other credential
+    # part (part keys must then be top-level keys of the document).
+
 
 def fingerprint(secret: str) -> str:
     """A short, non-reversible tag for an API key (never the key itself)."""
     return "sha256:" + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]
 
 
-def jwt_claims(token: str) -> dict:
+def jwt_claims(token: object) -> dict:
     """Decode a JWT payload for labelling only (no signature check: the token
     is read from the user's own credential file, not trusted for access)."""
+    if not isinstance(token, str):
+        return {}
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
@@ -188,20 +195,30 @@ class SnapshotCredentials:
     # -- sync-back -------------------------------------------------------------
 
     def _capture(self, accounts: list[StoredAccount], doc: dict) -> list[int]:
-        """Copy live parts back into their stored accounts. Returns updated slots."""
+        """Copy live parts back into their stored accounts. Returns updated slots.
+
+        A slot that an isolated session is running is skipped: that session
+        refreshes the slot's snapshot in place, so it is newer than any copy
+        the live file could hold.
+        """
         updated = []
         for key, part in self.fmt.parts(doc).items():
-            ident = self.fmt.identify(key, part)
-            if ident is None:
-                continue
-            acc = self.store.find(accounts, ident.identity, ident.provider)
-            if acc is None or (acc.part_key or "") != key:
+            acc = self._owner(accounts, key, part)
+            if acc is None or sessions.in_use(self.store.account_dir(acc.slot)):
                 continue
             data = _dump(self.fmt.merge(None, key, part))
             if self.store.read_secret(acc.slot, self.fmt.secret_name) != data:
                 self.store.write_secret(acc.slot, self.fmt.secret_name, data)
                 updated.append(acc.slot)
         return updated
+
+    def _owner(self, accounts: list[StoredAccount], key: str, part: dict) -> StoredAccount | None:
+        """The stored account this live part belongs to (same identity *and* part key)."""
+        ident = self.fmt.identify(key, part)
+        if ident is None:
+            return None
+        acc = self.store.find(accounts, ident.identity, ident.provider)
+        return acc if acc is not None and (acc.part_key or "") == key else None
 
     def sync_back(self) -> list[int]:
         """Public sync-back: refresh stored snapshots from the live file."""
@@ -258,8 +275,19 @@ class SnapshotCredentials:
     # -- switching -----------------------------------------------------------------
 
     def activate(self, slot: int, *, force: bool = False) -> tuple[StoredAccount, StoredAccount | None]:
-        """Make stored ``slot`` the live login. Returns ``(target, previous)``."""
+        """Make stored ``slot`` the live login. Returns ``(target, previous)``.
+
+        With an *exclusive* format (``fmt.exclusive``) the target becomes the
+        only credential part of the file -- needed when the harness, not hswap,
+        decides which of several parts it uses.
+        """
         with self._locked():
+            if sessions.in_use(self.store.account_dir(slot)):
+                raise HswapError(
+                    f"slot {slot} is running in an isolated session, which refreshes that login "
+                    "on its own; activating it globally too would make two processes rotate one "
+                    "refresh token. Exit that session first."
+                )
             accounts = self.store.load()
             target = next((a for a in accounts if a.slot == slot), None)
             if target is None:
@@ -270,25 +298,32 @@ class SnapshotCredentials:
             key = target.part_key or ""
             part = self.stored_part(target)
 
-            previous = None
-            live_part = self.fmt.parts(doc).get(key)
-            if live_part is not None:
-                ident = self.fmt.identify(key, live_part)
-                if ident is not None and (ident.identity, ident.provider) == (target.identity, target.provider):
-                    return target, target  # already active; nothing to write
-                previous = (
-                    self.store.find(accounts, ident.identity, ident.provider) if ident else None
-                )
-                if previous is None:
-                    if not force:
-                        who = ident.label if ident else "an unrecognised login"
-                        raise CredentialConflict(
-                            f"the current login ({who}) is not stored by hswap; switching "
-                            "would lose it. Add it first, or pass --force to stash it and continue"
-                        )
-                    self._stash(raw)
+            live_parts = self.fmt.parts(doc)
+            exclusive = getattr(self.fmt, "exclusive", False)
+            replaced = {k: p for k, p in live_parts.items() if k == key or exclusive}
+            if key in replaced and len(replaced) == 1 and self._owner([target], key, replaced[key]):
+                return target, target  # already active; nothing to write
 
-            self._write_live_verified(raw, self.fmt.merge(doc, key, part), key, target)
+            previous, unmanaged = None, []
+            for k, p in replaced.items():
+                ident = self.fmt.identify(k, p)
+                if ident is not None and (ident.identity, ident.provider) == (target.identity, target.provider):
+                    continue
+                owner = self._owner(accounts, k, p)
+                if owner is None:
+                    unmanaged.append(ident.label if ident else "an unrecognised login")
+                elif previous is None:
+                    previous = owner
+            if unmanaged:
+                if not force:
+                    raise CredentialConflict(
+                        f"the current login ({', '.join(unmanaged)}) is not stored by hswap; switching "
+                        "would lose it. Add it first, or pass --force to stash it and continue"
+                    )
+                self._stash(raw)
+
+            base = {k: v for k, v in doc.items() if k == key or k not in replaced}
+            self._write_live_verified(raw, self.fmt.merge(base, key, part), key, target)
             return target, previous
 
     def _stash(self, raw: bytes | None) -> Path | None:

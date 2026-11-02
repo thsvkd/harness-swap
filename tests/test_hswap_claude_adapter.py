@@ -147,3 +147,23 @@ def test_legacy_store_is_not_moved_as_a_side_effect(monkeypatch, tmp_path):
     assert (backup / "sequence.json").read_text() == '{"accounts": {}}'
     assert any("moved" in step for step in done)
     assert claude_adapter.legacy_move_pending() is None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the legacy move only exists on Linux/WSL")
+@pytest.mark.parametrize("argv", [[], ["config"], ["config", "list"], ["tui"], ["list"]])
+def test_no_engine_path_bypasses_the_migration_gate(monkeypatch, tmp_path, argv):
+    from claude_swap import cli as engine_cli
+
+    legacy = Path.home() / ".claude-swap-backup"
+    legacy.mkdir()
+    monkeypatch.setattr(engine_cli, "main", lambda: pytest.fail("engine must not start"))
+    with pytest.raises(HswapError, match="hswap migrate"):
+        ClaudeAdapter().run_cli(argv)
+    assert legacy.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the legacy move only exists on Linux/WSL")
+def test_help_still_works_with_a_pending_migration(capsys):
+    (Path.home() / ".claude-swap-backup").mkdir()
+    assert ClaudeAdapter().run_cli(["help"]) == 0
+    assert (Path.home() / ".claude-swap-backup").exists()

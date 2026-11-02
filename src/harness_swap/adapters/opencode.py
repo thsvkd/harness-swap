@@ -130,6 +130,7 @@ class OpenCodeAdapter:
         self._mode: str | None | bool = False  # False = not probed yet
         self._legacy = LegacyOpenCode()
         self._db_path: Path | None | bool = False
+        self._mode_error = ""
 
     # -- discovery ------------------------------------------------------------
 
@@ -142,18 +143,27 @@ class OpenCodeAdapter:
         inst = self.installation()
         if not inst.installed:
             raise HarnessNotInstalled(f"OpenCode: {inst.detail}")
-        if not capture:  # interactive: inherit the terminal
-            return subprocess.run([inst.executable, *args], check=False)
-        return spawn.run(
-            [inst.executable, *args], capture_output=True, text=True, timeout=self.timeout
-        )
+        try:
+            if not capture:  # interactive: inherit the terminal
+                return subprocess.run([inst.executable, *args], check=False)
+            return spawn.run(
+                [inst.executable, *args], capture_output=True, text=True, timeout=self.timeout
+            )
+        except subprocess.TimeoutExpired:
+            raise HswapError(f"`opencode {' '.join(args)}` did not finish within {self.timeout}s") from None
+        except OSError as exc:
+            raise HswapError(f"could not run opencode: {exc}") from None
 
     def mode(self) -> str | None:
         if self._mode is False:
             self._mode = None
             inst = self.installation()
             if inst.installed:
-                out = self._run("auth", "switch", "--help")
+                try:
+                    out = self._run("auth", "switch", "--help")
+                except HswapError as exc:
+                    self._mode_error = str(exc)
+                    return None
                 if out.returncode == 0 and "auth switch" in (out.stdout or ""):
                     self._mode = NATIVE
                 else:
@@ -171,7 +181,8 @@ class OpenCodeAdapter:
             return {c: off for c in Capability} | {Capability.USAGE_MONITORING: no_usage}
         if mode is None:
             off = unavailable(
-                f"OpenCode {inst.version} has no `auth switch` and is not a 1.x release; "
+                self._mode_error
+                or f"OpenCode {inst.version} has no `auth switch` and is not a 1.x release; "
                 "hswap does not guess at its credential storage"
             )
             return {c: off for c in Capability} | {Capability.USAGE_MONITORING: no_usage}
@@ -222,13 +233,18 @@ class OpenCodeAdapter:
         try:
             data = json.loads(out.stdout)
         except ValueError:
-            raise HswapError("`opencode auth list --format json` did not return JSON") from None
-        return data if isinstance(data, list) else []
+            data = None
+        if not isinstance(data, list):
+            raise HswapError("`opencode auth list --format json` did not return a JSON list")
+        return [item for item in data if isinstance(item, dict)]
 
     def _database(self) -> Path | None:
         if self._db_path is False:
             self._db_path = None
-            out = self._run("debug", "paths")
+            try:
+                out = self._run("debug", "paths")
+            except HswapError:
+                return None
             for line in (out.stdout or "").splitlines():
                 name, _, value = line.strip().partition(" ")
                 if name == "db" and value.strip():
@@ -265,8 +281,8 @@ class OpenCodeAdapter:
         found = [
             (integration.get("id"), integration.get("name"), conn)
             for integration in listing
-            for conn in integration.get("connections", [])
-            if conn.get("type") == "credential" and conn.get("id")
+            for conn in (integration.get("connections") or [])
+            if isinstance(conn, dict) and conn.get("type") == "credential" and conn.get("id")
         ]
         # hswap numbers saved accounts (and keeps aliases); OpenCode keeps the secrets.
         with self.store.lock():

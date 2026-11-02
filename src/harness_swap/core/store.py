@@ -25,7 +25,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from harness_swap.core.errors import AccountNotFound, StoreVersionError
+from harness_swap.core.errors import (
+    AccountNotFound,
+    HswapError,
+    StoreVersionError,
+    ValidationError,
+)
 from harness_swap.core.models import normalize_alias
 from harness_swap.infrastructure.fsutil import atomic_write_bytes, atomic_write_text
 from harness_swap.infrastructure.locking import FileLock
@@ -58,6 +63,13 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _alias(name: str) -> str:
+    try:
+        return normalize_alias(name)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from None
+
+
 def mkdir_private(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
@@ -80,8 +92,11 @@ class AccountStore:
             raw = self.file.read_text(encoding="utf-8")
         except FileNotFoundError:
             return []
-        data = json.loads(raw)
-        version = data.get("schemaVersion")
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise HswapError(f"{self.file} is not valid JSON; restore it from a backup or remove it") from None
+        version = data.get("schemaVersion") if isinstance(data, dict) else None
         if not isinstance(version, int) or version > SCHEMA_VERSION:
             raise StoreVersionError(
                 f"{self.file} has schemaVersion {version!r}; this hswap understands "
@@ -126,11 +141,12 @@ class AccountStore:
                 return acc
         return None
 
-    @staticmethod
-    def next_slot(accounts: list[StoredAccount]) -> int:
+    def next_slot(self, accounts: list[StoredAccount]) -> int:
+        """Lowest free slot whose directory is gone too, so a new account never
+        inherits a removed one's session history."""
         used = {a.slot for a in accounts}
         slot = 1
-        while slot in used:
+        while slot in used or self.account_dir(slot).exists():
             slot += 1
         return slot
 
@@ -149,7 +165,7 @@ class AccountStore:
         """Add or refresh an account in ``accounts`` (in place). Duplicate
         identities update the existing slot instead of taking a new one."""
         if alias is not None:
-            alias = normalize_alias(alias)
+            alias = _alias(alias)
             self._check_alias_free(accounts, alias, identity, provider)
         existing = self.find(accounts, identity, provider)
         if existing is not None:
@@ -178,7 +194,13 @@ class AccountStore:
     def _check_alias_free(accounts, alias, identity, provider) -> None:
         for acc in accounts:
             if acc.alias == alias and not (acc.identity == identity and acc.provider == provider):
-                raise ValueError(f"alias '{alias}' is already used by slot {acc.slot}")
+                raise ValidationError(f"alias '{alias}' is already used by slot {acc.slot}")
+
+    def check_new_alias(self, alias: str) -> str:
+        """Validate an alias for an account not stored yet (before a sign-in)."""
+        alias = _alias(alias)
+        self._check_alias_free(self.load(), alias, None, None)
+        return alias
 
     def set_alias(self, slot: int, alias: str | None) -> StoredAccount:
         with self.lock():
@@ -187,26 +209,30 @@ class AccountStore:
             if acc is None:
                 raise AccountNotFound(f"no stored account in slot {slot}")
             if alias is not None:
-                alias = normalize_alias(alias)
+                alias = _alias(alias)
                 self._check_alias_free(accounts, alias, acc.identity, acc.provider)
             acc.alias = alias
             self.save(accounts)
             return acc
 
-    def delete(self, slot: int, secret_names: tuple[str, ...] = ()) -> None:
-        """Forget ``slot`` and remove its ``secret_names`` files.
+    def delete(self, slot: int, secret_names: tuple[str, ...] = (), refuse=None) -> None:
+        """Forget ``slot`` and remove its ``secret_names`` files, all under the lock.
 
-        The per-account harness home keeps any session history it holds:
-        only credential files are removed, the rest is left for the user.
+        ``refuse(directory)`` may return a reason to stop (checked under the
+        lock). The per-account harness home keeps any session history it
+        holds -- only credential files are removed -- and its slot number is
+        then not reused (see :meth:`next_slot`).
         """
-        with self.lock():
-            accounts = [a for a in self.load() if a.slot != slot]
-            self.save(accounts)
         directory = self.account_dir(slot)
-        if directory.is_dir():
-            for name in secret_names:
-                (directory / name).unlink(missing_ok=True)
-            try:
-                directory.rmdir()  # only when nothing else (history) lives there
-            except OSError:
-                pass
+        with self.lock():
+            reason = refuse(directory) if refuse else None
+            if reason:
+                raise HswapError(reason)
+            self.save([a for a in self.load() if a.slot != slot])
+            if directory.is_dir():
+                for name in secret_names:
+                    (directory / name).unlink(missing_ok=True)
+                try:
+                    directory.rmdir()  # only when nothing else (history) lives there
+                except OSError:
+                    pass

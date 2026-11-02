@@ -356,3 +356,49 @@ def test_installation_probe_reports_a_failing_binary(tmp_path, monkeypatch):
     assert broken.installed and broken.version is None and "boom" in broken.detail
     assert probe_installation("okharness").version == "okharness 1.2.3"
     assert not probe_installation("definitely-not-installed-xyz").installed
+
+
+class TestUsageBackoffRegressions:
+    def test_backoff_applies_without_any_good_reading(self, tmp_path):
+        clock = [1000.0]
+        svc = UsageService(tmp_path, lambda: clock[0])
+        bad = CountingReader(RuntimeError("down"))
+        first = svc.get(bad, acct(1))
+        second = svc.get(bad, acct(1))
+        assert bad.calls == 1 and first.state is second.state is UsageState.ERROR
+        assert "down" in second.detail
+
+    def test_backoff_never_serves_old_numbers_as_available(self, tmp_path):
+        clock = [1000.0]
+        svc = UsageService(tmp_path, lambda: clock[0])
+        svc.get(CountingReader(UsageSnapshot(UsageState.AVAILABLE, (QuotaWindow("w", 5.0),), measured_at=1000.0)), acct(1))
+        clock[0] += 61
+        bad = CountingReader(RuntimeError("down"))
+        svc.get(bad, acct(1))
+        clock[0] += 1
+        during = svc.get(bad, acct(1))
+        assert bad.calls == 1 and during.state is UsageState.ERROR and during.windows[0].used_percent == 5.0
+
+    def test_unreadable_cache_entries_are_ignored(self, tmp_path):
+        (tmp_path / "usage-cache.json").write_text(json.dumps({acct(1).key: {"snapshot": {"state": "bogus"}}}))
+        reader = CountingReader(snap(10))
+        assert UsageService(tmp_path, lambda: 10.0).get(reader, acct(1)).state is UsageState.AVAILABLE
+        (tmp_path / "usage-cache.json").write_text("[1, 2]")
+        UsageService(tmp_path, lambda: 10.0).get(reader, acct(2))
+        assert reader.calls == 2
+
+
+def test_store_errors_are_hswap_errors(tmp_path):
+    store = AccountStore(tmp_path / "h")
+    store.root.mkdir(parents=True)
+    store.file.write_text("{broken")
+    with pytest.raises(HswapError, match="not valid JSON"):
+        store.load()
+
+
+def test_trust_hint_keeps_already_trusted_plugins(monkeypatch):
+    eps = [FakeEntryPoint(name=n, value="x:Y", dist=None) for n in ("one", "two")]
+    monkeypatch.setattr("harness_swap.core.registry.entry_points", lambda group: eps)
+    reg = Registry({}, trusted_plugins={"one"})
+    with pytest.raises(HarnessNotFound, match="plugins.trusted one,two"):
+        reg.get("two")

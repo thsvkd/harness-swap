@@ -4,8 +4,8 @@ Switch between multiple accounts across AI coding harnesses, with automatic
 rate-limit rotation, a unified usage dashboard, and parallel sessions.
 
 `hswap` grew out of [claude-swap](https://github.com/realiti4/claude-swap). Its
-Claude Code support *is* the claude-swap engine, unchanged; Codex CLI, Grok
-Build and OpenCode are added through the same adapter contract any other
+Claude Code support *is* the claude-swap engine (unchanged apart from a small
+embedding hook); Codex CLI, Grok Build and OpenCode are added through the same adapter contract any other
 harness can implement.
 
 | | Claude Code | Codex CLI | Grok Build | OpenCode |
@@ -112,6 +112,11 @@ hswap <harness> alias ACCOUNT NAME | --unset
 hswap <harness> remove ACCOUNT [--yes]
 ```
 
+These generic verbs apply to every harness except Claude Code, whose
+`hswap claude ...` takes the full claude-swap command set instead (`hswap claude
+help`); the cross-harness commands (`hswap list claude`, `hswap capabilities
+claude`, ...) work for Claude too.
+
 `ACCOUNT` is a slot number, an alias, or an email/label. Unsupported operations
 fail with the reason (`hswap capabilities` lists them all). Every `--json`
 payload carries `schemaVersion: 1`; Claude's own `--json` keeps claude-swap's
@@ -126,8 +131,10 @@ schema.
   (`--force` stashes it first, 0600), changes only the target scope/provider,
   writes atomically at 0600 under hswap's lock and the harness's own lock, re-reads
   the result and restores the original on any failure.
-- An account running in an isolated session cannot be activated globally at
-  the same time (two processes would rotate one refresh token).
+- For Codex and Grok, an account running in an isolated session cannot be
+  activated globally (or removed) until that session exits — two processes
+  would rotate one refresh token. Claude's `run` keeps the claude-swap rules
+  (see docs/claude.md).
 
 Details: [docs/security.md](docs/security.md).
 

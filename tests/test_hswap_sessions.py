@@ -62,3 +62,13 @@ def test_remove_is_refused_while_a_session_runs(tmp_path):
     finally:
         os.close(fd)
     assert [a.slot for a in store.load()] == [1]
+
+
+def test_a_missing_executable_is_a_clean_error_and_frees_the_lock(tmp_path):
+    from harness_swap.core.errors import HswapError
+
+    profile = tmp_path / "p"
+    fd = sessions.acquire(profile)
+    with pytest.raises(HswapError, match="could not start"):
+        sessions.launch([str(tmp_path / "no-such-harness")], dict(os.environ), fd)
+    assert not sessions.in_use(profile)

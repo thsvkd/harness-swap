@@ -402,3 +402,15 @@ def test_trust_hint_keeps_already_trusted_plugins(monkeypatch):
     reg = Registry({}, trusted_plugins={"one"})
     with pytest.raises(HarnessNotFound, match="plugins.trusted one,two"):
         reg.get("two")
+
+
+def test_malformed_cache_and_store_rows(tmp_path):
+    (tmp_path / "usage-cache.json").write_text(json.dumps({acct(1).key: {"snapshot": [1, 2]}}))
+    reader = CountingReader(snap(10))
+    UsageService(tmp_path, lambda: 10.0).get(reader, acct(1))
+    assert reader.calls == 1
+    store = AccountStore(tmp_path / "h")
+    store.root.mkdir(parents=True)
+    store.file.write_text(json.dumps({"schemaVersion": 1, "accounts": ["junk"]}))
+    with pytest.raises(HswapError, match="malformed"):
+        store.load()

@@ -305,3 +305,22 @@ def test_concurrent_switches_across_processes(env):
     assert read(live)["s"]["user"] in users
     for slot, user in enumerate(users, start=1):
         assert read(store.account_dir(slot) / "auth.json")["s"] == entry(user, f"{user}-1")
+
+
+def test_exclusive_switch_never_drops_the_target_signed_in_under_another_part(tmp_path):
+    live = tmp_path / "home" / "auth.json"
+    live.parent.mkdir()
+    store = AccountStore(tmp_path / "store")
+    creds = SnapshotCredentials(ExclusiveFormat(), store, live)
+    write(live, {"s1": entry("alice", "a-1")})
+    creds.add_current()
+    write(live, {"s2": entry("bob", "b-1")})
+    creds.add_current()
+    write(live, {"s2": entry("bob", "b-1"), "s9": entry("alice", "a-fresh-under-other-scope")})
+    before = live.read_bytes()
+    with pytest.raises(CredentialConflict, match="alice"):
+        creds.activate(1)
+    assert live.read_bytes() == before
+    creds.activate(1, force=True)
+    (stash,) = (store.root / "stash").iterdir()
+    assert stash.read_bytes() == before

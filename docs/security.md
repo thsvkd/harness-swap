@@ -12,8 +12,9 @@ follows, where they are enforced, and how they are tested.
 - Errors name accounts, never tokens (`tests/test_hswap_credentials.py::
   test_errors_never_contain_secret_material`).
 - `output.emit_json` refuses to print anything shaped like a JWT or a vendor
-  key (`infrastructure/secrets.py`) — a guard against regressions, not a
-  redaction layer.
+  key with a mixed-case, digit-bearing body (`infrastructure/secrets.py`) — a
+  guard against regressions, not a redaction layer; an all-lowercase key body
+  would not be caught.
 - `tests/test_hswap_cli.py::test_no_credential_material_reaches_any_output`
   runs every top-level and per-harness command on synthetic logins and checks
   that no token reaches stdout or stderr.
@@ -41,8 +42,13 @@ For every file-backed harness (`core/credentials.py`):
 2. **Unmanaged logins are refused.** If the login being replaced is not one
    hswap stores, the switch stops with a message. `--force` continues only
    after stashing the original file (0600) under `<harness>/stash/`.
-3. **Only the target part changes.** Other OAuth scopes / providers in the
-   same file are carried over byte-for-byte in content.
+3. **Nothing unrelated changes.** Entries of other providers in the same file
+   (OpenCode 1.x) and non-credential keys are carried over unchanged. Grok is
+   the exception by design: Grok itself picks between several login scopes, so
+   the target becomes the only one; every other scope is first saved back into
+   its stored account, and one hswap does not store (including the target
+   account signed in under a different scope) stops the switch unless `--force`
+   stashes the file.
 4. **Verified and reversible.** The new file is re-read and re-identified; on
    any mismatch or error the original bytes are restored (or the file removed
    if there was none). A tampered or mismatched stored snapshot is refused
@@ -92,5 +98,8 @@ protective controls.
   credentials without its lock can still race a switch; the read-back check
   then fails the switch and restores the original.
 - Windows: permission bits are not applied; files inherit the user profile's ACLs.
+- The session lock is held by hswap while it waits for the harness; if hswap is
+  killed with SIGKILL the harness keeps running but the session no longer counts
+  as in use.
 - A Codex token refresh that is in flight during a switch can leave the outgoing
   account needing a fresh `codex login` (see harness-compatibility.md).

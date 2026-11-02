@@ -102,7 +102,10 @@ class AccountStore:
                 f"{self.file} has schemaVersion {version!r}; this hswap understands "
                 f"up to {SCHEMA_VERSION}. Upgrade hswap instead of editing the file."
             )
-        return [StoredAccount.from_json(a) for a in data.get("accounts", [])]
+        rows = data.get("accounts", [])
+        if not isinstance(rows, list) or not all(isinstance(a, dict) for a in rows):
+            raise HswapError(f"{self.file} has malformed account rows; restore it from a backup")
+        return [StoredAccount.from_json(a) for a in rows]
 
     def save(self, accounts: list[StoredAccount]) -> None:
         mkdir_private(self.root)

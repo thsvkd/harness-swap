@@ -18,7 +18,9 @@ Liveness: hswap takes an exclusive lock on ``<home>/.hswap-session.lock``
 harness as its child and keeps the lock until the child exits. The
 descriptor is not inheritable, so servers or shells the harness leaves
 behind never keep a session "in use". The kernel drops the lock if hswap
-itself dies, so :func:`in_use` needs no pid files.
+itself dies, so :func:`in_use` needs no pid files. Trade-off: if hswap is
+killed with SIGKILL while the harness keeps running, the session no longer
+counts as in use.
 """
 
 from __future__ import annotations
@@ -108,7 +110,12 @@ def launch(argv: list[str], env: dict[str, str], lock_fd: int | None = None) -> 
     the child exits. A child killed by signal N yields ``128 + N``, as a
     shell reports it.
     """
-    proc = subprocess.Popen(argv, env=env)
+    try:
+        proc = subprocess.Popen(argv, env=env)
+    except OSError as exc:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        raise HswapError(f"could not start {argv[0]}: {exc}") from None
     forwarded = {}
     if sys.platform != "win32":
         for sig in (signal.SIGINT, signal.SIGQUIT):

@@ -54,8 +54,12 @@ class AcmeCredentials:
 ```
 
 - Use `""` as the part key when the whole file is one account. When a file holds
-  several logins (Grok scopes, OpenCode 1.x providers), make each one a part and
-  have `merge` replace only that key.
+  several logins (OpenCode 1.x providers), make each one a part and have
+  `merge` replace only that key.
+- If the *harness* chooses between several logins in one file (Grok scopes),
+  set `exclusive = True` on the format: a switch then leaves the target as the
+  only credential part, after saving the others back (part keys must be
+  top-level keys).
 - `identity` must be stable and unique within the provider: a subject/user id
   (plus workspace/team when one user can have several), never just the email.
   For API keys use `fingerprint(key)` — never the key itself.
@@ -81,7 +85,7 @@ class AcmeAdapter(FileCredentialAdapter):
 `FileCredentialAdapter` then provides, with the core's guarantees: `list_accounts`,
 `add_account` (current login, or `--login` in a throwaway home so the current
 login is never replaced), `remove_account`, `switch_account` (with sync-back,
-conflict refusal, single-part replacement, verification, rollback, restart
+conflict refusal, target-part (or exclusive) replacement, verification, rollback, restart
 notice), `set_alias`, `launch` (isolated session) and `diagnose`.
 
 ## 5. Report capabilities honestly

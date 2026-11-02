@@ -69,7 +69,7 @@ class UsageService:
             entry = entry if isinstance(entry, dict) else {}
             try:
                 last = _from_cache(entry["snapshot"]) if "snapshot" in entry else None
-            except (TypeError, ValueError, KeyError):
+            except (TypeError, ValueError, KeyError, AttributeError):
                 entry, last = {}, None  # written by another hswap version: start over
             failures = entry.get("failures", 0)
             if failures and now < entry.get("retry_at", 0.0):

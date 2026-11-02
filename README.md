@@ -76,7 +76,7 @@ hswap codex run personal -- resume    # isolated per-account CODEX_HOME, this te
 
 ```bash
 hswap grok add --login       # isolated GROK_HOME sign-in
-hswap grok switch 1          # replaces only that login scope; Grok hot-reloads it
+hswap grok switch 1          # leaves that login as the only scope; Grok hot-reloads it
 hswap grok run 2             # experimental isolated GROK_HOME session
 ```
 
@@ -128,7 +128,8 @@ schema.
   refuses to print JSON that looks like it contains a token.
 - Before overwriting a login hswap copies the harness's freshly rotated tokens
   back into the stored account, refuses to overwrite a login it does not manage
-  (`--force` stashes it first, 0600), changes only the target scope/provider,
+  (`--force` stashes it first, 0600), leaves other providers' entries alone
+  (Grok: the target becomes the only login scope, the others are saved first),
   writes atomically at 0600 under hswap's lock and the harness's own lock, re-reads
   the result and restores the original on any failure.
 - For Codex and Grok, an account running in an isolated session cannot be

@@ -118,7 +118,9 @@ is a JSON file. The adapter supplies a `CredentialFormat` — how to split the
 file into *parts* (whole file, one OAuth scope, one provider), who owns a part,
 and how to put a part back. The core then guarantees, for every such harness:
 sync-back of rotated tokens before any overwrite, refusal (or stash with
-`--force`) of unmanaged logins, single-part replacement, atomic 0600 writes,
+`--force`) of unmanaged logins, replacement of the target part only (or, for
+an `exclusive` format such as Grok's, of every credential part, after saving
+the others back), atomic 0600 writes,
 read-back verification, rollback, and locking (hswap's lock plus the harness's
 own lock file). See [security.md](security.md).
 

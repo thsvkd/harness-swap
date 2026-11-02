@@ -307,8 +307,10 @@ class SnapshotCredentials:
             previous, unmanaged = None, []
             for k, p in replaced.items():
                 ident = self.fmt.identify(k, p)
-                if ident is not None and (ident.identity, ident.provider) == (target.identity, target.provider):
+                if k == key and ident is not None and (ident.identity, ident.provider) == (target.identity, target.provider):
                     continue
+                # The target signed in under another part key is not covered by
+                # sync-back either, so it counts as unmanaged below.
                 owner = self._owner(accounts, k, p)
                 if owner is None:
                     unmanaged.append(ident.label if ident else "an unrecognised login")

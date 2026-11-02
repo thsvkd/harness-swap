@@ -1,0 +1,249 @@
+"""Building blocks shared by adapters. No harness names live here.
+
+:class:`FileCredentialAdapter` implements every account role for a harness
+whose login is a JSON file in a home directory that an environment variable
+can relocate. A concrete adapter declares *data* -- executable, home
+variable, credential format, what to share with isolated sessions, how it
+reloads -- and overrides :meth:`capabilities` with what its install supports.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
+
+from harness_swap.core import sessions
+from harness_swap.core.credentials import CredentialFormat, SnapshotCredentials
+from harness_swap.core.errors import CredentialError, HarnessNotInstalled, HswapError
+from harness_swap.core.models import Account, Installation, SwitchResult
+from harness_swap.core.paths import env_dir, harness_home
+from harness_swap.core.store import AccountStore, StoredAccount, mkdir_private
+from harness_swap.infrastructure import processes, spawn
+
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_version(text: str | None) -> tuple[int, int, int] | None:
+    m = _VERSION_RE.search(text or "")
+    return tuple(int(g) for g in m.groups()) if m else None  # type: ignore[return-value]
+
+
+def probe_installation(executable: str, args: tuple[str, ...] = ("--version",)) -> Installation:
+    path = shutil.which(executable)
+    if path is None:
+        return Installation(False, detail=f"`{executable}` not found on PATH")
+    try:
+        result = spawn.run([path, *args], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return Installation(True, path, None, f"version probe failed: {exc}")
+    text = (result.stdout or result.stderr).strip().splitlines()
+    first = text[0].strip() if text else ""
+    if result.returncode != 0:
+        return Installation(True, path, None, f"`{executable} {' '.join(args)}` failed: {first[:200]}")
+    return Installation(True, path, first or None)
+
+
+class FileCredentialAdapter:
+    # --- declared by subclasses -------------------------------------------
+    id: str
+    display_name: str
+    providers: tuple[str, ...] = ()
+    executable: str
+    home_env: str
+    default_home: str  # relative to the user's home directory, e.g. ".codex"
+    credential_file = "auth.json"
+    harness_lock_name: str | None = None
+    #: Default-home entries linked into an isolated session's home.
+    shared_names: tuple[str, ...] = ()
+    login_args: tuple[str, ...] = ("login",)
+    #: Running processes pick up a switched credential file by themselves.
+    hot_reload = False
+    fmt: CredentialFormat
+
+    def __init__(self) -> None:
+        self._installation: Installation | None = None
+
+    # --- locations ------------------------------------------------------------
+
+    @property
+    def home(self) -> Path:
+        return env_dir(self.home_env, Path.home() / self.default_home)
+
+    @property
+    def store(self) -> AccountStore:
+        return AccountStore(harness_home(self.id))
+
+    @property
+    def credentials(self) -> SnapshotCredentials:
+        lock = self.home / self.harness_lock_name if self.harness_lock_name else None
+        return SnapshotCredentials(self.fmt, self.store, self.home / self.credential_file, lock)
+
+    # --- discovery --------------------------------------------------------------
+
+    def installation(self) -> Installation:
+        if self._installation is None:
+            self._installation = probe_installation(self.executable)
+        return self._installation
+
+    def _require_installed(self) -> Installation:
+        inst = self.installation()
+        if not inst.installed:
+            raise HarnessNotInstalled(f"{self.display_name}: {inst.detail}")
+        return inst
+
+    # --- listing ----------------------------------------------------------------
+
+    def _to_account(self, acc: StoredAccount, active: bool | None) -> Account:
+        return Account(
+            harness=self.id,
+            identity=acc.identity,
+            label=acc.label,
+            provider=acc.provider,
+            slot=acc.slot,
+            alias=acc.alias,
+            auth_mode=acc.auth_mode,
+            active=active,
+            details=dict(acc.meta),
+        )
+
+    def list_accounts(self) -> list[Account]:
+        creds = self.credentials
+        try:
+            live = creds.live_identities()
+        except CredentialError:
+            live = None  # unreadable live file: activity unknown, list still works
+        return [
+            self._to_account(s, None if live is None else creds.is_active(s, live))
+            for s in self.store.load()
+        ]
+
+    def _stored(self, account: Account) -> StoredAccount:
+        for acc in self.store.load():
+            if acc.slot == account.slot:
+                return acc
+        raise HswapError(f"slot {account.slot} disappeared while hswap was running")
+
+    # --- adding / removing -------------------------------------------------------
+
+    def add_account(
+        self, *, alias: str | None = None, provider: str | None = None, login: bool = False
+    ) -> Account:
+        if login:
+            results = self._login_isolated(alias=alias, provider=provider)
+        else:
+            results = self.credentials.add_current(alias=alias, provider=provider)
+        slot = results[0][0].slot
+        return next(a for a in self.list_accounts() if a.slot == slot)
+
+    def _login_isolated(self, *, alias: str | None, provider: str | None):
+        """Run the harness's own sign-in in a throwaway home, then import it.
+
+        The default login is never replaced (so never revoked or logged out);
+        user configuration is linked in so SSO/OIDC settings still apply.
+        """
+        inst = self._require_installed()
+        tmp = self.store.root / f"pending-login-{uuid.uuid4().hex}"
+        try:
+            sessions.link_shared(tmp, self.home, self.login_shared_names())
+            env = {**os.environ, self.home_env: str(tmp)}
+            code = subprocess.call([inst.executable, *self.login_args], env=env)
+            if code != 0:
+                raise HswapError(f"{self.executable} login exited with status {code}; nothing added")
+            try:
+                doc = json.loads((tmp / self.credential_file).read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                raise CredentialError("sign-in finished but wrote no usable credentials") from None
+            return self.credentials.import_document(doc, alias=alias, only_provider=provider)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def login_shared_names(self) -> tuple[str, ...]:
+        return self.shared_names
+
+    def remove_account(self, account: Account) -> None:
+        if account.slot is not None and sessions.in_use(self.store.account_dir(account.slot)):
+            raise HswapError(
+                f"slot {account.slot} is in use by a running `hswap {self.id} run` session; "
+                "exit it first"
+            )
+        self.store.delete(account.slot, (self.credential_file,))
+
+    def set_alias(self, account: Account, alias: str | None) -> Account:
+        return self._to_account(self.store.set_alias(account.slot, alias), account.active)
+
+    # --- switching -------------------------------------------------------------------
+
+    def switch_account(self, account: Account, *, force: bool = False) -> SwitchResult:
+        if sessions.in_use(self.store.account_dir(account.slot)):
+            raise HswapError(
+                f"slot {account.slot} is running in an isolated `hswap {self.id} run` session, "
+                "which refreshes that login on its own; activating it globally too would make two "
+                "processes rotate one refresh token. Exit that session first."
+            )
+        target, previous = self.credentials.activate(account.slot, force=force)
+        notes = []
+        restart = False
+        if previous is not None and previous.slot == target.slot:
+            notes.append("already the active account")
+        elif self.hot_reload:
+            notes.append(f"running {self.display_name} processes pick this up on their next request")
+        else:
+            running = processes.find({self.executable})
+            restart = bool(running)
+            if running:
+                notes.append(
+                    f"{len(running)} running {self.display_name} process(es) keep the previous "
+                    "account until restarted"
+                )
+            elif running is None:
+                notes.append(f"restart any running {self.display_name} to use the new account")
+        return SwitchResult(
+            harness=self.id,
+            current=self._to_account(target, True),
+            previous=self._to_account(previous, False) if previous else None,
+            restart_required=restart,
+            notes=tuple(notes),
+        )
+
+    # --- diagnostics --------------------------------------------------------------
+
+    def diagnose(self) -> list[tuple[str, str]]:
+        out = []
+        live = self.home / self.credential_file
+        if live.exists() and os.name == "posix":
+            mode = live.stat().st_mode & 0o777
+            if mode & 0o077:
+                out.append(("warn", f"{live} is readable by other users (mode {mode:o}); run chmod 600"))
+        try:
+            out.append(("info", f"{len(self.store.load())} stored account(s) in {self.store.root}"))
+        except HswapError as exc:
+            out.append(("error", str(exc)))
+        except ValueError:
+            out.append(("error", f"{self.store.file} is not valid JSON"))
+        return out
+
+    # --- isolated sessions -------------------------------------------------------
+
+    def session_args(self) -> list[str]:
+        """Extra harness arguments for an isolated session."""
+        return []
+
+    def launch(self, account: Account, args: list[str]) -> int:
+        inst = self._require_installed()
+        if account.active:
+            # Already the default login: the default home is the right one,
+            # and a second copy of the token must not be created.
+            os.execvp(inst.executable, [inst.executable, *args])
+        profile = self.store.account_dir(account.slot)
+        if not (profile / self.credential_file).exists():
+            raise CredentialError(f"slot {account.slot} has no stored credentials to run with")
+        mkdir_private(profile)
+        sessions.link_shared(profile, self.home, self.shared_names)
+        fd = sessions.acquire(profile)
+        env = {**os.environ, self.home_env: str(profile)}
+        return sessions.launch([inst.executable, *self.session_args(), *args], env, fd)

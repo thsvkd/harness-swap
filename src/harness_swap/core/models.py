@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import UTC
 from enum import StrEnum
-
 
 #: Alias validation: letters/digits/-/_/., non-empty, not purely digits (so an
 #: alias can never collide with a slot number in _resolve_account_identifier),
@@ -246,10 +246,10 @@ class SwitchResult:
 def _iso(ts: float | None) -> str | None:
     if ts is None:
         return None
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     return (
-        datetime.fromtimestamp(ts, tz=timezone.utc)
+        datetime.fromtimestamp(ts, tz=UTC)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )

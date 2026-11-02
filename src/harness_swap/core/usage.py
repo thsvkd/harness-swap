@@ -1,0 +1,94 @@
+"""Shared usage collection: caching, pacing, backoff and staleness.
+
+Adapters only know how to take *one* measurement (:class:`UsageReader`).
+This service decides *when* to take it, so every adapter gets the same
+manners without reimplementing them:
+
+* never more than once per ``UsagePolicy.min_interval_s`` per account, even
+  across concurrent ``hswap`` processes (the cache is shared on disk and
+  updated under a lock);
+* after a failure, exponential backoff up to ``max_backoff_s``, serving the
+  last good measurement marked ``stale`` in the meantime;
+* a measurement older than ``stale_after_s`` is reported ``stale``;
+* an adapter exception becomes an ``error`` snapshot, never a crash.
+
+The cache holds usage numbers and timestamps only -- no credentials.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import time
+from collections.abc import Callable
+from pathlib import Path
+
+from harness_swap.core.adapter import UsageReader
+from harness_swap.core.models import Account, QuotaWindow, UsageSnapshot, UsageState
+from harness_swap.core.store import mkdir_private
+from harness_swap.infrastructure.fsutil import atomic_write_text
+from harness_swap.infrastructure.locking import FileLock
+
+_CACHE_NAME = "usage-cache.json"
+
+
+def _to_cache(s: UsageSnapshot) -> dict:
+    d = dataclasses.asdict(s)
+    d["state"] = str(s.state)
+    return d
+
+
+def _from_cache(d: dict) -> UsageSnapshot:
+    windows = tuple(QuotaWindow(**w) for w in d.get("windows", ()))
+    return UsageSnapshot(**{**d, "state": UsageState(d["state"]), "windows": windows})
+
+
+class UsageService:
+    def __init__(self, cache_dir: Path, clock: Callable[[], float] = time.time):
+        self.cache_dir = cache_dir
+        self.clock = clock
+
+    def _path(self) -> Path:
+        return self.cache_dir / _CACHE_NAME
+
+    def _load(self) -> dict:
+        try:
+            return json.loads(self._path().read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def get(self, reader: UsageReader, account: Account) -> UsageSnapshot:
+        policy = reader.usage_policy
+        now = self.clock()
+        mkdir_private(self.cache_dir)
+        with FileLock(self.cache_dir / ".usage.lock", timeout=30.0):
+            cache = self._load()
+            entry = cache.get(account.key, {})
+            last = _from_cache(entry["snapshot"]) if "snapshot" in entry else None
+            due = max(entry.get("fetched_at", 0.0) + policy.min_interval_s, entry.get("retry_at", 0.0))
+            if last is not None and now < due:
+                return self._aged(last, policy.stale_after_s, now)
+            try:
+                snap = reader.read_usage(account)
+                entry = {"snapshot": _to_cache(snap), "fetched_at": now, "failures": 0}
+            except Exception as exc:  # noqa: BLE001 - any adapter failure becomes an error snapshot
+                failures = entry.get("failures", 0) + 1
+                delay = min(policy.min_interval_s * 2**failures, policy.max_backoff_s)
+                entry = {**entry, "failures": failures, "retry_at": now + delay}
+                snap = UsageSnapshot(
+                    UsageState.ERROR,
+                    windows=last.windows if last else (),
+                    measured_at=last.measured_at if last else None,
+                    source=last.source if last else "",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+            cache[account.key] = entry
+            atomic_write_text(self._path(), json.dumps(cache, indent=1))
+        return self._aged(snap, policy.stale_after_s, now)
+
+    @staticmethod
+    def _aged(snap: UsageSnapshot, stale_after_s: float, now: float) -> UsageSnapshot:
+        age = snap.age_s(now)
+        if snap.state is UsageState.AVAILABLE and age is not None and age > stale_after_s:
+            return dataclasses.replace(snap, state=UsageState.STALE)
+        return snap

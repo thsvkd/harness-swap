@@ -44,12 +44,12 @@ for *your* install.
 
 ## Install
 
-hswap is not on PyPI yet. From a clone:
-
 ```bash
-uv tool install .          # or: pipx install .
-hswap harnesses            # what is installed, which versions
+uv tool install harness-swap   # or: pipx install harness-swap
+hswap harnesses                # what is installed, which versions
 ```
+
+From a clone: `uv tool install .`
 
 Python 3.12+. hswap does not install a `cswap` command, so it never collides
 with an installed upstream claude-swap; `hswap claude ...` takes every cswap

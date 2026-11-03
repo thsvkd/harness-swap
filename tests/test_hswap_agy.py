@@ -94,6 +94,8 @@ def agy(tmp_path, monkeypatch):
     monkeypatch.setenv("HSWAP_HOME", str(tmp_path / "hswap"))
     monkeypatch.setenv("AGY_FAKE_LOG", str(tmp_path / "calls.jsonl"))
     monkeypatch.setattr("harness_swap.infrastructure.processes.find", lambda names: [])
+    # The file-backed login exists only on Linux; on macOS agy uses the keychain.
+    monkeypatch.setattr(sys, "platform", "linux")
     exe = fake_executable(tmp_path / "bin", "agy", FAKE_AGY)
     adapter = AgyAdapter()
     adapter._installation = Installation(True, str(exe), "1.4.8")

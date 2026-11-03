@@ -26,14 +26,14 @@ from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
-from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
+from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT, STYLESHEET
 
 
 class CswapApp(App):
     """claude-swap interactive dashboard."""
 
     TITLE = "claude-swap"
-    CSS_PATH = "cswap.tcss"
+    CSS_PATH = STYLESHEET
     # No command palette: actions live in the dashboard's nested menu, in
     # their own context — not in a global searchable list.
     ENABLE_COMMAND_PALETTE = False

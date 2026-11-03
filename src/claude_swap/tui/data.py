@@ -15,7 +15,6 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
@@ -24,6 +23,7 @@ from claude_swap import oauth, printer, usage_store
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.snapshot_source import SnapshotSource
 from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
+from harness_swap.ui.fmt import clock_stamp, format_duration
 
 
 # ---------------------------------------------------------------------------
@@ -152,30 +152,11 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     return reset_text(last_good.get(key), now)
 
 
-def format_duration(seconds: float) -> str:
-    """Compact duration: "45s", "12m", "2h 13m", "3d 4h"."""
-    s = int(seconds)
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    if s < 86400:
-        h, m = divmod(s // 60, 60)
-        return f"{h}h {m}m" if m else f"{h}h"
-    d, h = divmod(s // 3600, 24)
-    return f"{d}d {h}h" if h else f"{d}d"
-
-
 def format_age(age_s: float | None) -> str | None:
     """Measurement age note ("· 2m ago"); None while comfortably fresh."""
     if age_s is None or age_s < usage_store.SERVE_TTL_S:
         return None
     return f"· {format_duration(age_s)} ago"
-
-
-def clock_stamp() -> str:
-    """HH:MM:SS local-time stamp for the event log."""
-    return time.strftime("%H:%M:%S")
 
 
 __all__ = [

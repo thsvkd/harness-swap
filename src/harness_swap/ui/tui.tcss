@@ -1,6 +1,7 @@
-/* claude-swap TUI — flat, low-chrome dark layout.
-   Colors come from the registered "cswap-dark" theme (theme.py); this file
-   only handles layout, spacing, and the few component states. */
+/* Dashboard layout shared by `hswap tui` and the Claude engine's TUI — flat,
+   low-chrome. Colors come from the registered "cswap-dark"/"cswap-light"
+   themes (theme.py); this file only handles layout, spacing, and the few
+   component states. */
 
 Screen {
     background: $background;
@@ -13,6 +14,20 @@ Screen {
     padding: 1 3;
     background: $background;
     border-bottom: solid $panel;
+}
+
+/* hswap: the panel scrolls once many harnesses outgrow the space, so the
+   menu below always stays on screen (its max-height follows the menu's
+   length, set by the dashboard). */
+#panel-scroll {
+    height: auto;
+    background: $background;
+    border-bottom: solid $panel;
+    scrollbar-size-vertical: 1;
+}
+
+#panel-scroll #accounts-panel {
+    border-bottom: none;
 }
 
 #auto-active-panel {
@@ -48,6 +63,11 @@ Screen {
 
 #accounts ListItem {
     margin-bottom: 1;
+}
+
+/* hswap: a harness's name sits right above its account cards. */
+#accounts ListItem.harness-heading {
+    margin-bottom: 0;
 }
 
 #menu ListItem.-highlight,

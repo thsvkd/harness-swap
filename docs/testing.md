@@ -22,7 +22,7 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 | Automatic switching | `test_hswap_auto.py` | opt-in, threshold, cooldown, no switch on missing data, `--dry-run`, overlapping runs |
 | Ask-a-harness transport | `test_hswap_jsonrpc.py` | JSON-RPC session over a fake child: deadline, shutdown, errors scrubbed |
 | Claude adapter | `test_hswap_claude_adapter.py` | schema-v1 → core usage mapping, engine embedding (prog name, argv restore, upgrade refused), legacy-store migration gate (no engine path bypasses it) + backup |
-| CLI and dashboard | `test_hswap_cli.py` | native passthrough, errors and JSON envelopes, confirmations, failed switch keeps login, config, **no credential in any output**, Textual pilot test of the dashboard |
+| CLI and dashboard | `test_hswap_cli.py` | native passthrough, errors and JSON envelopes, confirmations, failed switch keeps login, config, **no credential in any output**, Textual pilot tests of the dashboard (grouped panel, menus, switch, never forcing, remove, watch, theme, auto view) |
 | Extensibility acceptance | `test_hswap_contract.py` | the example adapter registered at runtime and as a trusted/untrusted entry-point plugin, driven through CLI, services and dashboard; snapshot-name rule; static check that shared code names no harness and imports no adapter |
 | Plugin trust and isolation | `test_hswap_core.py`, `test_hswap_cli.py` | trust bound to the distribution, duplicate/invalid/reserved ids, a plugin that raises or exits, every cross-harness command (and `--json`) surviving a broken adapter |
 
@@ -58,13 +58,13 @@ covered by the tests above, except these, which remain known limits:
   alias and slot; removing the active account does not say which one OpenCode
   activated instead; switches OpenCode makes itself are not serialised with
   hswap's;
-- `add`, `remove` and `alias` have no `--json`; the dashboard refreshes on `r`
-  only;
+- `add`, `remove` and `alias` have no `--json`;
 - accounts with the same email in two workspaces look alike in `list`
   (use the slot number); `status` does not name a login hswap does not store;
   `add` names only the logins that were new when one file holds several;
-- the dashboard cuts long rows (Left/Right scrolls) and has no detail view;
-  a slow harness (e.g. OpenCode starting its service) delays only its own rows;
+- the dashboard re-reads every 10 s (Claude's own dashboard: 3 s), so a change
+  made elsewhere can take that long to show; a slow harness (e.g. OpenCode
+  starting its service) delays only its own rows;
 - a usage reading of "unknown" is cached like any other for the adapter's
   minimum interval (30 s for Codex's passive log reading, 300 s for every live read);
 - keep-alive's check-then-run race: a harness started by hand after hswap checked

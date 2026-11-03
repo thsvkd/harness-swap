@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from claude_swap.printer import warning as print_warning
+from harness_swap.ui.fmt import reset_clock_string
 
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
@@ -362,16 +363,6 @@ def format_reset(resets_at: str) -> tuple[str, str]:
         countdown = f"{minutes}m"
 
     return countdown, reset_clock_string(reset_utc, now)
-
-
-def reset_clock_string(reset_utc: datetime, now_utc: datetime) -> str:
-    """Absolute reset time in local time: "20:39" same-day, else "Jul 5 08:59"."""
-    reset_local = reset_utc.astimezone()
-    now_local = now_utc.astimezone()
-    if reset_local.date() == now_local.date():
-        return reset_local.strftime("%H:%M")
-    day = str(reset_local.day)
-    return reset_local.strftime(f"%b {day} %H:%M")
 
 
 def fresh_reset_strings(window: dict) -> tuple[str, str] | None:

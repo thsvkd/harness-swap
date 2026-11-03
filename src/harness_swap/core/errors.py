@@ -42,6 +42,10 @@ class AccountNotFound(HswapError):
     """No stored account matches the given slot, alias or identity."""
 
 
+class NoSwitchTarget(HswapError):
+    """No other account qualifies for a strategy pick: nothing to switch to, not a failure."""
+
+
 class CredentialError(HswapError):
     """Reading, validating or writing credential material failed."""
 

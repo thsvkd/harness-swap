@@ -55,6 +55,12 @@ def _threshold(value: object) -> float:
     return pct
 
 
+def _theme(value: object) -> str:
+    if value not in ("dark", "light", "auto"):
+        raise ValueError("expected dark, light or auto")
+    return value  # type: ignore[return-value]
+
+
 #: key -> (default, validator). Validators raise ValueError with a readable message.
 SPECS = {
     "plugins.trusted": ([], _plugin_ids),
@@ -64,6 +70,8 @@ SPECS = {
     # Harnesses `hswap <harness> auto` may switch automatically (opt-in: see the warning).
     "auto.enabled": ([], _harness_ids),
     "auto.cooldown": (600.0, _seconds),
+    # `hswap tui` colours; auto follows the terminal background.
+    "ui.theme": ("auto", _theme),
 }
 
 #: Shown when a harness is added to one of these lists.

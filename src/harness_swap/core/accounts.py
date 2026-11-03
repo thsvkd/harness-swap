@@ -19,7 +19,12 @@ from harness_swap.core.adapter import (
     UsageReader,
     require,
 )
-from harness_swap.core.errors import AccountNotFound, HswapError, UnsupportedOperation
+from harness_swap.core.errors import (
+    AccountNotFound,
+    HswapError,
+    NoSwitchTarget,
+    UnsupportedOperation,
+)
 from harness_swap.core.models import (
     Account,
     Capability,
@@ -141,7 +146,7 @@ def switch_by_strategy(
         accounts, usage, current=current, strategy=strategy, threshold=threshold, provider=provider
     )
     if target is None:
-        raise HswapError(
+        raise NoSwitchTarget(
             f"no other {adapter.display_name} account qualifies for '{strategy}' "
             f"(threshold {threshold:g}%); usage may be unknown or stale -- see `hswap {adapter.id} usage`"
         )

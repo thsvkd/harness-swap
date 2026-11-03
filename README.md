@@ -63,6 +63,21 @@ hswap list                  # every harness, every account, usage where availabl
 hswap status                # the active account per harness
 ```
 
+### Dashboard
+
+`hswap` (or `hswap tui`) is Claude's dashboard (`hswap claude tui`) for every
+harness: per harness, the active account as a card with its usage bars (the
+tick marks `rotation.threshold`) and the others on one line, with a menu below:
+Switch account…, Watch accounts, Auto-switch view, Add account… (a harness's
+current login), Remove account…, Theme…. Keys: `s` switch (`b` best pick
+within the highlighted account's harness), `w` watch (`s` there to pick), `g`
+auto-switch view (dry-run until `l`; `t` then ←/→ tries another threshold for
+this session), `f` refresh now, PgDn/PgUp scroll the accounts when they do not
+fit, `ctrl+t` theme (saved as `ui.theme`: dark, light or auto), `q` quit. It
+re-reads every 10 s (all harnesses in parallel) and never forces a switch over a login hswap does not manage (that stays
+`hswap <harness> switch ACCOUNT --force`). Disabling accounts and token logins
+are Claude-only: use `hswap claude tui` for those.
+
 ### Claude Code
 
 Exactly the claude-swap workflow, spelled `hswap claude`:
@@ -165,7 +180,7 @@ a time (experimental, mock-verified).
 
 ```
 hswap harnesses | list [H] | status [H] | capabilities [H] | doctor | migrate [--dry-run]
-hswap config [list|get|set|unset|path]  plugins.trusted, rotation.threshold, usage.remote, auto.enabled, auto.cooldown
+hswap config [list|get|set|unset|path]  plugins.trusted, rotation.threshold, usage.remote, auto.enabled, auto.cooldown, ui.theme
 hswap tui
 
 hswap <harness> list [--json] [--no-usage] [--cached]

@@ -11,7 +11,7 @@ selection, isolated sessions, output); an adapter only describes its harness.
 flowchart TD
     subgraph Presentation
         CLI[cli.py<br/>hswap commands]
-        TUI[ui/tui.py<br/>overview dashboard]
+        TUI[ui/<br/>dashboard + shared TUI kit]
         OUT[output.py<br/>human + JSON v1]
     end
     subgraph "Application services (core)"
@@ -60,7 +60,7 @@ flowchart TD
     CX & GK --> RPC
     OC --> BASE
     CL --> ENGINE
-    ENGINE --> FS & LK & SP
+    ENGINE --> FS & LK & SP & TUI
     PLUG -. entry point .-> REG
     REG -. lazy import .-> CL & CX & GK & OC & AG
 ```
@@ -75,7 +75,13 @@ Rules the code follows (and `tests/test_hswap_contract.py` checks):
 - The Claude engine (`claude_swap`) is only imported by `adapters/claude.py`.
   Its generic leaf modules (`fsutil`, `locking`, `spawn`) now live in
   `harness_swap.infrastructure`; `claude_swap.fsutil` etc. are aliases of the
-  same module objects. The engine's other changes are an embedding hook in
+  same module objects. Likewise its harness-neutral TUI kit lives in
+  `harness_swap/ui` and is shared by both dashboards: `theme.py` and
+  `appearance.py` (whole-module aliases `claude_swap.tui.theme`,
+  `claude_swap.appearance`), the stylesheet `tui.tcss`, the usage bars and
+  menu rows (`widgets.py`), the confirm/output modals (`modals.py`) and plain
+  formatting helpers (`fmt.py`), which the engine's modules re-import under
+  their old names. The engine's other changes are an embedding hook in
   `cli.py` (`EMBEDDED_PROG`), `ClaudeSwitchError` deriving from `HswapError`,
   and the alias validator moving to `core.models`; its 2900 existing tests
   pass unmodified.

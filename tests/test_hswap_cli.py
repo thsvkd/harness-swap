@@ -42,6 +42,17 @@ def run(registry, capsys, *argv):
     return code, captured.out, captured.err
 
 
+def run_quiet(registry, *argv):
+    """`hswap` output without pytest's capture (for use inside a running app)."""
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+        cli.run(list(argv), registry)
+    return buf.getvalue()
+
+
 @pytest.fixture
 def native():
     adapter = Native()
@@ -231,64 +242,278 @@ def test_migrate_with_nothing_to_do(homes, capsys):
     assert code == 0 and "Nothing to migrate" in out
 
 
-@pytest.mark.asyncio
-async def test_dashboard_renders_and_switches(homes):
-    from textual.widgets import DataTable, Static
+def _codex_accounts(reg, tmp, *users):
+    """Add one synthetic Codex login per user; the last one stays the live login."""
+    for user in users:
+        write_json(tmp / "codex" / "auth.json", codex_auth(f"{user}@x.com", f"user-{user}", f"acct-user-{user}"))
+        cli.run(["codex", "add"], reg)
 
-    from harness_swap.ui.tui import build_app
+
+def _dashboard(reg):
+    """The real `hswap tui` app, with its toasts recorded as ``(title, message)``."""
+    from harness_swap.ui.tui import HswapApp
+
+    app = HswapApp(reg)
+    toasts = []
+    app.notify = lambda message, title="", **_kw: toasts.append((title, message))
+    return app, toasts
+
+
+async def _settle(pilot):
+    await pilot.app.workers.wait_for_complete()
+    await pilot.pause()
+    await pilot.pause()
+
+
+def _menu_ids(app):
+    from textual.widgets import ListView
+
+    from harness_swap.ui.widgets import MenuItem
+
+    return [item.action_id for item in app.screen.query_one("#menu", ListView).query(MenuItem)]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_groups_accounts_by_harness_and_switches(homes):
+    from textual.widgets import ListView
+
+    from harness_swap.ui.screens import SwitchScreen
 
     reg, tmp = homes
-    for email, user in (("a@x.com", "user-a"), ("b@x.com", "user-b")):
-        write_json(tmp / "codex" / "auth.json", codex_auth(email, user, f"acct-{user}"))
-        cli.run(["codex", "add"], reg)
-    app = build_app(reg)
-    async with app.run_test() as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        table = app.query_one(DataTable)
-        labels = [str(table.get_row_at(i)[3]) for i in range(table.row_count)]
-        assert "a@x.com" in labels and "b@x.com" in labels
-        assert any("not installed" in str(table.get_row_at(i)[4]) or str(table.get_row_at(i)[1]) == "Grok Build"
-                   for i in range(table.row_count))
-        last = table.row_count - 1  # in the last harness's rows, which arrive after a partial fill
-        table.move_cursor(row=last)
-        await pilot.press("r")  # a refresh keeps the highlighted row
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        assert table.cursor_row == last
-        table.move_cursor(row=labels.index("a@x.com"))
+    _codex_accounts(reg, tmp, "a", "b")
+    app, toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+        panel = app.screen.query_one("#accounts-panel").render().plain
+        # a heading per harness; the active account as a full card, the other as a mini
+        assert panel.index("Codex CLI") < panel.index("a@x.com") < panel.index("b@x.com") < panel.index("Grok Build")
+        assert "b@x.com  [plus]   ● active" in panel and "a@x.com  [plus]   ● active" not in panel
+        assert "Grok Build  no accounts · Add account…" in panel
+
         await pilot.press("s")
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        assert "now a@x.com" in str(app.query_one("#status", Static).render())
+        await _settle(pilot)
+        assert isinstance(app.screen, SwitchScreen)
+        assert str(app.screen.query_one("#list-title").render()) == "switch to which account?"
+        listview = app.screen.query_one("#accounts", ListView)
+        assert listview.highlighted_child.row.account.label == "b@x.com"  # starts on the active account
+        await pilot.press("up", "up")  # the harness heading above a@x.com is skipped
+        assert listview.highlighted_child.row.account.label == "a@x.com"
+        await pilot.press("enter")
+        await _settle(pilot)
+        assert not isinstance(app.screen, SwitchScreen)  # Enter switches and pops back
+        assert ("Switch", "Switched Codex CLI to a@x.com") in [(t, m.splitlines()[0]) for t, m in toasts]
+        assert "a@x.com  [plus]   ● active" in app.screen.query_one("#accounts-panel").render().plain
     assert json.loads((tmp / "codex" / "auth.json").read_text())["tokens"]["account_id"] == "acct-user-a"
 
 
-def test_dashboard_shows_each_harness_as_soon_as_it_is_read():
+@pytest.mark.asyncio
+async def test_dashboard_never_forces_over_an_unmanaged_login(homes):
+    reg, tmp = homes
+    _codex_accounts(reg, tmp, "a")
+    write_json(tmp / "codex" / "auth.json", codex_auth("stranger@x.com", "user-s", "acct-s"))
+    before = (tmp / "codex" / "auth.json").read_bytes()
+    app, toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+        await pilot.press("s")
+        await _settle(pilot)
+        await pilot.press("enter")
+        await _settle(pilot)
+    assert any(t == "No switch" and "hswap codex switch 1 --force" in message for t, message in toasts)
+    assert (tmp / "codex" / "auth.json").read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_switch_outcomes_that_change_nothing_are_calm_toasts(homes):
+    from harness_swap.ui.screens import SwitchScreen
+
+    reg, tmp = homes
+    _codex_accounts(reg, tmp, "a", "b")
+    app, toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+        await pilot.press("s")
+        await _settle(pilot)
+        await pilot.press("b")  # no usage measured: nothing qualifies, which is no failure
+        await _settle(pilot)
+        assert isinstance(app.screen, SwitchScreen)  # no error modal on top
+        await pilot.press("enter")  # the cursor starts on the active account
+        await _settle(pilot)
+    assert [t for t, _m in toasts] == ["No switch", "No switch"]
+    assert toasts[1][1] == "b@x.com is already the active Codex CLI account"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_menu_nests_with_a_breadcrumb(homes):
+    from textual.widgets import Static
+
+    reg, tmp = homes
+    _codex_accounts(reg, tmp, "a")
+    app, _toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+
+        def crumb():
+            return str(app.screen.query_one("#menu-title", Static).render())
+
+        assert crumb() == "menu"
+        assert _menu_ids(app) == ["switch", "watch", "auto", "add-menu", "remove-menu", "theme-menu", "quit"]
+        await pilot.press("tab")  # the panel never takes focus from the menu
+        assert app.focused is app.screen.query_one("#menu")
+        await pilot.press("down", "down", "down", "enter")
+        await pilot.pause()
+        assert crumb() == "menu › add account"
+        assert _menu_ids(app) == ["add:codex", "add:grok", "back"]
+        await pilot.press("escape")
+        await pilot.pause()
+        assert crumb() == "menu" and _menu_ids(app)[0] == "switch"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_removes_through_the_menu_after_confirming(homes):
+    from harness_swap.ui.modals import ConfirmModal
+
+    reg, tmp = homes
+    _codex_accounts(reg, tmp, "a", "b")
+    app, toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+        await pilot.press("down", "down", "down", "down", "enter")  # Remove account…
+        await pilot.pause()
+        assert _menu_ids(app) == ["remove:0", "remove:1", "back"]
+        await pilot.press("enter")  # Codex 1 a@x.com
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmModal)
+        assert "Remove Codex CLI account 1 (a@x.com)?" in str(app.screen.query_one(".modal-body").render())
+        await pilot.press("y")
+        await _settle(pilot)
+        assert ("Remove account", "Removed a@x.com from Codex CLI") in toasts
+    remaining = json.loads(run_quiet(reg, "codex", "list", "--json", "--no-usage"))["accounts"]
+    assert [a["label"] for a in remaining] == ["b@x.com"]
+
+
+@pytest.mark.asyncio
+async def test_watch_arms_selection_on_demand(homes):
+    from textual.widgets import ListView
+
+    from harness_swap.ui.screens import DashboardScreen, WatchScreen
+
+    reg, tmp = homes
+    _codex_accounts(reg, tmp, "a", "b")
+    app, _toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+        await pilot.press("w")
+        await _settle(pilot)
+        assert isinstance(app.screen, WatchScreen)
+        listview = app.screen.query_one("#accounts", ListView)
+        assert listview.index is None  # monitor mode: no cursor
+        assert str(app.screen.query_one("#list-title").render()) == "watching all accounts"
+        await pilot.press("down")  # scrolls; no hidden cursor moves
+        assert listview.index is None
+        await pilot.press("s")
+        await pilot.pause()
+        assert listview.highlighted_child.row.account.label == "b@x.com"  # armed on the active account
+        assert str(app.screen.query_one("#list-title").render()).startswith("switch to which account?")
+        await pilot.press("escape")  # disarms first
+        await pilot.pause()
+        assert isinstance(app.screen, WatchScreen) and listview.index is None
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, DashboardScreen)
+
+
+@pytest.mark.asyncio
+async def test_ctrl_t_cycles_and_persists_the_theme(homes):
+    from harness_swap.core import settings
+
+    reg, _tmp = homes
+    app, _toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+        assert settings.load()["ui.theme"] == "auto"
+        await pilot.press("ctrl+t")
+        assert app.theme == "cswap-dark" and settings.load()["ui.theme"] == "dark"
+        await pilot.press("ctrl+t")
+        assert app.theme == "cswap-light" and settings.load()["ui.theme"] == "light"
+
+
+@pytest.mark.asyncio
+async def test_auto_view_opens_dry_and_explains_a_harness_it_cannot_run_once(homes):
+    from textual.widgets import RichLog
+
+    from harness_swap.core import settings
+    from harness_swap.ui.screens import AutoScreen
+
+    reg, tmp = homes
+    write_json(tmp / "grok" / "auth.json", {"https://auth.example::c": grok_entry("g@x.com", "user-g")})
+    run_quiet(reg, "grok", "add")
+    settings.set_value("auto.enabled", "grok")  # opted in, but grok has no live usage without usage.remote
+    app, _toasts = _dashboard(reg)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await _settle(pilot)
+        await pilot.press("g")
+        await _settle(pilot)
+        assert isinstance(app.screen, AutoScreen)
+        assert str(app.screen.query_one("#mode-badge").render()).strip() == "DRY-RUN"
+        app.screen._run_pass()  # the minute timer, now
+        await _settle(pilot)
+        lines = [line.text for line in app.screen.query_one("#event-log", RichLog).lines]
+        assert any("DRY-RUN (watching only)" in line for line in lines)
+        assert sum("Grok Build: automatic_rotation" in line for line in lines) == 1
+
+
+def test_dashboard_reads_harnesses_in_parallel_and_shows_each_as_it_arrives():
+    import threading
     from types import SimpleNamespace
 
-    from harness_swap.core.models import Installation
-    from harness_swap.ui.tui import collect
+    from harness_swap.core.models import Capability, Installation, unsupported
+    from harness_swap.ui.tui import LOADING, collect
 
-    def missing(harness_id):
-        return SimpleNamespace(id=harness_id, installation=lambda: Installation(False, harness_id, None, "missing"))
+    acc = Account("b", "i", "b@x", None, 1)
+    b_listed = threading.Event()
 
-    seen = []
-    rows = collect(SimpleNamespace(available=lambda: [missing("a"), missing("b")], entries=list), seen.append)
-    assert [[r[0].id for r in partial] for partial in seen] == [["a"]]
-    assert [r[0].id for r in rows] == ["a", "b"]
+    def slow_install():
+        assert b_listed.wait(5), "the slow harness held back the one after it"
+        return Installation(False, "a", None, "missing")
 
-    # a harness's accounts show before its (possibly slow) usage read finishes
-    from harness_swap.core.models import Capability, unsupported
-
-    acc = Account("c", "i", "c@x", None, 1)
-    slow = SimpleNamespace(
-        id="c", display_name="C", providers=(), installation=lambda: Installation(True, "c", "1"),
+    slow = SimpleNamespace(id="a", installation=slow_install)
+    fast = SimpleNamespace(
+        id="b", display_name="B", providers=(), installation=lambda: Installation(True, "b", "1"),
         list_accounts=lambda: [acc], capabilities=lambda: {Capability.USAGE_MONITORING: unsupported("none")},
     )
-    seen.clear()
-    collect(SimpleNamespace(available=lambda: [slow], entries=list), seen.append)
-    assert [(r[1], r[2]) for r in seen[0]] == [(acc, "measuring...")]
+    seen = []
+
+    def progress(rows):
+        seen.append([(r.adapter.id, r.account, r.usage, r.note) for r in rows])
+        if any(r.account is not None for r in rows):
+            b_listed.set()
+
+    rows = collect(SimpleNamespace(available=lambda: [slow, fast], entries=list), progress)
+    # every harness from the start, in registry order; b's account before its usage is read
+    assert seen[0] == [("a", None, None, LOADING), ("b", acc, None, "")]
+    assert [(r.adapter.id, r.note) for r in rows] == [("a", "not installed: missing"), ("b", "")]
+    assert rows[1].usage is not None
+
+
+def test_switch_cursor_follows_the_active_account_until_the_user_moves_it():
+    from types import SimpleNamespace as NS
+
+    from harness_swap.ui.screens import SwitchScreen
+
+    def row(key, active):
+        return NS(account=NS(key=key, active=active))
+
+    screen = SwitchScreen()
+    screen._keys, screen._rows = [("a", None), ("b", None)], [None, None]  # every harness still loading
+    assert screen._index_after_build(None, None) is None
+    screen._keys = [("a", None), ("b", None), ("b", "bob"), ("b", "ann")]
+    screen._rows = [None, None, row("bob", False), row("ann", True)]
+    assert screen._index_after_build(None, None) == 3  # the active account, not the first one listed
+    screen._keys = [("a", None), ("a", "x"), ("b", None), ("b", "bob"), ("b", "ann")]
+    screen._rows = [None, row("x", False), None, row("bob", False), row("ann", True)]
+    assert screen._index_after_build(("b", "ann"), 3) == 4  # a harness arriving above does not move it off
+    assert screen._index_after_build(("b", "bob"), 3) == 3  # once the user picked bob, bob stays
 
 
 class Crashy(Native):

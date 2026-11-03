@@ -202,8 +202,17 @@ class HswapApp(App):
             self._tick()
 
     def _collect_blocking(self) -> None:
-        rows = collect(self.registry, partial(self.call_from_thread, self._apply_rows))
-        self.call_from_thread(self._collect_done, rows, addable(rows))
+        rows = collect(self.registry, partial(self.from_thread, self._apply_rows))
+        self.from_thread(self._collect_done, rows, addable(rows))
+
+    def from_thread(self, callback, *args) -> None:
+        """Hand ``callback(*args)`` to the UI from a worker thread, without waiting.
+
+        ``call_from_thread`` blocks until the UI has run the callback, so a worker
+        still busy when the app exits would wait forever and keep the process
+        from exiting."""
+        with contextlib.suppress(RuntimeError):  # the event loop is already closed
+            self.call_later(callback, *args)
 
     def _apply_rows(self, rows: list[Row]) -> None:
         """Show ``rows``; a harness still loading keeps its previous rows, and an
@@ -300,7 +309,7 @@ class HswapApp(App):
             error = exc
         finally:
             sys.stdin = saved
-        self.call_from_thread(self._action_finished, label, done, refused, result, error, buf.getvalue())
+        self.from_thread(self._action_finished, label, done, refused, result, error, buf.getvalue())
 
     def _action_finished(self, label: str, done, refused, result, error, output: str) -> None:
         self.busy = False

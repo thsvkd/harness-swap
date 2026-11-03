@@ -866,7 +866,7 @@ class AutoScreen(Screen):
                 results.append((harness_id, name, events))
             except Exception as exc:  # noqa: BLE001 - logged; one harness must not stop the others
                 results.append((harness_id, name, exc))
-        self.app.call_from_thread(self._pass_done, results)
+        self.app.from_thread(self._pass_done, results)
 
     def _pass_done(self, results: list[tuple[str, str, list[dict] | Exception]]) -> None:
         self._pass_running = False

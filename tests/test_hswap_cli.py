@@ -496,6 +496,47 @@ def test_dashboard_reads_harnesses_in_parallel_and_shows_each_as_it_arrives():
     assert rows[1].usage is not None
 
 
+def test_a_read_that_outlives_the_dashboard_never_waits_on_it(homes):
+    """A worker handing rows to an app that has exited must not block: the
+    thread would never finish and the process could not exit (a slow CI
+    runner hung at exit this way)."""
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from harness_swap.core.models import Installation
+    from harness_swap.ui.tui import HswapApp
+
+    release, finished = threading.Event(), threading.Event()
+
+    def slow_list():
+        release.wait(5)
+        return [Account("x", "i", "x@x", None, 1, active=True)]
+
+    def capabilities():  # asked once the read has handed over its rows
+        finished.set()
+        return {}
+
+    adapter = SimpleNamespace(
+        id="x", display_name="X", providers=(), installation=lambda: Installation(True, "x", "1"),
+        list_accounts=slow_list, capabilities=capabilities,
+    )
+    app = HswapApp(SimpleNamespace(available=lambda: [adapter], entries=list))
+
+    async def open_and_quit():
+        async with app.run_test():
+            pass
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(open_and_quit())
+        release.set()  # the read ends now, with the app gone and no loop running
+        assert finished.wait(5), "the worker is stuck waiting for the app"
+    finally:
+        loop.run_until_complete(asyncio.sleep(0.2))  # on failure: let a stuck worker go
+        loop.close()
+
+
 def test_switch_cursor_follows_the_active_account_until_the_user_moves_it():
     from types import SimpleNamespace as NS
 

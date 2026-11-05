@@ -661,7 +661,7 @@ class TestRequiredModeFetchPathR10:
         s._fetch_active_usage("1", "a@example.com", expired, "")
         assert endpoint.posts == ["RT-0"]
         spent = oauth.credential_fingerprint(expired)
-        assert consumed_grants.slot_of(spent) == "1"
+        assert consumed_grants.entry(spent)["state"] == consumed_grants.CONSUMED
         rows = s._store._list_unclaimed_credentials()
         assert [row["consumedFp"] for row in rows.values()] == [spent]
         assert [row["configSlot"] for row in rows.values()] == ["1"]
@@ -686,7 +686,9 @@ class TestRequiredModeFetchPathR10:
             "1", creds("AT-P", "RT-P"), oauth.credential_fingerprint(expired),
             "active-refresh-persist-failed",
         )
-        consumed_grants.record(oauth.credential_fingerprint(expired), "1")
+        consumed_grants.record(
+            oauth.credential_fingerprint(expired), ("a@example.com", ""), consumed_grants.CONSUMED
+        )
         report = run_keepalive(s)
         assert report["ok"] is True and report["action"] == "synced-keychain"
         assert endpoint.posts == []

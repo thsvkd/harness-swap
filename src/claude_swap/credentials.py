@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain
+from claude_swap import consumed_grants, macos_keychain
 from claude_swap.exceptions import (
     CredentialError,
     CredentialReadError,
@@ -435,7 +435,13 @@ class CredentialStore:
         )
 
     def records_consumed_grants(self) -> bool:
-        return self.records_consumed or self._keychain_is_required()
+        # An existing ledger binds every POST, or a default-mode `auto` could
+        # spend a token behind keepalive's back.
+        return (
+            self.records_consumed
+            or self._keychain_is_required()
+            or consumed_grants.in_use()
+        )
 
     def _refuse_file_fallback(self, cause: Exception | None = None) -> None:
         """Keychain-required mode: a Keychain failure raises, never reaches a file."""

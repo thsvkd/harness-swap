@@ -28,7 +28,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import consumed_grants, oauth, pace
+from claude_swap import oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -657,19 +657,16 @@ class ClaudeAccountSwitcher:
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
 
     def post_refresh(
-        self, account_num: str, credentials: str, **kwargs
+        self, identity: tuple[str, str], credentials: str, **kwargs
     ) -> "oauth.RefreshOutcome":
-        """Every engine POST of a refresh token: no POST whose successor could
-        not be stored, and the spent token goes on the ledger before anything
-        else can fail. A server that did not rotate spent nothing."""
+        """Every engine POST of a refresh token, for the account ``identity``
+        (email, organization): no POST whose successor could not be stored, and
+        the token is reserved on the ledger before it leaves."""
         if self.keychain_gate_closed(fresh=True):
             return oauth.RefreshOutcome(None, "transient")
-        result = oauth.try_refresh_oauth_credentials(credentials, **kwargs)
-        if result.credentials and self._store.records_consumed_grants():
-            spent = oauth.credential_fingerprint(credentials)
-            if oauth.credential_fingerprint(result.credentials) != spent:
-                consumed_grants.record(spent, account_num)
-        return result
+        if self._store.records_consumed_grants():
+            kwargs["ledger_identity"] = identity
+        return oauth.try_refresh_oauth_credentials(credentials, **kwargs)
 
     def stash_consumed_successor(
         self, account_num: str, credentials: str, consumed_fp: str | None, reason: str
@@ -2573,7 +2570,9 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
         result = self.post_refresh(
-            account_num, refresh_input, **({"timeout_s": 6.0} if global_lock_held else {})
+            (email, self.account_identity(account_num)["organizationUuid"]),
+            refresh_input,
+            **({"timeout_s": 6.0} if global_lock_held else {}),
         )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
@@ -2887,6 +2886,9 @@ class ClaudeAccountSwitcher:
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
             self._write_account_credentials(account_num, email, creds)
+            # The stash holds the only sure copy until the slot provably does.
+            if self._store._read_account_credentials(account_num, email) != creds:
+                return creds
             # Housekeeping, and non-fatal for the same reason: the slot is
             # advanced, so a raise would report a failed refresh for a
             # credential the store holds. A stale row is retried next pass or
@@ -4840,7 +4842,7 @@ class ClaudeAccountSwitcher:
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
                         result = self.post_refresh(
-                            account_num, refresh_input, timeout_s=6.0
+                            (email, org_uuid or ""), refresh_input, timeout_s=6.0
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"

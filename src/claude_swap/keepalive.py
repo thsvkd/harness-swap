@@ -72,6 +72,11 @@ _MESSAGES = {
     "unmanaged": "The active login matches no managed account; add it to back it up.",
 }
 _FILE_NOT_UPDATED = "file store could not be updated"
+_LEDGER_UNREADABLE = "consumed-grant ledger unreadable"
+_UNCERTAIN_REFRESH = (
+    "The last refresh had an uncertain outcome, so its token will not be sent "
+    "again; log in again and re-add the account."
+)
 _UNSUPPORTED_STORE = (
     "CLAUDE_CONFIG_DIR or CLAUDE_SECURESTORAGE_CONFIG_DIR names a credential store "
     "keepalive does not manage; run it from a normal shell."
@@ -125,6 +130,8 @@ def run_keepalive(
         report["error"] = {"type": stop.kind, "message": stop.message}
     except KeychainUnavailableError:
         report["error"] = _error("keychain_unavailable")
+    except consumed_grants.LedgerUnreadable:
+        report["error"] = {"type": "refresh_failed", "message": _LEDGER_UNREADABLE}
     except LockError:
         report["error"] = _error("locked")
     except Exception as e:  # noqa: BLE001 - a watcher must always get a report
@@ -216,10 +223,13 @@ def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict
 
     backup, parked_entry = _adopted_backup(active, keychain, file_creds, dry_run)
     final = _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run)
-    if parked_entry and oauth.credential_fingerprint(final) == oauth.credential_fingerprint(backup):
+    if parked_entry:
+        if not _store_holds(store, switcher.platform == Platform.MACOS, backup):
+            raise _Stop("refresh_failed", _FILE_NOT_UPDATED)
         switcher._retire_stash_entry(parked_entry, _UNMANAGED)
     token_account = None
     if _due(final, ahead):
+        _refuse_spent(final)
         if dry_run:
             report["action"] = "refreshed"
         else:
@@ -238,6 +248,26 @@ def _read_stores(store, macos: bool) -> tuple[str, str]:
     path = get_credentials_path()
     file_creds = path.read_text(encoding="utf-8") if path.exists() else ""
     return keychain, file_creds if file_creds.strip() else ""
+
+
+def _store_holds(store, macos: bool, parked: str) -> bool:
+    """A store read back now holds this successor, or the same lineage no older."""
+    keychain, file_creds = _read_stores(store, macos)
+    durable = keychain if macos else file_creds
+    return durable == parked or (
+        oauth.credential_fingerprint(durable) == oauth.credential_fingerprint(parked)
+        and credential_generation(durable) >= credential_generation(parked)
+    )
+
+
+def _refuse_spent(credentials: str) -> None:
+    """Called after every adoption: nothing newer exists, and no POST can help."""
+    recorded = consumed_grants.entry(oauth.credential_fingerprint(credentials))
+    if recorded is not None:
+        raise _Stop(
+            "relogin_required",
+            _UNCERTAIN_REFRESH if recorded["state"] == consumed_grants.RESERVED else None,
+        )
 
 
 def _adopted_backup(active, keychain, file_creds, dry_run) -> tuple[str, str | None]:
@@ -302,9 +332,11 @@ def _belongs(active, credentials: str, backup: str, *, probe: bool) -> bool | No
     fingerprint = oauth.credential_fingerprint(credentials)
     if active.slot and backup and fingerprint == oauth.credential_fingerprint(backup):
         return True
-    spender = consumed_grants.slot_of(fingerprint)
-    if spender is not None:
-        return spender == (active.slot or _UNMANAGED)
+    recorded = consumed_grants.entry(fingerprint)
+    if recorded is not None:
+        if not active.identity:
+            return None
+        return (recorded["email"], recorded["organizationUuid"]) == active.identity
     for num, account in active.accounts.items():
         if num != active.slot:
             other = switcher._read_account_credentials_ex(num, account.get("email", ""))[0]
@@ -343,32 +375,48 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
             verdicts[creds] = _belongs(active, creds, backup, probe=drifted)
         return verdicts[creds]
 
-    # Newest first, the Keychain winning a tie (`sorted` is stable and Claude Code
-    # reads it first). The first that is not another account's: a switch this run
-    # did not see must not be undone by a stale, longer-lived copy.
-    ordered = sorted(live, key=credential_generation, reverse=True)
-    authoritative = next((creds for creds in ordered if belongs(creds) is not False), None)
-    # The slot holding a newer generation means a live store was stranded on the
-    # consumed one (a write that failed after a refresh): `_fetch_active_usage`
-    # restores in that case too, and POSTing the live bytes could only fail.
+    # Another account's copy never wins: a switch this run did not see must not be
+    # undone by a stale, longer-lived copy. The slot competes too, since it holding
+    # a newer generation means a live store was stranded on the consumed one (a
+    # write that failed after a refresh), which `_fetch_active_usage` restores as
+    # well. With every live copy foreign, overwriting a login takes a slot copy
+    # that can still work: a duplicated lineage can look foreign too.
+    candidates = [creds for creds in live if belongs(creds) is not False]
     if _oauth_payload(backup).get("refreshToken") and (
-        credential_generation(backup) > credential_generation(authoritative)
-        if authoritative
-        # Every live copy is another account's. Overwriting a login takes a slot
-        # copy that can still work: a duplicated lineage can look foreign too.
-        else not _is_expired(backup)
-        and consumed_grants.slot_of(oauth.credential_fingerprint(backup)) is None
+        candidates or (not _is_expired(backup) and not _is_spent(backup))
     ):
-        authoritative = backup
-    if authoritative is None:
+        candidates.append(backup)
+    if not candidates:
         raise _Stop("unmanaged")
+
+    # A working copy beats a spent one, then the newest wins. `max` keeps the first
+    # on a tie, and the Keychain is first because Claude Code reads it first.
+    def rank(creds: str) -> tuple:
+        return (_is_working(creds), credential_generation(creds))
+
+    authoritative = max(candidates, key=rank)
+    generation = credential_generation(authoritative)
+    spent_newer = [
+        creds for creds in live
+        if _is_spent(creds) and credential_generation(creds) > generation
+    ]
+    if spent_newer and not dry_run:
+        # An older copy of a chain whose newer link is spent was very likely spent
+        # to make that link. Keep that knowledge past the overwrite below.
+        consumed_grants.record(
+            oauth.credential_fingerprint(authoritative),
+            active.identity or ("", ""),
+            consumed_grants.RESERVED,
+        )
 
     fingerprint = oauth.credential_fingerprint(authoritative)
     for loser in dict.fromkeys(live):
         if loser == authoritative or oauth.credential_fingerprint(loser) == fingerprint:
             continue
         verdict = belongs(loser)
-        if verdict is True or _spent_or_empty(loser, authoritative, verdict):
+        if loser not in spent_newer and (
+            verdict is True or _spent_or_empty(loser, authoritative, verdict)
+        ):
             continue  # a stale generation of this login is not a split
         if verdict is False:
             report["note"] = "split_brain"
@@ -402,6 +450,20 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
         report["action"] = "synced-file" if file_creds else "created-file"
     _report_expiry(report, composed)
     return composed
+
+
+def _is_spent(credentials: str) -> bool:
+    return consumed_grants.entry(oauth.credential_fingerprint(credentials)) is not None
+
+
+def _is_working(credentials: str) -> bool:
+    payload = _oauth_payload(credentials)
+    return bool(
+        payload.get("accessToken")
+        and payload.get("refreshToken")
+        and not _is_expired(credentials)
+        and not _is_spent(credentials)
+    )
 
 
 def _file_text(path) -> str | None:
@@ -490,12 +552,16 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
         # Unmanaged, or a rotation the slot has not caught up with. Posting the
         # live store's own grant is what Claude Code itself would do.
         outcome = switcher.post_refresh(
-            slot or _UNMANAGED, current, timeout_s=_POST_TIMEOUT_S
+            active.identity or ("", ""), current, timeout_s=_POST_TIMEOUT_S
         )
 
     if not outcome.credentials:
         if outcome.error == "consumed":
             raise _Stop("relogin_required")  # nothing parked and no POST can help
+        if outcome.error == "ledger-unreadable":
+            raise _Stop("refresh_failed", _LEDGER_UNREADABLE)
+        if outcome.fate == oauth.GRANT_UNCERTAIN:
+            raise _Stop("relogin_required", _UNCERTAIN_REFRESH)
         if outcome.error in PERMANENT_AUTH_ERRORS:
             if slot:
                 switcher._usage_store.record(

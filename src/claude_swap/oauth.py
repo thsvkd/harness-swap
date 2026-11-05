@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
+import socket
+import ssl
 import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from claude_swap import consumed_grants
@@ -20,6 +23,11 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+# What a POST did to its refresh token, as far as the client can know.
+GRANT_SPENT = "spent"  # rotated, or the server says this token is dead
+GRANT_UNCHANGED = "unchanged"  # never sent, or refused without touching it
+GRANT_UNCERTAIN = "uncertain"  # the server may have rotated it
 
 _logger = logging.getLogger("claude-swap")
 
@@ -122,8 +130,9 @@ class RefreshOutcome:
     - ``"no_refresh_token"`` — the stored credential carries no usable refresh
       token (also permanent for retry purposes)
     - ``"transient"`` — network/server error; the token may still be valid
-    - ``"consumed"`` — not POSTed: this machine already spent this refresh token
-      (see ``consumed_grants``). No server verdict, so nothing strikes on it
+    - ``"consumed"`` — not POSTed: this token is spent or may be (see
+      ``consumed_grants``). No server verdict, so nothing strikes on it
+    - ``"ledger-unreadable"`` — not POSTed: the ledger cannot answer or record
 
     ``token_account`` is the account identity the token endpoint optionally
     includes alongside a successful grant (``{"uuid", "email",
@@ -148,16 +157,39 @@ class RefreshOutcome:
     # tell the user what to do next must not promise a stash that never
     # happened.
     stashed: bool = False
+    # One of the GRANT_* values once a POST was attempted. ``transient`` covers
+    # both "never sent" and "may have rotated"; only this tells them apart.
+    fate: str | None = field(default=None, compare=False)
+
+
+def _never_sent(error: Exception) -> bool:
+    """The request bytes provably did not go out. Unsure counts as sent, so a
+    timeout does not qualify even though most of them happen while connecting."""
+    reason = error.reason if isinstance(error, urllib.error.URLError) else None
+    if isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)):
+        return True
+    if isinstance(reason, ssl.SSLError):
+        return "HANDSHAKE" in str(reason)
+    return isinstance(reason, OSError) and reason.errno in (
+        errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH,
+    )
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str,
+    timeout_s: float = 10.0,
+    *,
+    ledger_identity: tuple[str, str] | None = None,
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
+
+    The one place a refresh token leaves this machine. It refuses a token the
+    ledger lists, and with ``ledger_identity`` reserves the token durably before
+    the POST and settles the entry from the outcome (see ``consumed_grants``).
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -173,9 +205,30 @@ def try_refresh_oauth_credentials(
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
-    if consumed_grants.slot_of(credential_fingerprint(credentials)) is not None:
-        return RefreshOutcome(None, "consumed")
 
+    fingerprint = credential_fingerprint(credentials)
+    try:
+        if consumed_grants.entry(fingerprint) is not None:
+            return RefreshOutcome(None, "consumed")
+        if ledger_identity is not None:
+            consumed_grants.record(fingerprint, ledger_identity, consumed_grants.RESERVED)
+    except consumed_grants.LedgerUnreadable:
+        return RefreshOutcome(None, "ledger-unreadable")
+
+    outcome = _post_grant(data, oauth, timeout_s)
+    if ledger_identity is not None:
+        try:
+            if outcome.fate == GRANT_SPENT:
+                consumed_grants.record(fingerprint, ledger_identity, consumed_grants.CONSUMED)
+            elif outcome.fate == GRANT_UNCHANGED:
+                consumed_grants.release(fingerprint)
+        except consumed_grants.LedgerUnreadable:
+            # Still reserved, so still refused: the safe side of a failed write.
+            _logger.warning("Could not settle a consumed-grant ledger entry")
+    return outcome
+
+
+def _post_grant(data: dict, oauth: dict, timeout_s: float) -> RefreshOutcome:
     try:
         body = json.dumps({
             "grant_type": "refresh_token",
@@ -196,6 +249,7 @@ def try_refresh_oauth_credentials(
             resp_data = json.loads(resp.read().decode())
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        previous = oauth["refreshToken"]
         oauth["accessToken"] = resp_data["access_token"]
         oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
         if resp_data.get("refresh_token"):
@@ -205,7 +259,9 @@ def try_refresh_oauth_credentials(
 
         data["claudeAiOauth"] = oauth
         return RefreshOutcome(
-            json.dumps(data), None, _parse_token_account(resp_data)
+            json.dumps(data), None, _parse_token_account(resp_data),
+            # A server that did not rotate spent nothing.
+            fate=GRANT_SPENT if oauth["refreshToken"] != previous else GRANT_UNCHANGED,
         )
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
@@ -231,12 +287,18 @@ def try_refresh_oauth_credentials(
             # invalid_client: OUR client credential was rejected — systemic
             # (client_id rotated/blocked), no evidence about any slot, so it
             # keeps its own kind and lands no strike.
-            if err in ("invalid_grant", "invalid_client"):
-                return RefreshOutcome(None, err)
-        return RefreshOutcome(None, "transient")
+            if err == "invalid_grant":
+                return RefreshOutcome(None, err, fate=GRANT_SPENT)
+            if err == "invalid_client":
+                return RefreshOutcome(None, err, fate=GRANT_UNCHANGED)
+        # A 4xx refused the request; a 5xx may have died after rotating.
+        fate = GRANT_UNCHANGED if 400 <= e.code < 500 else GRANT_UNCERTAIN
+        return RefreshOutcome(None, "transient", fate=fate)
     except Exception as e:
         _logger.debug("OAuth refresh failed: %s", type(e).__name__)
-        return RefreshOutcome(None, "transient")
+        # A cut-off or unparsable 2xx lands here too: the token may be rotated.
+        fate = GRANT_UNCHANGED if _never_sent(e) else GRANT_UNCERTAIN
+        return RefreshOutcome(None, "transient", fate=fate)
 
 
 def _parse_token_account(resp_data: dict) -> dict | None:

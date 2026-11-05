@@ -10,7 +10,9 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 
 | Area | File | Notes |
 |---|---|---|
-| Claude engine (regression) | `tests/test_*.py` (pre-existing, ~2900) | not modified; must stay green |
+| Claude engine (regression) | `tests/test_*.py` (pre-existing, ~2900) | must stay green; changed only where a test pins the settings registry (`credentials.requireKeychain` is its 13th key) |
+| Keychain-required mode | `test_keychain_required.py` | preflight over a fake `security` (search list without the login keychain, a daemon reporting `System.keychain`, rc 36, timeout, n/a off macOS), setting and env override, refusal with byte-identical stores for every credential-writing command, `keychain_unavailable` envelope, cached `list`/`status`/dashboard with no fetch, no plaintext or `.enc` fallback on any write path, mid-switch failure and rollback |
+| `hswap claude keepalive` | `test_keepalive.py` | Keychain/file sync both ways, split-brain stash, shared fields, `--ensure-file`, refresh with one POST and the successor in every store, racing writer, `invalid_grant`, network error, identity from the token endpoint, a failed Keychain write after the POST and its recovery, Claude Code's lock held, unmanaged login, Linux, the report's shape and mode, no token or home path in any output |
 | Core: store, rotation, usage service, registry, dispatch, resolution | `test_hswap_core.py` | |
 | Credential activation guarantees | `test_hswap_credentials.py` | sync-back, conflict/stash, part isolation, exclusive formats, rollback on interrupted write and on failed verification, tampered snapshot, harness lock, lock file not truncated, concurrent switches (threads and processes), session-owned snapshot never overwritten, no secrets in errors |
 | Isolated sessions | `test_hswap_sessions.py` | lock held while running and released after, not inherited by the harness's background children, exit status/signals, removed slot not reused, remove refused while running |
@@ -30,8 +32,10 @@ uv run pytest tests/test_hswap_*.py -n 0   # just the hswap layer, serially
 
 - Every test runs with `$HOME`/`Path.home()` pointed at a temporary directory,
   and `HSWAP_HOME`, `CODEX_HOME`, `GROK_HOME`, `XDG_DATA_HOME`,
-  `CLAUDE_CONFIG_DIR` and `HSWAP_TRUSTED_PLUGINS` cleared (`tests/conftest.py`,
-  `_isolate_real_home`).
+  `CLAUDE_CONFIG_DIR`, `HSWAP_REQUIRE_KEYCHAIN` and `HSWAP_TRUSTED_PLUGINS` cleared
+  (`tests/conftest.py`, `_isolate_real_home`).
+- `block_real_keychain` replaces the `security` wrapper, the keychain preflight
+  included, with an in-memory fake (`reachable` sets the preflight's answer).
 - A process-wide audit hook refuses writes to the developer's real stores:
   the claude-swap store and `~/.claude*`, plus hswap's data directory and the
   live credential files in `~/.codex`, `~/.grok` and
@@ -82,6 +86,7 @@ These pass against fakes and synthetic files, not against a live service:
   tests use the real file formats; the binaries were checked separately with
   synthetic homes — see harness-compatibility.md);
 - OpenCode 1.x legacy mode (no 1.x binary available);
+- keychain-required mode and `keepalive`: the preflight was exercised only against `security` output measured on one Mac mini (2.1.318, a LaunchDaemon), and the refresh only against a fake token endpoint;
 - macOS and Windows behaviour of the new adapters (only Linux was run).
 
 The Claude engine's own suite includes its macOS/Windows paths, run on CI as

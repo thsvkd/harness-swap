@@ -169,6 +169,7 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 hswap claude run 2                     # Run an account in this terminal only (session mode)
 hswap claude auto                      # Auto-switch when nearing rate limits (see above)
+hswap claude keepalive                 # Sync the active login's stores and refresh it ahead of expiry
 hswap claude config                    # Show or edit settings (see Configuration below)
 hswap claude list                      # Show all accounts with 5h/7d usage and reset times
 hswap claude list --token-status       # Add source-labelled OAuth token diagnostics
@@ -271,6 +272,7 @@ hswap claude config set autoswitch.weeklyThreshold 97  # own switch line for the
 hswap claude config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 hswap claude config set run.shareHistory true    # every hswap claude run shares chat history (see "run")
 hswap claude config set updates.check false      # no daily PyPI lookup for the "newer version" hint
+hswap claude config set credentials.requireKeychain true  # macOS: never fall back to plaintext (see "headless")
 hswap claude config unset autoswitch.threshold   # back to the default
 hswap claude config path                         # where settings.json lives
 ```
@@ -342,6 +344,8 @@ Usage is served from a per-account cache: when the usage API is briefly unreacha
 
 A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `hswap claude add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
 
+A top-level `keychainUnavailable: true` means keychain-required mode is on and this process cannot reach the login keychain, so the rows are the cached view: nothing was fetched or refreshed. See [Keeping a headless machine logged in](#keeping-a-headless-machine-logged-in-macos). Absent otherwise.
+
 An account row also carries an additive `alias` field once one is set with `hswap claude alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
@@ -377,6 +381,72 @@ usage-aware `switch` strategies never skip them as rate-limited. Create personal
 service-account keys scoped to a single workspace: a multi-workspace key needs an
 `anthropic-workspace-id` header on every request, which Claude Code does not add for
 a stored key.
+
+## Keeping a headless machine logged in (macOS)
+
+On macOS Claude Code keeps the active login in the login Keychain and falls back to `~/.claude/.credentials.json`. A process that cannot reach the login keychain (started by a LaunchDaemon, even with `UserName` set, or over SSH without an unlocked keychain) reads and writes only the file, and it cannot tell it is in that state: `security find-generic-password` answers rc 44, "not found", for an item that exists.
+
+So one login ends up in two stores that each refresh on their own. The refresh token rotates on every refresh, and whichever side refreshes later presents a consumed token, which logs out every process on that side. hswap run from such a process makes it worse: its Keychain write fails, it falls back to the plaintext file and `.enc` backups, and it can neither remove the Keychain item nor see newer generations held there.
+
+The cure is one refresher in a place that can see both stores, running early enough that no Claude Code process ever reaches its own refresh window (the last 5 minutes of the access token).
+
+**1. Refuse to work from the wrong place.**
+
+```bash
+hswap claude config set credentials.requireKeychain true   # or HSWAP_REQUIRE_KEYCHAIN=1|0, which wins over the setting
+```
+
+With this on (macOS only; off by default), every command checks that the login keychain is in this process's search list and answers `security show-keychain-info`. When it does not:
+
+- commands that can write a credential (`switch`, `add`, `add-token`, `remove`, `import`, `move`, `swap`, `purge`, `run`, `auto`, `keepalive`) refuse before touching anything: exit 1, and under `--json` an error envelope with type `keychain_unavailable`;
+- `list`, `status` and the dashboard show cached usage with no fetch, no refresh and no writes, and `list --json` adds `keychainUnavailable: true`.
+
+A Keychain write that fails anyway never falls back to the plaintext file or an `.enc` backup; the command fails instead.
+
+**2. Run one refresher from the GUI session.** Save as `~/Library/LaunchAgents/com.example.hswap-keepalive.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.hswap-keepalive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>{ hswap claude keepalive --json --ensure-file; hswap claude auto --once --json; } >> ~/Library/Logs/hswap-keepalive.log 2>&amp;1</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>300</integer>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hswap-keepalive.plist
+```
+
+`--ensure-file` is for processes that only see the file: it keeps a copy there for them, 0600, on the same generation as the Keychain. Leave it out if nothing on the machine needs the file. The job needs a logged-in session with an unlocked login keychain; a machine booted to the login window has neither, and `keepalive` then reports `keychain_unavailable` until someone logs in.
+
+**What `keepalive` does.** `hswap claude keepalive [--ahead SECONDS] [--ensure-file] [--dry-run] [--json]` takes Claude Code's credential locks and the slot's lock, then:
+
+1. Reads the login from the Keychain and the file. If they differ, the one with the later `expiresAt` wins and is copied to the other; the Keychain wins a tie and keeps its machine-shared fields (`mcpOAuth`, ...). If the two hold different refresh tokens, the older copy is stashed first (see `hswap claude unclaimed`) and the report's `note` says `split_brain`. A refresh by Claude Code in only one store looks exactly like this, so the note means "the stores had drifted", not necessarily an accident.
+2. If the access token expires within `--ahead` (default 3600 seconds), refreshes it once and writes the result to the Keychain, the file (when present or `--ensure-file`) and the slot's backup. A racing refresh is adopted, not repeated. A rejected refresh token reports `relogin_required` and wipes nothing.
+
+It always needs the login keychain on macOS, even with the setting off, and never falls back to the file. On Linux and Windows there is no Keychain: it refreshes the file only.
+
+Every run, failures and `--dry-run` included, writes `cache/keepalive.json` in the store root (0600, no tokens, no paths), and `--json` prints the same object. The exit code is 0 when `ok`, 1 otherwise.
+
+```json
+{"schemaVersion": 1, "checkedAt": 1793900000.0, "ok": true,
+ "action": "refreshed", "note": null, "activeSlot": 2,
+ "accessExpiresAt": "2026-11-06T01:45:00Z", "loginExpiresAt": "2026-12-05T00:00:00Z",
+ "error": null}
+```
+
+`action` is `none`, `synced-file`, `synced-keychain`, `created-file` or `refreshed`. `error` is null or `{"type", "message"}`, with `type` one of `keychain_unavailable`, `relogin_required`, `split_brain` (the older copy could not be preserved, so nothing was synced), `refresh_failed` (transient), `no_credentials`, `locked` or `unmanaged`, and `ok` is false whenever it is set. `unmanaged` means the login matches no managed slot: the stores were still synced and refreshed (see `action`), but nothing backs it up until you run `hswap claude add`. `--dry-run` adds `"dryRun": true` and reports what it would have done. `note` is `api_key` when the active login is a managed key, which has nothing to refresh.
 
 ## Uninstall
 

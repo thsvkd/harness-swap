@@ -2,7 +2,10 @@
 
 Claude Code guards its OAuth token refresh with the npm ``proper-lockfile``
 package, and its ``~/.claude.json`` writes with the same mechanism on the
-config file. The protocol (verified against the 2.1.218 bundle):
+config file. The protocol (verified against the 2.1.218 bundle; the names and
+timings below still match 2.1.318, which adds ``.oauth_refresh.lock.owner``, a
+record of its own holder for reclaiming a dead one, and leaves a lock without
+that record alone):
 
 - The lock artifact is a **directory**; ``mkdir`` atomicity is the mutex.
 - The refresh path takes **two** locks, in order: the primary

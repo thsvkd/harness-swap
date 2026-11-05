@@ -2486,6 +2486,9 @@ class ClaudeAccountSwitcher:
                     .get("organizationUuid", "")
                     or ""
                 )
+                # With the credential, under this lock: once it is released a
+                # `move` can hand this number to someone else.
+                identity = (email, org_uuid)
                 if not self._live_session_pids(account_num, email):
                     sdir = session_dir_for(self.backup_dir, account_num, email)
                     profile = read_session_credentials(sdir)
@@ -2576,8 +2579,6 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        # Read now: a `move` during the POST leaves this number to someone else.
-        identity = (email, self.account_identity(account_num)["organizationUuid"])
         result = self.post_refresh(
             identity,
             refresh_input,

@@ -28,7 +28,6 @@ from claude_swap import consumed_grants, macos_keychain, oauth
 from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
-    _active_profile_is_default,
     _credential_object,
     credential_generation,
 )
@@ -162,11 +161,10 @@ def _keep(switcher, report, ahead, ensure_file, dry_run) -> None:
     active = _read_active(switcher)
     report["activeSlot"] = int(active.slot) if active.slot else None
 
-    # Switch and consume resolve the default store only; syncing another
-    # profile's file against the default Keychain item would create a split.
-    if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR") or (
-        macos and not _active_profile_is_default()
-    ):
+    # Keepalive reads the unsuffixed Keychain item. Claude Code hashes either
+    # variable into its service name when it is set at all, even to the default
+    # directory, so the two would be looking at different items.
+    if "CLAUDE_CONFIG_DIR" in os.environ or "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
         raise _Stop("refresh_failed", _UNSUPPORTED_STORE)
     if macos:
         if macos_keychain.keychain_reachable(platform="darwin") is False:
@@ -270,6 +268,15 @@ def _refuse_spent(credentials: str) -> None:
         )
 
 
+def _slot_copy(switcher, slot: str, email: str) -> str:
+    """A slot's stored login. Unreadable defers the run: this copy can be the newest
+    generation, and "" would read as there being none."""
+    value, unreadable = switcher._read_account_credentials_ex(slot, email)
+    if unreadable:
+        raise _Stop("keychain_unavailable")
+    return value
+
+
 def _adopted_backup(active, keychain, file_creds, dry_run) -> tuple[str, str | None]:
     """The slot's copy, after adopting a successor parked for what the stores
     still hold: posting past it would present a spent token. A login with no slot
@@ -278,7 +285,7 @@ def _adopted_backup(active, keychain, file_creds, dry_run) -> tuple[str, str | N
     email = active.identity[0] if active.identity else ""
     backup = ""
     if active.slot:
-        backup = switcher._read_account_credentials_ex(active.slot, email)[0]
+        backup = _slot_copy(switcher, active.slot, email)
     if dry_run:
         return backup, None
     held = [creds for creds in (backup, keychain, file_creds) if creds]
@@ -340,7 +347,7 @@ def _belongs(active, credentials: str, backup: str, *, probe: bool) -> bool | No
         return (recorded["email"], recorded["organizationUuid"]) == active.identity
     for num, account in active.accounts.items():
         if num != active.slot:
-            other = switcher._read_account_credentials_ex(num, account.get("email", ""))[0]
+            other = _slot_copy(switcher, num, account.get("email", ""))
             if other and oauth.credential_fingerprint(other) == fingerprint:
                 return False
     token = _oauth_payload(credentials).get("accessToken")

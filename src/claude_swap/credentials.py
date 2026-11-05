@@ -1399,7 +1399,7 @@ class CredentialStore:
                     self._host._logger.warning(f"Failed to read credentials file: {e}")
                 else:
                     if decoded and self._keychain_is_required():
-                        return self._newest_backup(account_num, email, decoded, cached)
+                        return self._newest_backup(account_num, email, decoded, failed, cached)
                     if decoded:
                         return decoded
                     # Empty/whitespace .enc is not a real backup → try the Keychain.
@@ -1424,22 +1424,22 @@ class CredentialStore:
         return ""
 
     def _newest_backup(
-        self, account_num: str, email: str, enc_value: str, cached: bool
+        self, account_num: str, email: str, enc_value: str, failed: list | None, cached: bool
     ) -> str:
         """Keychain-required mode ranks by generation: `.enc`-wins exists for a
-        Keychain that may be stale, and here the `.enc` is the leftover."""
+        Keychain that may be stale, and here the `.enc` is the leftover. A read
+        changes nothing: the next Keychain write of this slot removes it
+        (`_reconcile_enc_after_keychain_write`)."""
         try:
             keychain_value = self._kc_read_backup(account_num, email, cached=cached)
         except macos_keychain.KEYCHAIN_ERRORS:
-            return enc_value
+            # Unreadable, not "the .enc": the Keychain may hold a newer generation,
+            # and consuming this one could present a spent token.
+            if failed is not None:
+                failed.append(True)
+            return ""
         if credential_generation(keychain_value) <= credential_generation(enc_value):
             return enc_value
-        # A read path may not write from a process that cannot reach the keychain.
-        if macos_keychain.keychain_reachable(platform="darwin") is not False:
-            try:
-                self._backup_enc_path(account_num, email).unlink(missing_ok=True)
-            except OSError as e:
-                self._host._logger.warning(f"Could not remove a stale .enc: {e}")
         return keychain_value
 
     def _read_account_credentials_ex(

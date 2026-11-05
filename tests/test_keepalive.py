@@ -32,6 +32,7 @@ from claude_swap import (
     macos_keychain,
     oauth,
 )
+from claude_swap import switcher as switcher_module
 from claude_swap.keepalive import run_keepalive
 from claude_swap.models import Platform
 from claude_swap.settings import set_setting
@@ -499,12 +500,27 @@ class TestOtherStates:
         assert report["ok"] is True and report["action"] == "none"
         assert env.post.posts == []
 
-    def test_custom_profile_is_refused_before_touching_anything(self, env, monkeypatch, tmp_path):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "other"))
-        env.active(creds(expires_in_s=NEAR))
+    @pytest.mark.parametrize("variable", ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"])
+    @pytest.mark.parametrize("value", ["default", "other", "empty"])
+    @pytest.mark.parametrize("platform", [Platform.MACOS, Platform.LINUX], ids=["macos", "linux"])
+    def test_either_config_variable_set_to_anything_is_refused(
+        self, env, monkeypatch, variable, value, platform
+    ):
+        """Claude Code hashes even the default directory into its item's name."""
+        monkeypatch.setenv(
+            variable,
+            {"default": str(env.home / ".claude"), "other": str(env.home / "other"), "empty": ""}[value],
+        )
+        env.store.platform = platform
+        near = creds(expires_in_s=NEAR)
+        env.active(near)
+        env.file.write_text(near)
+        before = snapshot(env.home, env.keychain)
         report = env.run()
-        assert report["error"]["type"] == "refresh_failed"
+        assert report["ok"] is False and report["error"]["type"] == "refresh_failed"
+        assert "CLAUDE_CONFIG_DIR" in report["error"]["message"]
         assert env.post.posts == []
+        assert snapshot(env.home, env.keychain) == before
 
     def test_linux_refreshes_the_file_only(self, env):
         env.store.platform = Platform.LINUX
@@ -2166,3 +2182,67 @@ class TestSuccessorFollowsTheAccount:
             "consumedFp": oauth.credential_fingerprint(spent),
         })
         assert access_token(s._adopt_stashed_successor(*SLOT, spent)) == "AT-1"
+
+
+class TestIdentityIsCapturedWithTheCredential:
+    def test_move_after_the_lock_keeps_the_identity_and_the_retry_adopts(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["organizationUuid"] = "org-b"
+        s._write_json(s.sequence_file, data)
+        near = creds("AT-0", "RT-0", expires_in_s=-60)
+        s._write_account_credentials("2", "b@example.com", near)
+
+        real_lock = switcher_module.FileLock
+        armed = [True]
+
+        class MovesAfterTheGatesFirstRelease(real_lock):
+            def __exit__(self, *args):
+                super().__exit__(*args)
+                if armed[0] and self.lock_path == s.lock_file:
+                    armed[0] = False
+                    s.move_account("2", "7")
+
+        monkeypatch.setattr(switcher_module, "FileLock", MovesAfterTheGatesFirstRelease)
+        s.consume_backup_grant("2", "b@example.com", near)
+        monkeypatch.setattr(switcher_module, "FileLock", real_lock)
+        assert armed == [False] and rotating.posts == ["RT-0"]
+
+        rows = s._store._list_unclaimed_credentials()
+        assert [(row["email"], row["organizationUuid"]) for row in rows.values()] == [
+            ("b@example.com", "org-b")
+        ]
+        row = consumed_grants.entry(oauth.credential_fingerprint(near))
+        assert (row["email"], row["organizationUuid"]) == ("b@example.com", "org-b")
+
+        outcome = s.consume_backup_grant("7", "b@example.com", near)
+        assert outcome.error is None and access_token(outcome.credentials) == "AT-1"
+        assert rotating.posts == ["RT-0"]
+        assert s._store._list_unclaimed_credentials() == {}
+
+
+class TestDryRunChangesNothing:
+    def test_divergent_backup_copies_stay_byte_identical(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        # Slot 1's Keychain copy and its leftover .enc differ, and the older .enc is
+        # the one a read used to delete. The live stores differ as well.
+        s._write_account_credentials(*SLOT, creds("AT-kc", "RT-kc", expires_in_s=7200))
+        s._store._write_backup_enc(*SLOT, creds("AT-enc", "RT-enc", expires_in_s=100))
+        s._write_account_credentials("2", "b@example.com", creds("AT-b", "RT-b", expires_in_s=7200))
+        s._store._write_backup_enc("2", "b@example.com", creds("AT-b0", "RT-b0", expires_in_s=100))
+        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-K", "RT-K", expires_in_s=NEAR)
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            creds("AT-F", "RT-F", expires_in_s=NEAR - 10)
+        )
+        before = snapshot(temp_home, block_real_keychain)
+        assert any(name.endswith(".enc") for name in before["files"])
+        report = run_keepalive(new_process(), dry_run=True, ensure_file=True)
+        assert report["dryRun"] is True
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert rotating.posts == []

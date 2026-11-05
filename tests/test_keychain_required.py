@@ -555,6 +555,18 @@ class TestNoReadPathWrites:
         assert "organizationUuid" in s._get_sequence_data_migrated()["accounts"]["1"]
 
 
+class _RotatingEndpoint:
+    def __init__(self):
+        self.posts = []
+
+    def __call__(self, request, timeout=None):
+        self.posts.append(json.loads(request.data)["refresh_token"])
+        n = len(self.posts)
+        return io.BytesIO(json.dumps({
+            "access_token": f"AT-{n}", "refresh_token": f"RT-{n}", "expires_in": 28800,
+        }).encode())
+
+
 class TestEncDoesNotShadowR9:
     @pytest.fixture
     def store(self, temp_home):
@@ -576,10 +588,17 @@ class TestEncDoesNotShadowR9:
             "accessToken"
         ]
 
-    def test_R9_newer_keychain_wins_and_the_stale_enc_goes(self, store):
+    def test_R9_newer_keychain_wins_and_the_read_changes_nothing(self, store):
         enc = self._seed(store, enc_expires=100, keychain_expires=7200)
+        before = enc.read_bytes()
         assert self._access(store) == "AT-kc"
+        assert enc.read_bytes() == before
+
+    def test_R9_the_next_write_of_the_slot_removes_the_stale_enc(self, store):
+        enc = self._seed(store, enc_expires=100, keychain_expires=7200)
+        store._write_account_credentials("2", "b@example.com", creds("AT-new", "RT-new"))
         assert not enc.exists()
+        assert self._access(store) == "AT-new"
 
     def test_R9_newer_enc_still_wins(self, store):
         enc = self._seed(store, enc_expires=7200, keychain_expires=100)
@@ -593,7 +612,7 @@ class TestEncDoesNotShadowR9:
         del data["claudeAiOauth"]["refreshToken"]
         store._store._write_backup_enc("2", "b@example.com", json.dumps(data))
         assert self._access(store) == "AT-kc"
-        assert not enc.exists()
+        assert enc.exists()
 
     def test_R9_read_writes_nothing_when_the_keychain_is_unreachable(
         self, store, block_real_keychain
@@ -603,30 +622,62 @@ class TestEncDoesNotShadowR9:
         store._read_account_credentials("2", "b@example.com")
         assert enc.exists()
 
-    def test_R9_keychain_read_failure_falls_back_on_the_enc(self, store, monkeypatch):
+    def _backup_item_denied(self, monkeypatch):
+        real = macos_keychain.get_password
+
+        def denied(service, account):
+            if service == "claude-swap":
+                raise macos_keychain.KeychainError("denied")
+            return real(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", denied)
+
+    def test_item_read_failure_is_unreadable_not_the_enc(self, store, monkeypatch):
+        """Preflight passed, then this one item timed out or was denied."""
         self._seed(store, enc_expires=100, keychain_expires=7200)
-        monkeypatch.setattr(
-            macos_keychain, "get_password",
-            lambda *a: (_ for _ in ()).throw(macos_keychain.KeychainError("denied")),
-        )
-        assert self._access(store) == "AT-enc"
+        self._backup_item_denied(monkeypatch)
+        assert store._read_account_credentials_ex("2", "b@example.com") == ("", True)
+
+    def test_item_read_failure_defers_the_consume_gate(self, store, monkeypatch):
+        self._seed(store, enc_expires=100, keychain_expires=7200)
+        endpoint = _RotatingEndpoint()
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", endpoint)
+        self._backup_item_denied(monkeypatch)
+        stale = creds("AT-enc", "RT-enc", expires_in_s=100)
+        outcome = store.consume_backup_grant("2", "b@example.com", stale)
+        assert outcome.error == "transient" and outcome.credentials is None
+        assert endpoint.posts == []
+
+    @pytest.mark.parametrize("leftover_enc", [True, False], ids=["enc", "no-enc"])
+    @pytest.mark.parametrize("own_slot", [True, False], ids=["own-slot", "other-slot"])
+    def test_item_read_failure_defers_keepalive(
+        self, temp_home, block_real_keychain, monkeypatch, leftover_enc, own_slot
+    ):
+        s = macos_store(temp_home)
+        slot = ("1", "a@example.com") if own_slot else ("2", "b@example.com")
+        if leftover_enc:
+            s._store._write_backup_enc(*slot, creds("AT-enc", "RT-enc", expires_in_s=100))
+        live = creds("AT-K", "RT-K", expires_in_s=600)
+        block_real_keychain.data[ACTIVE_ITEM] = live
+        endpoint = _RotatingEndpoint()
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", endpoint)
+        real = macos_keychain.get_password
+
+        def denied(service, account):
+            if (service, account) == ("claude-swap", f"account-{slot[0]}-{slot[1]}"):
+                raise macos_keychain.KeychainError("denied")
+            return real(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", denied)
+        report = run_keepalive(s)
+        assert report["ok"] is False and report["error"]["type"] == "keychain_unavailable"
+        assert endpoint.posts == []
+        assert block_real_keychain.data[ACTIVE_ITEM] == live
 
     def test_R9_default_mode_keeps_enc_wins(self, temp_home):
         s = macos_store(temp_home)
         self._seed(s, enc_expires=100, keychain_expires=7200)
         assert self._access(s) == "AT-enc"
-
-
-class _RotatingEndpoint:
-    def __init__(self):
-        self.posts = []
-
-    def __call__(self, request, timeout=None):
-        self.posts.append(json.loads(request.data)["refresh_token"])
-        n = len(self.posts)
-        return io.BytesIO(json.dumps({
-            "access_token": f"AT-{n}", "refresh_token": f"RT-{n}", "expires_in": 28800,
-        }).encode())
 
 
 class TestRequiredModeFetchPathR10:

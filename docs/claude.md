@@ -403,7 +403,7 @@ With this on (macOS only; off by default), every command checks that the login k
 - commands that can write a credential (`switch`, `add`, `add-token`, `remove`, `import`, `move`, `swap`, `purge`, `run`, `auto`, `keepalive`) refuse before touching anything: exit 1, and under `--json` an error envelope with type `keychain_unavailable`;
 - `list`, `status` and the dashboard show cached usage with no fetch, no refresh and no writes, and `list --json` adds `keychainUnavailable: true`.
 
-A Keychain write that fails anyway never falls back to the plaintext file or an `.enc` backup; the command fails instead. Every refresh POST re-checks reachability first. A leftover `.enc` backup no longer outranks a newer Keychain copy, and is removed once the Keychain is reachable.
+A Keychain write that fails anyway never falls back to the plaintext file or an `.enc` backup; the command fails instead. Every refresh POST re-checks reachability first. A leftover `.enc` backup no longer outranks a newer Keychain copy, and the next Keychain write of that slot removes it; reading a backup changes nothing. If a backup's Keychain item cannot be read, the `.enc` is not used in its place: the refresh defers.
 
 A locked login keychain in the GUI session counts as unreachable, and the check does not raise an unlock dialog. `security show-keychain-info` calls `SecKeychainCopySettings` with interaction allowed, and it returns `errSecInteractionNotAllowed` (rc 36) in a daemon, which means the call wants user interaction, so on a locked keychain in a GUI session it can prompt. hswap therefore reads the lock state first with `SecKeychainGetStatus` after `SecKeychainSetUserInteractionAllowed(false)`, in its own process, and runs `show-keychain-info` only once the keychain is known to be unlocked. If the lock state cannot be read, the keychain counts as unreachable. A keychain that locks after this check can still prompt on the next item read, for at most the 5 seconds `security` is given.
 
@@ -449,7 +449,7 @@ A copy on the ledger never wins over a working copy, and a copy recorded for ano
 
 After every write, `keepalive` reads the file back when it should hold the login, retries once, and otherwise reports `refresh_failed` with "file store could not be updated". The Keychain and the slot still hold the login in that case, and the next run repairs the file.
 
-It always needs the login keychain on macOS, even with the setting off, and never falls back to the file. On Linux and Windows there is no Keychain: it refreshes the file only.
+It refuses to run with `CLAUDE_CONFIG_DIR` or `CLAUDE_SECURESTORAGE_CONFIG_DIR` set to anything, even the default directory, because Claude Code then uses a differently named Keychain item; the LaunchAgent above sets neither. It always needs the login keychain on macOS, even with the setting off, and never falls back to the file. On Linux and Windows there is no Keychain: it refreshes the file only.
 
 Every run, failures and `--dry-run` included, writes `cache/keepalive.json` in the store root (0600, no tokens, no paths), and `--json` prints the same object. The exit code is 0 when `ok`, 1 otherwise.
 

@@ -200,7 +200,8 @@ def try_refresh_oauth_credentials(
         )
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
-        _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
+        # Status only: this endpoint's body and the exception text may carry tokens.
+        _logger.debug("OAuth refresh failed: HTTP %s", e.code)
         # Permanent only when the server itself rejected the grant: a 4xx AND
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
@@ -225,7 +226,7 @@ def try_refresh_oauth_credentials(
                 return RefreshOutcome(None, err)
         return RefreshOutcome(None, "transient")
     except Exception as e:
-        _logger.debug("OAuth refresh failed: %r", e)
+        _logger.debug("OAuth refresh failed: %s", type(e).__name__)
         return RefreshOutcome(None, "transient")
 
 

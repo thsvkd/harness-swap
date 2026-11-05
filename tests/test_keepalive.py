@@ -5,6 +5,7 @@ fake token endpoint."""
 from __future__ import annotations
 
 import ast
+import base64
 import errno
 import hashlib
 import io
@@ -2246,3 +2247,143 @@ class TestDryRunChangesNothing:
         assert report["dryRun"] is True
         assert snapshot(temp_home, block_real_keychain) == before
         assert rotating.posts == []
+
+
+class TestStashIsPruned:
+    OLD = 32 * 24 * 3600
+
+    @pytest.fixture
+    def store(self, temp_home, block_real_keychain, rotating):
+        s = macos_store(temp_home)
+        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-live", "RT-live", expires_in_s=7200)
+        s._write_account_credentials(*SLOT, block_real_keychain.data[ACTIVE_ITEM])
+        return s
+
+    def _stash(self, s, value, *, age_s=None, **context):
+        entry_id = s._store._write_unclaimed_credential(value, {
+            "reason": "keepalive-split-brain",
+            "configSlot": "1",
+            "email": "a@example.com",
+            "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(value),
+            **context,
+        })
+        if age_s is not None:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age_s))
+            s._store._mutate_stash_manifest(
+                lambda rows: rows[entry_id].update(createdAt=stamp)
+            )
+        return entry_id
+
+    def _ids(self, s):
+        return set(s._store._list_unclaimed_credentials())
+
+    def _consumed(self, value, identity=IDENTITY["1"]):
+        consumed_grants.record(
+            oauth.credential_fingerprint(value), identity, consumed_grants.CONSUMED
+        )
+
+    def test_consumed_with_a_newer_unspent_login_in_a_store_goes(self, store):
+        spent = creds("AT-0", "RT-0", expires_in_s=100)
+        self._consumed(spent)
+        self._stash(store, spent)
+        run_keepalive(store)
+        assert self._ids(store) == set()
+
+    def test_consumed_with_its_successor_in_another_entry_goes(self, store):
+        spent = creds("AT-0", "RT-0", expires_in_s=30000)  # nothing in a store is newer
+        self._consumed(spent)
+        gone = self._stash(store, spent)
+        kept = self._stash(
+            store, creds("AT-1", "RT-1", expires_in_s=30000),
+            consumedFp=oauth.credential_fingerprint(spent),
+        )
+        run_keepalive(store)
+        ids = self._ids(store)
+        assert gone not in ids and kept in ids
+
+    def test_consumed_with_no_successor_stays(self, store):
+        spent = creds("AT-0", "RT-0", expires_in_s=30000)
+        self._consumed(spent)
+        entry = self._stash(store, spent)
+        run_keepalive(store)
+        assert entry in self._ids(store)
+
+    def test_a_successor_that_is_itself_spent_does_not_count(self, store, block_real_keychain):
+        live = block_real_keychain.data[ACTIVE_ITEM]
+        self._consumed(live)
+        spent = creds("AT-0", "RT-0", expires_in_s=100)
+        self._consumed(spent)
+        entry = self._stash(store, spent)
+        run_keepalive(store)
+        assert entry in self._ids(store)
+
+    def test_consumed_for_another_account_looks_at_that_accounts_slot(self, store):
+        b = ("b@example.com", "")
+        spent = creds("AT-b0", "RT-b0", expires_in_s=100)
+        self._consumed(spent, b)
+        entry = self._stash(store, spent)
+        run_keepalive(store)
+        assert entry in self._ids(store)  # slot 2 holds nothing newer, whatever the live login is
+        store._write_account_credentials("2", "b@example.com", creds("AT-b1", "RT-b1"))
+        run_keepalive(new_process())
+        assert entry not in self._ids(store)
+
+    def test_older_than_31_days_by_its_timestamp_goes(self, store):
+        entry = self._stash(store, creds("AT-0", "RT-0"), age_s=self.OLD)
+        run_keepalive(store)
+        assert entry not in self._ids(store)
+
+    def test_younger_than_31_days_stays(self, store):
+        entry = self._stash(store, creds("AT-0", "RT-0"), age_s=30 * 24 * 3600)
+        run_keepalive(store)
+        assert entry in self._ids(store)
+
+    def test_no_timestamp_goes_by_the_file_mtime(self, store):
+        old = store._store._stash_entry_path("orphan-old")
+        new = store._store._stash_entry_path("orphan-new")
+        encoded = base64.b64encode(creds("AT-o", "RT-o").encode())
+        store.credentials_dir.mkdir(parents=True, exist_ok=True)
+        for path in (old, new):
+            path.write_bytes(encoded)
+        os.utime(old, (time.time() - self.OLD, time.time() - self.OLD))
+        run_keepalive(store)
+        assert not old.exists() and new.exists()
+
+    @pytest.mark.parametrize("age_s", [None, 400 * 24 * 3600], ids=["new", "old"])
+    def test_a_reservation_is_never_deleted(self, store, age_s):
+        value = creds("AT-0", "RT-0", expires_in_s=100)
+        consumed_grants.reserve(oauth.credential_fingerprint(value), IDENTITY["1"])
+        entry = self._stash(store, value, age_s=age_s)
+        run_keepalive(store)
+        assert entry in self._ids(store)
+
+    def test_dry_run_deletes_nothing(self, store, temp_home, block_real_keychain):
+        self._stash(store, creds("AT-0", "RT-0"), age_s=self.OLD)
+        spent = creds("AT-1", "RT-1", expires_in_s=100)
+        self._consumed(spent)
+        self._stash(store, spent)
+        before = snapshot(temp_home, block_real_keychain)
+        report = run_keepalive(new_process(), dry_run=True)
+        assert report["ok"] is True
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_an_unreadable_manifest_deletes_nothing(self, store, monkeypatch):
+        entry = self._stash(store, creds("AT-0", "RT-0"), age_s=self.OLD)
+        monkeypatch.setattr(store._store, "_read_stash_manifest_ex", lambda: ({}, "unreadable"))
+        keepalive._prune_stash(keepalive._read_active(store), "", "")
+        monkeypatch.undo()
+        assert entry in self._ids(store)
+
+    def test_an_unreadable_entry_stays(self, store, monkeypatch):
+        entry = self._stash(store, creds("AT-0", "RT-0"), age_s=self.OLD)
+        monkeypatch.setattr(store._store, "_read_unclaimed_credential", lambda i: ("", True))
+        keepalive._prune_stash(keepalive._read_active(store), "", "")
+        monkeypatch.undo()
+        assert entry in self._ids(store)
+
+    def test_pruning_runs_without_a_login_too(self, temp_home, block_real_keychain, rotating):
+        s = macos_store(temp_home)
+        entry = self._stash(s, creds("AT-0", "RT-0"), age_s=self.OLD)
+        assert run_keepalive(s)["error"]["type"] == "no_credentials"
+        assert entry not in self._ids(s)

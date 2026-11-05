@@ -28,7 +28,7 @@ from claude_swap.settings import (
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
 
-from .keychain_helpers import ACTIVE_ITEM, creds, macos_store, snapshot
+from .keychain_helpers import ACTIVE_ITEM, FakeSecurity, creds, macos_store, snapshot
 
 LOGIN = "/Users/me/Library/Keychains/login.keychain-db"
 
@@ -799,3 +799,139 @@ class TestEnvOverrideCannotLoosen:
         with pytest.raises(KeychainUnavailableError):
             s._write_credentials(creds())
         assert not (temp_home / ".claude" / ".credentials.json").exists()
+
+
+@pytest.mark.no_keychain_fake
+class TestKeychainThatManglesWithRcZero:
+    """The real wrapper over a fake `security` that exits 0 and stores something else."""
+
+    @pytest.fixture
+    def mangling(self, temp_home, monkeypatch):
+        monkeypatch.setattr(macos_keychain, "keychain_reachable", lambda *a, **kw: True)
+        fake = FakeSecurity()
+        monkeypatch.setattr("claude_swap.macos_keychain.subprocess.run", fake)
+        s = macos_store(temp_home)
+        endpoint = _RotatingEndpoint()
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", endpoint)
+        return s, fake, endpoint
+
+    def _credential(self, access, refresh, expires_in_s):
+        # Real size, so these take the quoted `-w` path a real login takes.
+        return creds(access + "A" * 1000, refresh + "B" * 1000, expires_in_s=expires_in_s)
+
+    def test_active_write_fails_closed_and_no_plaintext_appears(self, mangling, temp_home):
+        s, fake, _ = mangling
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        fake.mangle = lambda value: value.replace('"', "")
+        with pytest.raises(KeychainUnavailableError):
+            s._write_credentials(self._credential("AT", "RT", 7200))
+        assert not (temp_home / ".claude" / ".credentials.json").exists()
+        assert not list(s.credentials_dir.glob("*.enc"))
+
+    def test_keepalive_direct_post_keeps_the_successor_in_the_stash(self, mangling, temp_home):
+        s, fake, endpoint = mangling
+        near = self._credential("AT-0", "RT-0", 600)
+        fake.items[ACTIVE_ITEM] = near
+        s._store._write_account_credentials("1", "a@example.com", self._credential("AT-old", "RT-old", -100))
+        fake.mangle = lambda value: value.replace('"', "")
+        report = run_keepalive(s)
+        assert report["ok"] is False and report["error"]["type"] == "keychain_unavailable"
+        assert len(endpoint.posts) == 1
+        rows = s._store._list_unclaimed_credentials()
+        kept = [s._store._read_unclaimed_credential(i)[0] for i in rows]
+        assert [oauth.extract_access_token(value) for value in kept] == ["AT-1"]
+        assert [row["consumedFp"] for row in rows.values()] == [oauth.credential_fingerprint(near)]
+        assert consumed_grants.entry(oauth.credential_fingerprint(near))["state"] == "consumed"
+        assert not (temp_home / ".claude" / ".credentials.json").exists()
+
+    def test_consume_gate_keeps_the_successor_in_the_stash(self, mangling):
+        s, fake, endpoint = mangling
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        stale = self._credential("AT-b", "RT-b", -100)
+        s._store._write_account_credentials("2", "b@example.com", stale)
+        fake.mangle = lambda value: value.replace('"', "")
+        outcome = s.consume_backup_grant("2", "b@example.com", stale)
+        assert outcome.error == "transient" and outcome.stashed is True
+        rows = s._store._list_unclaimed_credentials()
+        kept = [s._store._read_unclaimed_credential(i)[0] for i in rows]
+        assert [oauth.extract_access_token(value) for value in kept] == ["AT-1"]
+        assert len(endpoint.posts) == 1
+
+    def test_default_mode_falls_back_to_the_file_as_for_any_failed_write(self, mangling, temp_home):
+        s, fake, _ = mangling
+        fake.mangle = lambda value: value.replace('"', "")
+        value = self._credential("AT", "RT", 7200)
+        s._write_credentials(value)
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == value
+        assert ACTIVE_ITEM not in fake.items  # the fallback clears what would shadow it
+
+    def test_a_faithful_keychain_round_trips_a_real_sized_credential(self, mangling):
+        s, fake, _ = mangling
+        value = self._credential("AT", "RT", 7200)
+        s._write_credentials(value)
+        assert fake.items[ACTIVE_ITEM] == value
+
+
+class TestSelftestCommand:
+    def _run(self, capsys, *argv, platform=Platform.MACOS):
+        code = 0
+        with (
+            patch("claude_swap.cli.Platform.detect", return_value=platform),
+            patch.object(sys, "argv", ["cswap", "keychain-selftest", *argv]),
+        ):
+            try:
+                cli.main()
+            except SystemExit as exc:
+                code = exc.code
+        return (code, *capsys.readouterr())
+
+    @pytest.fixture
+    def security(self, monkeypatch):
+        fake = FakeSecurity()
+        monkeypatch.setattr(macos_keychain, "keychain_reachable", lambda *a, **kw: True)
+        monkeypatch.setattr("claude_swap.macos_keychain.subprocess.run", fake)
+        return fake
+
+    @pytest.mark.no_keychain_fake
+    def test_ok(self, security, capsys):
+        code, out, _ = self._run(capsys, "--json")
+        assert code == 0 and json.loads(out) == {"ok": True}
+        assert security.items == {}
+
+    @pytest.mark.no_keychain_fake
+    def test_mangling_fails_and_never_prints_the_value(self, security, capsys):
+        security.mangle = lambda value: value.replace("\\", "")
+        code, out, err = self._run(capsys, "--json")
+        report = json.loads(out)
+        assert code == 1 and report["ok"] is False
+        assert report["error"]["type"] == "selftest_failed"
+        assert security.items == {}
+        for text in (out, err):
+            assert "AbC-_" not in text and "HOME" not in text
+
+    @pytest.mark.no_keychain_fake
+    def test_a_failed_delete_exits_one(self, security, capsys):
+        security.delete_rc = 45
+        code, out, _ = self._run(capsys, "--json")
+        assert code == 1 and json.loads(out)["ok"] is False
+
+    @pytest.mark.no_keychain_fake
+    def test_human_output(self, security, capsys):
+        code, out, _ = self._run(capsys)
+        assert code == 0 and "ok" in out and "AbC-_" not in out
+        security.mangle = lambda value: value[:-1]
+        code, out, err = self._run(capsys)
+        assert code == 1 and "Error:" in err and "AbC-_" not in out + err
+
+    def test_refuses_when_the_keychain_is_out_of_reach(self, block_real_keychain, capsys):
+        block_real_keychain.reachable = False
+        code, out, _ = self._run(capsys, "--json")
+        report = json.loads(out)
+        assert code == 1 and report["ok"] is False
+        assert report["error"]["type"] == "keychain_unavailable"
+        assert block_real_keychain.data == {}
+
+    @pytest.mark.parametrize("flags, expected", [((), "unsupported\n"), (("--json",), '{"unsupported": true}\n')])
+    def test_unsupported_elsewhere_exits_zero(self, capsys, flags, expected):
+        code, out, _ = self._run(capsys, *flags, platform=Platform.LINUX)
+        assert code == 0 and out == expected

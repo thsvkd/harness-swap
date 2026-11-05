@@ -9,7 +9,7 @@ import os
 import re
 import sys
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, macos_keychain, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
@@ -957,6 +957,45 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+def _keychain_selftest_command(argv: list[str]) -> None:
+    """Handle `cswap keychain-selftest [--json]`. Pre-dispatched: it needs no store."""
+    from claude_swap.credentials import KEYCHAIN_UNAVAILABLE_MESSAGE
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} keychain-selftest",
+        description=(
+            "Check that a credential-sized value survives a Keychain write, using a "
+            "throwaway item that is always deleted. macOS only. Exit code 0 when ok, "
+            "1 otherwise."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Print the result as JSON on stdout")
+    args = parser.parse_args(argv)
+
+    def finish(report: dict, text: str, code: int) -> None:
+        if args.json:
+            print(json.dumps(report))
+        elif code:
+            error(f"Error: {text}")
+        else:
+            print(text)
+        sys.exit(code)
+
+    def failure(kind: str, message: str) -> None:
+        finish({"ok": False, "error": {"type": kind, "message": message}}, message, 1)
+
+    if Platform.detect() != Platform.MACOS:
+        finish({"unsupported": True}, "unsupported", 0)
+    if macos_keychain.keychain_reachable(platform="darwin") is False:
+        failure("keychain_unavailable", KEYCHAIN_UNAVAILABLE_MESSAGE)
+    if not macos_keychain.selftest():
+        failure(
+            "selftest_failed",
+            "A test value did not survive the Keychain round trip, or could not be removed.",
+        )
+    finish({"ok": True}, "Keychain round trip ok", 0)
+
+
 def _keepalive_command(argv: list[str]) -> None:
     """Handle `cswap keepalive [--ahead SECONDS] [--ensure-file] [--dry-run] [--json]`.
 
@@ -1280,6 +1319,9 @@ def main() -> None:
     if argv and argv[0] == "keepalive":
         _keepalive_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "keychain-selftest":
+        _keychain_selftest_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1352,6 +1394,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s keepalive                  sync and refresh the active login ahead of expiry
+  %(prog)s keychain-selftest          check a credential survives a Keychain write
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

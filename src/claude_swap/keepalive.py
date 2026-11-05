@@ -22,6 +22,7 @@ import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from datetime import UTC, datetime
 from typing import NamedTuple
 
 from claude_swap import consumed_grants, macos_keychain, oauth
@@ -50,6 +51,9 @@ _POST_TIMEOUT_S = 6.0
 # The consume lock is named after the slot, so a switch landing while we wait for
 # it means releasing everything and starting over.
 _SLOT_ATTEMPTS = 3
+# Past a refresh token's life (about 30 days), so an entry this old holds nothing
+# that still works.
+_STASH_MAX_AGE_S = 31 * 24 * 3600
 _UNMANAGED = "unmanaged"  # the stash's and the ledger's name for "no slot"
 
 _MESSAGES = {
@@ -213,6 +217,8 @@ def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict
     switcher = active.switcher
     store = switcher._store
     keychain, file_creds = _read_stores(store, switcher.platform == Platform.MACOS)
+    if not dry_run:
+        _prune_stash(active, keychain, file_creds)
     if not keychain and not file_creds:
         if store._read_managed_key():
             report["note"] = "api_key"  # nothing here to sync or refresh
@@ -246,6 +252,70 @@ def _read_stores(store, macos: bool) -> tuple[str, str]:
     path = get_credentials_path()
     file_creds = path.read_text(encoding="utf-8") if path.exists() else ""
     return keychain, file_creds if file_creds.strip() else ""
+
+
+def _entry_age_s(store, entry_id: str, row: dict) -> float | None:
+    try:
+        created = datetime.strptime(str(row.get("createdAt")), "%Y-%m-%dT%H:%M:%SZ")
+        return time.time() - created.replace(tzinfo=UTC).timestamp()
+    except ValueError:
+        pass
+    try:
+        return time.time() - store._stash_entry_path(entry_id).stat().st_mtime
+    except OSError:
+        return None
+
+
+def _grant_has_successor(
+    active, recorded: dict, fingerprint: str, value: str, rows: dict, live: tuple
+) -> bool:
+    """A successor of this spent grant provably exists elsewhere: another entry names
+    it as what it replaced, or a store of that account holds a newer unspent login."""
+    if any(row.get("consumedFp") == fingerprint for row in rows.values()):
+        return True
+    switcher = active.switcher
+    account = (recorded["email"], recorded["organizationUuid"])
+    holders = []
+    for num, row in active.accounts.items():
+        if (row.get("email"), row.get("organizationUuid", "") or "") == account:
+            holders.append(switcher._read_account_credentials_ex(num, row.get("email", ""))[0])
+    if account == active.identity:
+        holders += live
+    return any(
+        creds
+        and _oauth_payload(creds).get("refreshToken")
+        and not _is_spent(creds)
+        and credential_generation(creds) > credential_generation(value)
+        for creds in holders
+    )
+
+
+def _prune_stash(active, keychain, file_creds) -> None:
+    """Stash entries are base64 on disk, so they do not stay past their use. An entry
+    goes when its grant is consumed and has a successor elsewhere, or when it is too
+    old to hold a working token. When unsure it stays, and a reservation always does."""
+    switcher = active.switcher
+    store = switcher._store
+    if store._read_stash_manifest_ex()[1] != "ok":
+        return  # orphan files could be the only record: see _adopt_stashed_successor
+    rows = store._list_unclaimed_credentials()
+    for entry_id, row in rows.items():
+        value, unreadable = store._read_unclaimed_credential(entry_id)
+        fingerprint = row.get("fingerprint") or oauth.credential_fingerprint(value)
+        if unreadable or not fingerprint:
+            continue
+        recorded = consumed_grants.entry(fingerprint)
+        if recorded is not None and recorded["state"] == consumed_grants.RESERVED:
+            continue
+        others = {other: r for other, r in rows.items() if other != entry_id}
+        age = _entry_age_s(store, entry_id, row)
+        if (age is not None and age > _STASH_MAX_AGE_S) or (
+            recorded is not None
+            and _grant_has_successor(
+                active, recorded, fingerprint, value, others, (keychain, file_creds)
+            )
+        ):
+            switcher._retire_stash_entry(entry_id, active.slot or _UNMANAGED)
 
 
 def _store_holds(store, macos: bool, parked: str) -> bool:

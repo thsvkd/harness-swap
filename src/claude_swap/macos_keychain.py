@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import secrets
 import subprocess
 import sys
 from collections.abc import Callable
@@ -68,6 +69,9 @@ _SECURITY = "/usr/bin/security"
 _SECURITY_FRAMEWORK = "/System/Library/Frameworks/Security.framework/Security"
 _CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
 _UNLOCK_STATE_STATUS = 1  # kSecUnlockStateStatus
+# Every character `-w` quoting could get wrong, at a real credential's size: past
+# what the hex form can carry, so `set_password` takes the path real logins take.
+_SELFTEST_VALUE = '{"a":"b\\"c \\\\ \'d\' $HOME %s é"}' + "AbC-_.~09" * 240
 
 
 class KeychainError(Exception):
@@ -172,7 +176,9 @@ def set_password(service: str, account: str, password: str) -> None:
     The secret only ever travels on ``security -i``'s stdin: as hex (``-X``) when
     that fits the line buffer, else quoted (``-w``), which a typical credential's
     JSON does. A value neither form can carry raises :class:`KeychainError`, as
-    does a non-zero exit or a timeout. Messages carry no argv and no stderr.
+    does a non-zero exit, a timeout, or an item that does not read back as what was
+    sent: `security -i` exits 0 whatever its quoting did to the value. Messages
+    carry no argv, no stderr and no value.
     """
     prefix = f"add-generic-password -U -a {_quote(account)} -s {_quote(service)}"
     command = f"{prefix} -X {password.encode('utf-8').hex()}\n"
@@ -198,6 +204,9 @@ def set_password(service: str, account: str, password: str) -> None:
         ) from None
     if result.returncode != 0:
         raise KeychainError(f"security add-generic-password failed (rc={result.returncode})")
+    # `-w` prints the whole value as hex if any byte is not printable: same bytes.
+    if get_password(service, account) not in (password, password.encode("utf-8").hex()):
+        raise KeychainError("security add-generic-password stored a different value")
 
 
 def delete_password(service: str, account: str) -> None:
@@ -222,6 +231,26 @@ def delete_password(service: str, account: str) -> None:
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
     )
+
+
+def selftest() -> bool:
+    """Write, read back and delete a throwaway item through `set_password`, the path
+    real credentials take. True only if the value matched and the item is gone."""
+    service = f"hswap-selftest-{secrets.token_hex(8)}"
+    account = keychain_account_name()
+    matched = deleted = False
+    try:
+        set_password(service, account, _SELFTEST_VALUE)
+        matched = True
+    except KEYCHAIN_ERRORS:
+        pass
+    finally:
+        try:
+            delete_password(service, account)
+            deleted = True
+        except KEYCHAIN_ERRORS:
+            pass
+    return matched and deleted
 
 
 def _run_security(args: list[str]) -> subprocess.CompletedProcess:

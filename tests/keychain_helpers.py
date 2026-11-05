@@ -4,6 +4,7 @@ keychain-required and keepalive tests. Tokens are synthetic."""
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -74,3 +75,88 @@ def snapshot(home: Path, keychain) -> dict:
         and path.name != "keepalive.json"
     }
     return {"files": files, "keychain": dict(keychain.data)}
+
+
+def split_line(line):
+    """`security -i`'s tokenizer (Security/SecurityTool/macOS/security.c, split_line):
+    quotes delimit, and a backslash copies the next character literally."""
+    args, current, quote, escaped, in_arg = [], [], None, False, False
+    for ch in line.rstrip("\n"):
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped, in_arg = True, True
+        elif quote:
+            if ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in "\"'":
+            quote, in_arg = ch, True
+        elif ch.isspace():
+            if in_arg:
+                args.append("".join(current))
+                current, in_arg = [], False
+        else:
+            current.append(ch)
+            in_arg = True
+    if in_arg:
+        args.append("".join(current))
+    return args
+
+
+def stored_value(line):
+    """What `add-generic-password` stores from this stdin line."""
+    args = split_line(line)
+    assert args[:2] == ["add-generic-password", "-U"]
+    assert "\n" not in line.rstrip("\n")
+    if "-X" in args:
+        return bytes.fromhex(args[args.index("-X") + 1]).decode()
+    return args[args.index("-w") + 1]
+
+
+class FakeSecurity:
+    """`subprocess.run` for `/usr/bin/security`: parses `-i` lines the way the real
+    tool does and keeps items in memory. ``mangle`` is what its quoting did to a value
+    while still exiting 0."""
+
+    def __init__(self, mangle=None, write_rc=0, delete_rc=0):
+        self.items = {}
+        self.stdin = []
+        self.written = []
+        self.deleted = []
+        self.mangle = mangle or (lambda value: value)
+        self.write_rc = write_rc
+        self.delete_rc = delete_rc
+
+    def _completed(self, args, rc, stdout=""):
+        return subprocess.CompletedProcess(args, rc, stdout=stdout, stderr="")
+
+    def __call__(self, args, **kwargs):
+        if args[1:] == ["-i"]:
+            line = kwargs["input"]
+            self.stdin.append(line)
+            parsed = split_line(line)
+            key = (parsed[parsed.index("-s") + 1], parsed[parsed.index("-a") + 1])
+            self.written.append(key)
+            if self.write_rc:
+                return self._completed(args, self.write_rc)
+            value = self.mangle(stored_value(line))
+            if value is not None:
+                self.items[key] = value
+            return self._completed(args, 0)
+        key = (args[args.index("-s") + 1], args[args.index("-a") + 1])
+        if args[1] == "find-generic-password":
+            value = self.items.get(key)
+            if value is None:
+                return self._completed(args, 44)
+            # keychain_find.c: hex for the whole value if any byte fails isprint.
+            raw = value.encode()
+            printable = all(0x20 <= byte <= 0x7e for byte in raw)
+            return self._completed(args, 0, (value if printable else raw.hex()) + "\n")
+        assert args[1] == "delete-generic-password", args
+        self.deleted.append(key)
+        if self.delete_rc:
+            return self._completed(args, self.delete_rc)
+        return self._completed(args, 0 if self.items.pop(key, None) is not None else 44)

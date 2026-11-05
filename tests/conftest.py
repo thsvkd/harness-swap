@@ -449,6 +449,7 @@ class _KeychainStore:
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], str] = {}
+        self.reachable = True  # what the keychain preflight answers
 
     # Mirrors the ``macos_keychain`` (security CLI) contract.
     def get_password(self, service: str, account: str) -> str | None:
@@ -462,6 +463,9 @@ class _KeychainStore:
 
     def delete_password(self, service: str, account: str) -> None:
         self.data.pop((service, account), None)  # absent = no-op (rc 44)
+
+    def keychain_reachable(self, runner=None, *, platform=None) -> bool:
+        return self.reachable
 
 
 def _make_fake_keyring() -> types.ModuleType:
@@ -528,7 +532,7 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     # hswap and the harnesses it manages: every location must resolve under
     # the isolated $HOME unless a test sets it explicitly.
-    for name in ("HSWAP_HOME", "HSWAP_TRUSTED_PLUGINS", "CODEX_HOME", "GROK_HOME"):
+    for name in ("HSWAP_HOME", "HSWAP_TRUSTED_PLUGINS", "HSWAP_REQUIRE_KEYCHAIN", "CODEX_HOME", "GROK_HOME"):
         monkeypatch.delenv(name, raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
@@ -562,6 +566,7 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "item_exists", store.item_exists)
     monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
     monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
+    monkeypatch.setattr(_macos_keychain, "keychain_reachable", store.keychain_reachable)
     monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
     yield store
 

@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch``, ``ui``, ``run`` and ``updates`` sections; other sections can be added
+``autoswitch``, ``ui``, ``run``, ``updates`` and ``credentials`` sections; other sections can be added
 additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
@@ -95,11 +95,21 @@ class UpdateSettings:
     check: bool = True
 
 
+@dataclass(frozen=True)
+class CredentialSettings:
+    """Credential store policy (``credentials`` section). ``require_keychain``
+    refuses to work from a process that cannot reach the macOS login keychain,
+    instead of falling back to the plaintext file and ``.enc`` backups."""
+
+    require_keychain: bool = False
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "run": RunSettings,
     "updates": UpdateSettings,
+    "credentials": CredentialSettings,
 }
 
 
@@ -183,6 +193,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "updates", "check", "check", "bool",
             help="Check PyPI once a day and print a hint when a newer release exists",
+        ),
+        SettingSpec(
+            "credentials", "requireKeychain", "require_keychain", "bool",
+            help="macOS: refuse credential writes unless the login keychain is reachable (env: HSWAP_REQUIRE_KEYCHAIN=1|0)",
         ),
     )
 }
@@ -326,6 +340,23 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
         )
         return default
     return UpdateSettings(check=check)
+
+
+def load_credential_settings(backup_root: Path) -> CredentialSettings:
+    """Load the credentials section; missing/corrupt file or non-bool → default."""
+    section = _read_raw(settings_path(backup_root)).get("credentials")
+    value = section.get("requireKeychain") if isinstance(section, dict) else None
+    if not isinstance(value, bool):
+        return CredentialSettings()
+    return CredentialSettings(require_keychain=value)
+
+
+def require_keychain(backup_root: Path) -> bool:
+    """Keychain-required mode: ``HSWAP_REQUIRE_KEYCHAIN=1|0`` wins over the setting."""
+    env = os.environ.get("HSWAP_REQUIRE_KEYCHAIN")
+    if env in ("0", "1"):
+        return env == "1"
+    return load_credential_settings(backup_root).require_keychain
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -501,6 +532,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "ui": load_ui_settings(backup_root),
         "run": load_run_settings(backup_root),
         "updates": load_update_settings(backup_root),
+        "credentials": load_credential_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

@@ -915,6 +915,7 @@ Defaults live in settings.json in the backup root; flags override them.
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
+        switcher.refuse_if_keychain_unavailable()
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
         engine = AutoSwitchEngine(
             switcher,

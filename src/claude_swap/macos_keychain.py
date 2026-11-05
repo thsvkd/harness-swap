@@ -37,6 +37,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
 
 from claude_swap import spawn
 
@@ -226,3 +229,61 @@ def delete_password(service: str, account: str) -> None:
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
     )
+
+
+def _run_security(args: list[str]) -> subprocess.CompletedProcess:
+    return spawn.run(
+        [_SECURITY, *args], capture_output=True, text=True, timeout=_TIMEOUT
+    )
+
+
+def _listed_paths(output: str) -> list[str]:
+    """Paths from ``security`` listing output: one quoted path per line."""
+    return [line.strip().strip('"') for line in output.splitlines() if line.strip()]
+
+
+def _login_keychain_path(runner: Callable[[list[str]], subprocess.CompletedProcess]) -> str:
+    """The login keychain's path, as ``security`` reports it.
+
+    Only a path inside the user's own keychain directory counts: a daemon gets
+    ``System.keychain`` here, which would pass both preflight conditions without
+    saying anything about the login keychain.
+    """
+    keychains = Path.home() / "Library" / "Keychains"
+    for args in (["login-keychain"], ["default-keychain", "-d", "user"]):
+        try:
+            result = runner(args)
+        except KEYCHAIN_ERRORS:
+            continue
+        paths = _listed_paths(result.stdout) if result.returncode == 0 else []
+        if paths and Path(os.path.realpath(paths[0])).parent == Path(os.path.realpath(keychains)):
+            return paths[0]
+    return str(keychains / "login.keychain-db")
+
+
+def keychain_reachable(
+    runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
+    *,
+    platform: str = sys.platform,
+) -> bool | None:
+    """Can this process actually use the login keychain? ``None`` off macOS.
+
+    A find-generic-password rc 44 proves nothing: a LaunchDaemon or an SSH session
+    gets it for an item that exists, because the login keychain is not in its
+    search list. So this asks the two questions that do separate them: is the
+    login keychain in this process's search list, and does it answer
+    ``show-keychain-info`` (rc 36 when no user session can unlock it)?
+    """
+    if platform != "darwin":
+        return None
+    runner = runner or _run_security
+    try:
+        login = _login_keychain_path(runner)
+        listed = runner(["list-keychains"])
+        if listed.returncode != 0 or os.path.realpath(login) not in {
+            os.path.realpath(path) for path in _listed_paths(listed.stdout)
+        }:
+            return False
+        return runner(["show-keychain-info", login]).returncode == 0
+    except KEYCHAIN_ERRORS:
+        return False

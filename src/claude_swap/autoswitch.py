@@ -910,6 +910,7 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
+            self.switcher.refuse_if_keychain_unavailable()
             outcome = self._tick_inner()
             self._persist_health_counters(self._health_account)
             return outcome

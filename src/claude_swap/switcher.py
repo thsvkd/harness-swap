@@ -17,6 +17,7 @@ from pathlib import Path
 from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
+    KeychainUnavailableError,
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
@@ -44,6 +45,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
     CLAUDE_CODE_KEYCHAIN_SERVICE,
+    KEYCHAIN_UNAVAILABLE_MESSAGE,
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
@@ -92,7 +94,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    parse_model_names,
+    require_keychain,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -106,6 +113,9 @@ from claude_swap.usage_store import (
 KEYRING_SERVICE = "claude-code"
 
 # SECURITY_SERVICE and CLAUDE_CODE_KEYCHAIN_SERVICE now live in credentials.py
+# How long a display path may reuse the keychain preflight (three `security`
+# spawns); a dashboard repaints every few seconds. Writers always re-ask.
+KEYCHAIN_GATE_TTL_S = 30.0
 # (storage concerns); re-exported above for migrations.py and the test suite.
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
@@ -350,6 +360,7 @@ class ClaudeAccountSwitcher:
         # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
+        self._keychain_gate: tuple[float, bool] | None = None
 
         # The active read's verdict, PER THREAD. Set by _build_accounts_info
         # from the active slot's own read; consumed later by the usage
@@ -621,6 +632,26 @@ class ClaudeAccountSwitcher:
 
     def _use_keychain(self) -> bool:
         return self._store._use_keychain()
+
+    def keychain_gate_closed(self, *, fresh: bool = False) -> bool:
+        """Keychain-required mode is on and the login keychain is out of reach.
+
+        ``fresh`` re-asks ``security``, for a command about to write. Display
+        paths may run every few seconds, so they take a short-lived answer.
+        """
+        if self.platform != Platform.MACOS or not require_keychain(self.backup_dir):
+            return False
+        now = time.monotonic()
+        cached = self._keychain_gate
+        if fresh or cached is None or now - cached[0] > KEYCHAIN_GATE_TTL_S:
+            cached = (now, macos_keychain.keychain_reachable(platform="darwin") is False)
+            self._keychain_gate = cached
+        return cached[1]
+
+    def refuse_if_keychain_unavailable(self) -> None:
+        """The first step of every command that can write a credential."""
+        if self.keychain_gate_closed(fresh=True):
+            raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
 
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
@@ -1080,6 +1111,7 @@ class ClaudeAccountSwitcher:
 
         Returns the two resolved slot numbers ``(first_num, second_num)``.
         """
+        self.refuse_if_keychain_unavailable()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -1514,6 +1546,7 @@ class ClaudeAccountSwitcher:
         Returns ``(source_num, target_num, swapped)`` where ``swapped`` is True
         when an occupant was displaced.
         """
+        self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -2252,6 +2285,11 @@ class ClaudeAccountSwitcher:
 
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
         """
+        # Nothing consumed and nothing to blame on the slot; the POST must not
+        # run when its successor could not be stored.
+        if self.keychain_gate_closed():
+            return oauth.RefreshOutcome(None, "transient")
+
         # Store-resolution parity: CC ≥2.1.220 honors
         # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
         # mirrors that resolution on the CAPTURE path (#205 —
@@ -3731,6 +3769,7 @@ class ClaudeAccountSwitcher:
             alias: Optional short display alias to set on this account.
                   When omitted, an existing alias on the slot is preserved.
         """
+        self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         self._setup_directories()
         self._init_sequence_file()
@@ -3995,6 +4034,7 @@ class ClaudeAccountSwitcher:
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
         """
+        self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         import getpass
 
@@ -4183,6 +4223,7 @@ class ClaudeAccountSwitcher:
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
         the TUI, which collects confirmation before calling).
         """
+        self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -4273,7 +4314,10 @@ class ClaudeAccountSwitcher:
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
         """
-        data = self._get_sequence_data_migrated() or {}
+        # Cached view: no Keychain read (none can be trusted here) and no
+        # org-field migration write. The rows' creds stay empty.
+        closed = self.keychain_gate_closed()
+        data = (self._get_sequence_data() if closed else self._get_sequence_data_migrated()) or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
@@ -4295,7 +4339,9 @@ class ClaudeAccountSwitcher:
             alias = account.get("alias", "") or ""
             is_active = str(num) == active_num
 
-            if is_active:
+            if closed:
+                creds = ""
+            elif is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
@@ -5248,6 +5294,8 @@ class ClaudeAccountSwitcher:
         # Scoped-window models so the 429-stale trust bound honors per-model
         # (e.g. Fable) resets, matching the poll planner's window view.
         _threshold, _weekly_threshold, models = self._poll_policy_inputs()
+        if self.keychain_gate_closed():
+            return store.entries(identities, models)  # no fetch, refresh or write
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
@@ -5777,7 +5825,10 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
-                    login_expires_at=oauth.login_expires_at_iso(creds),
+                    login_expires_at=(
+                        oauth.login_expires_at_iso(creds)
+                        if creds else entry.login_expires_at
+                    ),
                 )
             )
         payload = {
@@ -5785,6 +5836,8 @@ class ClaudeAccountSwitcher:
             "activeAccountNumber": active_num,
             "accounts": accounts,
         }
+        if self.keychain_gate_closed():
+            payload["keychainUnavailable"] = True
         # Additive fields (absent when clean) — never printed warnings; the
         # JSON contract keeps stdout a single machine-readable object.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
@@ -5817,11 +5870,14 @@ class ClaudeAccountSwitcher:
             # JSON mode must never prompt — emit an empty list instead of the
             # interactive first-run setup.
             if json_output:
-                return {
+                payload = {
                     "schemaVersion": SCHEMA_VERSION,
                     "activeAccountNumber": None,
                     "accounts": [],
                 }
+                if self.keychain_gate_closed():
+                    payload["keychainUnavailable"] = True
+                return payload
             print(dimmed("No accounts are managed yet."))
             self._first_run_setup()
             return None
@@ -5833,6 +5889,11 @@ class ClaudeAccountSwitcher:
             return self._build_list_payload(accounts_info, entries)
 
         seq_data = self._get_sequence_data() or {}
+        if self.keychain_gate_closed():
+            warning(
+                "Login keychain not reachable from this process: showing cached "
+                "usage, nothing was fetched or refreshed."
+            )
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
@@ -6121,6 +6182,7 @@ class ClaudeAccountSwitcher:
         normal path (a live Claude login present); the fresh-machine path (no
         live login, e.g. right after --import) ignores them.
         """
+        self.refuse_if_keychain_unavailable()
         strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
         warnings: list[str] = []
         if strategy_label == "rotation":
@@ -6490,6 +6552,7 @@ class ClaudeAccountSwitcher:
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
         """
+        self.refuse_if_keychain_unavailable()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -7600,6 +7663,7 @@ class ClaudeAccountSwitcher:
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
+        self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
         legacy_distinct = legacy != self.backup_dir

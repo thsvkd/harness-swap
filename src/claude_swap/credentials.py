@@ -32,6 +32,7 @@ from claude_swap.exceptions import (
     CredentialError,
     CredentialReadError,
     CredentialWriteError,
+    KeychainUnavailableError,
 )
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.models import Platform
@@ -41,6 +42,7 @@ from claude_swap.paths import (
     get_default_claude_config_home,
     get_global_config_path,
 )
+from claude_swap.settings import require_keychain
 
 _logger = logging.getLogger("claude-swap")
 
@@ -106,6 +108,12 @@ def _active_oauth_keychain_services() -> list[str]:
         services.append(CLAUDE_CODE_KEYCHAIN_SERVICE)
     return services
 
+
+KEYCHAIN_UNAVAILABLE_MESSAGE = (
+    "The login keychain is not reachable from this process (daemon, SSH or locked), "
+    "and keychain-required mode forbids the plaintext fallback. Nothing was changed. "
+    "Run this from the logged-in GUI session."
+)
 
 # Service name for per-account backup credentials now managed via the ``security``
 # CLI on macOS. Deliberately distinct from KEYRING_SERVICE so old keyring items and
@@ -388,6 +396,19 @@ class CredentialStore:
         # The cooldown deadline already announced in the log (see
         # KeychainBackedOff): one line per cooldown, not one per skipped read.
         self._backoff_announced_until: float = 0.0
+        # Set by a command that needs keychain-required semantics whatever the
+        # setting says (keepalive).
+        self.keychain_required: bool = False
+
+    def _refuse_file_fallback(self, cause: Exception | None = None) -> None:
+        """Keychain-required mode: a Keychain failure raises, never reaches a file."""
+        if self._host.platform != Platform.MACOS:
+            return
+        # credentials_dir is <backup root>/credentials; the host view is data only.
+        if self.keychain_required or require_keychain(
+            self._host.credentials_dir.parent
+        ):
+            raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE) from cause
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -861,11 +882,14 @@ class CredentialStore:
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall back to config below.
+                self._refuse_file_fallback(e)
                 self._host._logger.warning(
                     f"Managed-key Keychain write failed, falling back to config: {e}"
                 )
             else:
                 wrote_to_keychain = True
+        if not wrote_to_keychain:
+            self._refuse_file_fallback()
 
         approved = approved_form(api_key)
 
@@ -1003,6 +1027,7 @@ class CredentialStore:
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # _kc_call flipped routing to file mode; fall through to the file.
                 # (A programming error is NOT caught here — it propagates.)
+                self._refuse_file_fallback(e)
                 self._host._logger.warning(f"Keychain write failed, falling back to file: {e}")
             else:
                 # Keychain (primary) now holds the fresh credential. Bump an
@@ -1016,6 +1041,7 @@ class CredentialStore:
         # that just failed. Write the plaintext file and (macOS) best-effort clear
         # any stale Keychain entry so Claude Code's keychain-first read can't shadow
         # it (#30337).
+        self._refuse_file_fallback()
         try:
             self._write_active_credentials_file(credentials)
         except Exception as e:
@@ -1439,6 +1465,9 @@ class CredentialStore:
         giving a misclassified overwrite a best-effort chance of recovery without
         a /login.
         """
+        # Before retention, which would write a file-mode `.prev` on its own.
+        if not self._use_keychain():
+            self._refuse_file_fallback()
         self._retain_previous_backup(account_num, email, credentials)
         if self._use_keychain():
             try:
@@ -1446,6 +1475,7 @@ class CredentialStore:
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 # Keychain unusable; _kc_call flipped routing to file mode.
                 # (A programming error is NOT caught here — it propagates.)
+                self._refuse_file_fallback(e)
                 self._host._logger.warning(
                     f"Keychain backup write failed, falling back to file: {e}"
                 )
@@ -1453,6 +1483,8 @@ class CredentialStore:
                 self._reconcile_enc_after_keychain_write(account_num, email, credentials)
                 return
 
+        # A `.prev` retention above may have just failed and flipped routing here.
+        self._refuse_file_fallback()
         # File mode: write the .enc atomically, then (macOS) best-effort drop the
         # stale Keychain copy so a recovered Keychain can't shadow the fresh file.
         try:

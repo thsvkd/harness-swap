@@ -366,5 +366,8 @@ def error_envelope(exc: Exception) -> dict:
     """The structured error payload emitted on a handled ClaudeSwitchError."""
     return {
         "schemaVersion": SCHEMA_VERSION,
-        "error": {"type": type(exc).__name__, "message": str(exc)},
+        "error": {
+            "type": getattr(exc, "json_type", type(exc).__name__),
+            "message": str(exc),
+        },
     }

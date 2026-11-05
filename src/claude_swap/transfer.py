@@ -324,6 +324,7 @@ def import_accounts(
     Raises:
         TransferError: malformed file, version mismatch, encrypted payload.
     """
+    switcher.refuse_if_keychain_unavailable()
     if source == "-":
         text = sys.stdin.read()
     else:

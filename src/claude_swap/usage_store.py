@@ -314,6 +314,9 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    # When the login itself lapses, as the last keepalive saw it: the cached
+    # view has no credential to read it from.
+    login_expires_at: str | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -974,6 +977,7 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                login_expires_at=row.get("loginExpiresAt"),
             )
         return out
 
@@ -1253,6 +1257,16 @@ class UsageStore:
             row["pollIntervalS"] = interval
 
         self._mutate(identities, plans.keys(), apply)
+
+    def set_login_expiry(
+        self, num: str, identity: Identity, login_expires_at: str | None
+    ) -> None:
+        """Remember when the active slot's login lapses (``keepalive``)."""
+
+        def apply(_num: str, row: dict) -> None:
+            row["loginExpiresAt"] = login_expires_at
+
+        self._mutate({num: identity}, [num], apply)
 
     def clear_dead_token(
         self, nums: Iterable[str], identities: dict[str, Identity]

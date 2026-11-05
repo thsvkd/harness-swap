@@ -574,6 +574,7 @@ class SessionManager:
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
         """
+        self.switcher.refuse_if_keychain_unavailable()
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(

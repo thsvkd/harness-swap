@@ -27,6 +27,12 @@ class CredentialWriteError(CredentialError):
     pass
 
 
+class KeychainUnavailableError(CredentialError):
+    """Keychain-required mode: the login keychain cannot be used from here."""
+
+    json_type = "keychain_unavailable"  # the --json error envelope's ``type``
+
+
 class ConfigError(ClaudeSwitchError):
     """Error related to configuration operations."""
 

@@ -1,6 +1,6 @@
 [project]
 name = "harness-swap"
-version = "0.2.1"
+version = "0.2.2"
 description = "Switch between multiple accounts across AI coding harnesses, with automatic rate-limit rotation, a unified usage dashboard, and parallel sessions."
 readme = "README.md"
 requires-python = ">=3.12"

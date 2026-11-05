@@ -683,8 +683,8 @@ class TestRequiredModeFetchPathR10:
     ):
         s, expired, endpoint = setup
         s.stash_consumed_successor(
-            "1", creds("AT-P", "RT-P"), oauth.credential_fingerprint(expired),
-            "active-refresh-persist-failed",
+            "1", ("a@example.com", ""), creds("AT-P", "RT-P"),
+            oauth.credential_fingerprint(expired), "active-refresh-persist-failed",
         )
         consumed_grants.record(
             oauth.credential_fingerprint(expired), ("a@example.com", ""), consumed_grants.CONSUMED

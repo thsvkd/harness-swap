@@ -208,10 +208,11 @@ def try_refresh_oauth_credentials(
 
     fingerprint = credential_fingerprint(credentials)
     try:
-        if consumed_grants.entry(fingerprint) is not None:
-            return RefreshOutcome(None, "consumed")
         if ledger_identity is not None:
-            consumed_grants.record(fingerprint, ledger_identity, consumed_grants.RESERVED)
+            if not consumed_grants.reserve(fingerprint, ledger_identity):
+                return RefreshOutcome(None, "consumed")
+        elif consumed_grants.entry(fingerprint) is not None:
+            return RefreshOutcome(None, "consumed")
     except consumed_grants.LedgerUnreadable:
         return RefreshOutcome(None, "ledger-unreadable")
 

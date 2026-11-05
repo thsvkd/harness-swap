@@ -669,7 +669,12 @@ class ClaudeAccountSwitcher:
         return oauth.try_refresh_oauth_credentials(credentials, **kwargs)
 
     def stash_consumed_successor(
-        self, account_num: str, credentials: str, consumed_fp: str | None, reason: str
+        self,
+        account_num: str,
+        identity: tuple[str, str],
+        credentials: str,
+        consumed_fp: str | None,
+        reason: str,
     ) -> None:
         """No store took a spent grant's successor: park it where the next pass
         adopts it (``_adopt_stashed_successor``). Never raises; a POST is done."""
@@ -678,7 +683,9 @@ class ClaudeAccountSwitcher:
                 credentials,
                 {
                     "reason": reason,
-                    "configSlot": account_num,
+                    "configSlot": account_num,  # a hint: `move` renumbers slots
+                    "email": identity[0],
+                    "organizationUuid": identity[1] or "",
                     "consumedFp": consumed_fp,
                     "fingerprint": oauth.credential_fingerprint(credentials),
                 },
@@ -2569,8 +2576,10 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
+        # Read now: a `move` during the POST leaves this number to someone else.
+        identity = (email, self.account_identity(account_num)["organizationUuid"])
         result = self.post_refresh(
-            (email, self.account_identity(account_num)["organizationUuid"]),
+            identity,
             refresh_input,
             **({"timeout_s": 6.0} if global_lock_held else {}),
         )
@@ -2593,6 +2602,8 @@ class ClaudeAccountSwitcher:
                 {
                     "reason": reason,
                     "configSlot": account_num,
+                    "email": identity[0],
+                    "organizationUuid": identity[1],
                     "consumedFp": consumed_fp,
                     "fingerprint": oauth.credential_fingerprint(
                         result.credentials
@@ -2804,8 +2815,14 @@ class ClaudeAccountSwitcher:
                 "successor may already have superseded (`cswap unclaimed` "
                 "lists them, `--purge` drops one)"
             )
+        own_org = self.account_identity(account_num)["organizationUuid"]
         for entry_id, meta in manifest.items():
-            if meta.get("configSlot") != account_num:
+            # By account: the slot this row was parked under may have moved. Only
+            # rows from before the identity was recorded still go by the number.
+            if "email" in meta:
+                if (meta["email"], meta.get("organizationUuid", "")) != (email, own_org):
+                    continue
+            elif meta.get("configSlot") != account_num:
                 continue
             if meta.get("consumedFp") != cur_fp:
                 if meta.get("reason") == "consume-gate-cas-conflict":
@@ -4967,7 +4984,7 @@ class ClaudeAccountSwitcher:
                         )
                     if restore_source is None and not backup_ok and not live_ok:
                         self.stash_consumed_successor(
-                            account_num, working,
+                            account_num, (email, org_uuid or ""), working,
                             oauth.credential_fingerprint(refresh_input),
                             "active-refresh-persist-failed",
                         )

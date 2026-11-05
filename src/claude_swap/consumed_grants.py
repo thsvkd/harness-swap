@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError, LockError
@@ -25,8 +26,12 @@ from claude_swap.locking import FileLock
 from claude_swap.settings import atomic_write_json
 
 FILENAME = "consumed_grants.json"
-# Oldest entries drop off: at one rotation per 7 hours, about 58 days.
-MAX_ENTRIES = 200
+# Longer than any refresh token lives (about 30 days), so a dropped row can no
+# longer name a token the server would accept or count as reuse. A row is never
+# dropped for space, and an unresolved reservation is never dropped at all.
+CONSUMED_RETENTION_S = 400 * 24 * 3600
+# About 30 accounts rotating every 7 hours for 400 days. Past it, POSTs stop.
+MAX_BYTES = 8 * 1024 * 1024
 RESERVED = "reserved"
 CONSUMED = "consumed"
 
@@ -48,6 +53,7 @@ def _valid(row: object) -> bool:
         and row.get("state") in (RESERVED, CONSUMED)
         and isinstance(row.get("email"), str)
         and isinstance(row.get("organizationUuid"), str)
+        and isinstance(row.get("at"), (int, float))
     )
 
 
@@ -81,8 +87,17 @@ def _rewrite(mutate) -> None:
     try:
         with FileLock(path.with_suffix(".lock")):
             rows = _read(path)  # raises before anything is written over it
-            mutate(rows)
-            atomic_write_json(path, dict(list(rows.items())[-MAX_ENTRIES:]))
+            if mutate(rows) is False:
+                return
+            oldest = time.time() - CONSUMED_RETENTION_S
+            rows = {
+                fingerprint: row
+                for fingerprint, row in rows.items()
+                if row["state"] == RESERVED or row["at"] >= oldest
+            }
+            if len(json.dumps(rows, indent=2).encode()) > MAX_BYTES:
+                raise LedgerUnreadable(f"{FILENAME} is too large")
+            atomic_write_json(path, rows)
             # The rename is only durable once the directory is; a reservation
             # lost to a crash would let the POST it guarded happen again.
             if sys.platform != "win32":  # a directory cannot be opened there
@@ -95,19 +110,42 @@ def _rewrite(mutate) -> None:
         raise LedgerUnreadable(f"{FILENAME} cannot be written") from None
 
 
-def record(fingerprint: str, identity: tuple[str, str], state: str) -> None:
-    """Raises :class:`LedgerUnreadable`; a reservation that failed forbids the POST.
+def _row(identity: tuple[str, str], state: str) -> dict:
+    # The account, not the slot: `move` and `swap` renumber slots.
+    return {
+        "state": state,
+        "email": identity[0],
+        "organizationUuid": identity[1] or "",
+        "at": time.time(),
+    }
 
-    The row names the account, not the slot: `move` and `swap` renumber slots.
+
+def reserve(fingerprint: str, identity: tuple[str, str]) -> bool:
+    """Claim this token for one POST. False when any row already names it.
+
+    One step under the ledger's lock: two consumers cannot both see it absent.
+    Raises :class:`LedgerUnreadable`, which forbids the POST too.
     """
+    claimed = False
+
+    def mutate(rows: dict) -> bool:
+        nonlocal claimed
+        if fingerprint in rows:
+            return False
+        rows[fingerprint] = _row(identity, RESERVED)
+        claimed = True
+        return True
+
+    _rewrite(mutate)
+    return claimed
+
+
+def record(fingerprint: str, identity: tuple[str, str], state: str) -> None:
+    """Settle a row. Raises :class:`LedgerUnreadable`."""
 
     def mutate(rows: dict) -> None:
         rows.pop(fingerprint, None)
-        rows[fingerprint] = {
-            "state": state,
-            "email": identity[0],
-            "organizationUuid": identity[1] or "",
-        }
+        rows[fingerprint] = _row(identity, state)
 
     _rewrite(mutate)
 

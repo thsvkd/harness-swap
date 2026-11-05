@@ -289,9 +289,10 @@ def _adopted_backup(active, keychain, file_creds, dry_run) -> tuple[str, str | N
                 return adopted, None
         return backup, None
     spent = {oauth.credential_fingerprint(creds) for creds in held}
+    identity = active.identity or ("", "")
     for entry_id, row in switcher._store._read_stash_manifest().items():
         if (
-            row.get("configSlot") == _UNMANAGED
+            (row.get("email"), row.get("organizationUuid")) == identity
             and str(row.get("reason", "")).startswith("keepalive-")
             and row.get("consumedFp") in spent
         ):
@@ -403,10 +404,8 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
     if spent_newer and not dry_run:
         # An older copy of a chain whose newer link is spent was very likely spent
         # to make that link. Keep that knowledge past the overwrite below.
-        consumed_grants.record(
-            oauth.credential_fingerprint(authoritative),
-            active.identity or ("", ""),
-            consumed_grants.RESERVED,
+        consumed_grants.reserve(
+            oauth.credential_fingerprint(authoritative), active.identity or ("", "")
         )
 
     fingerprint = oauth.credential_fingerprint(authoritative)
@@ -415,7 +414,7 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
             continue
         verdict = belongs(loser)
         if loser not in spent_newer and (
-            verdict is True or _spent_or_empty(loser, authoritative, verdict)
+            verdict is True or _is_wiped(loser)
         ):
             continue  # a stale generation of this login is not a split
         if verdict is False:
@@ -489,19 +488,11 @@ def _settle_file(store, report, expected: str) -> None:
         report["error"] = {"type": "refresh_failed", "message": _FILE_NOT_UPDATED}
 
 
-def _spent_or_empty(loser: str, winner: str, verdict: bool | None) -> bool:
-    """Nothing worth keeping: wiped token fields, or an unattributed copy that is
-    expired and older than the winner, so its refresh token is presumed consumed."""
-    payload = _oauth_payload(loser)
-    if not payload:
-        return False  # unparseable: we cannot say what it held
-    if not payload.get("accessToken") and not payload.get("refreshToken"):
-        return True
-    return (
-        verdict is None
-        and _is_expired(loser)
-        and (_expires_at(loser) or 0) < (_expires_at(winner) or 0)
-    )
+def _is_wiped(credentials: str) -> bool:
+    """Claude Code emptied its token fields: nothing left to keep. An expired copy
+    is not this: its refresh token may be another account's only live one."""
+    payload = _oauth_payload(credentials)
+    return bool(payload) and not payload.get("accessToken") and not payload.get("refreshToken")
 
 
 def _stash_loser(active, loser: str) -> None:
@@ -518,6 +509,8 @@ def _stash_loser(active, loser: str) -> None:
             {
                 "reason": "keepalive-split-brain",
                 "configSlot": active.slot or _UNMANAGED,
+                "email": (active.identity or ("", ""))[0],
+                "organizationUuid": (active.identity or ("", ""))[1],
                 "fingerprint": fingerprint,
             },
         )
@@ -582,8 +575,8 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
         # The gate stored it in the slot or its own stash, unless both failed.
         if not via_gate or (outcome.error and not outcome.stashed):
             switcher.stash_consumed_successor(
-                slot or _UNMANAGED, outcome.credentials, fingerprint,
-                "keepalive-live-write-failed",
+                slot or _UNMANAGED, active.identity or ("", ""), outcome.credentials,
+                fingerprint, "keepalive-live-write-failed",
             )
         raise
     if file_wanted:

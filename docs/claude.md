@@ -401,7 +401,7 @@ With this on (macOS only; off by default), every command checks that the login k
 - commands that can write a credential (`switch`, `add`, `add-token`, `remove`, `import`, `move`, `swap`, `purge`, `run`, `auto`, `keepalive`) refuse before touching anything: exit 1, and under `--json` an error envelope with type `keychain_unavailable`;
 - `list`, `status` and the dashboard show cached usage with no fetch, no refresh and no writes, and `list --json` adds `keychainUnavailable: true`.
 
-A Keychain write that fails anyway never falls back to the plaintext file or an `.enc` backup; the command fails instead.
+A Keychain write that fails anyway never falls back to the plaintext file or an `.enc` backup; the command fails instead. Every refresh POST re-checks reachability first. A leftover `.enc` backup no longer outranks a newer Keychain copy, and is removed once the Keychain is reachable.
 
 **2. Run one refresher from the GUI session.** Save as `~/Library/LaunchAgents/com.example.hswap-keepalive.plist`:
 
@@ -430,10 +430,12 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hswap-keepal
 
 `--ensure-file` is for processes that only see the file: it keeps a copy there for them, 0600, on the same generation as the Keychain. Leave it out if nothing on the machine needs the file. The job needs a logged-in session with an unlocked login keychain; a machine booted to the login window has neither, and `keepalive` then reports `keychain_unavailable` until someone logs in.
 
-**What `keepalive` does.** `hswap claude keepalive [--ahead SECONDS] [--ensure-file] [--dry-run] [--json]` takes Claude Code's credential locks and the slot's lock, then:
+**What `keepalive` does.** `hswap claude keepalive [--ahead SECONDS] [--ensure-file] [--dry-run] [--json]` takes Claude Code's credential locks and the slot's lock, reads who is logged in and both stores only then, and:
 
-1. Reads the login from the Keychain and the file. If they differ, the one with the later `expiresAt` wins and is copied to the other; the Keychain wins a tie and keeps its machine-shared fields (`mcpOAuth`, ...). If the two hold different refresh tokens, the older copy is stashed first (see `hswap claude unclaimed`) and the report's `note` says `split_brain`. A refresh by Claude Code in only one store looks exactly like this, so the note means "the stores had drifted", not necessarily an accident.
+1. Brings the Keychain and the file to the newest copy of the current account: one with a refresh token beats one without, then the later `expiresAt` wins, and the Keychain wins a tie and keeps its machine-shared fields (`mcpOAuth`, ...). A copy that belongs to another account never wins, so a switch landing mid-run is not undone. A stale generation of the same account (Claude Code rotated one store) is a plain sync. A copy of another account, or one nothing can attribute that is not both older and expired, is stashed first (see `hswap claude unclaimed`, once per fingerprint); `note` says `split_brain` only for another account.
 2. If the access token expires within `--ahead` (default 3600 seconds), refreshes it once and writes the result to the Keychain, the file (when present or `--ensure-file`) and the slot's backup. A racing refresh is adopted, not repeated. A rejected refresh token reports `relogin_required` and wipes nothing.
+
+A refresh token rotates and works once, and presenting a spent one can revoke the whole login. So a refresh whose result could not be written anywhere is parked in the stash, and the next run on any path adopts it instead of posting. Keepalive and keychain-required mode record every spent token's fingerprint in `cache/consumed_grants.json` (0600, no tokens), and nothing posts a token listed there; if nothing newer exists, `keepalive` reports `relogin_required`.
 
 It always needs the login keychain on macOS, even with the setting off, and never falls back to the file. On Linux and Windows there is no Keychain: it refreshes the file only.
 

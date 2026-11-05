@@ -11,6 +11,7 @@ import shutil
 import threading
 import sys
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -2342,9 +2343,23 @@ class ClaudeAccountSwitcher:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self,
+        account_num: str,
+        email: str,
+        snapshot: str,
+        *,
+        global_lock_held: bool = False,
     ) -> "oauth.RefreshOutcome":
-        """Body of ``consume_backup_grant``; caller holds the consume lock."""
+        """Body of ``consume_backup_grant``; caller holds the consume lock.
+
+        ``global_lock_held``: the caller already holds ``self.lock_file`` in the
+        switch path's order (keepalive, which keeps Claude Code's locks across
+        the POST). The POST is then bounded like ``_fetch_active_usage``'s, well
+        inside a concurrent switch's acquire budget.
+        """
+        def slot_lock():
+            return nullcontext() if global_lock_held else FileLock(self.lock_file)
+
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
@@ -2353,7 +2368,7 @@ class ClaudeAccountSwitcher:
         )
 
         try:
-            with FileLock(self.lock_file):
+            with slot_lock():
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2519,7 +2534,11 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        result = (
+            oauth.try_refresh_oauth_credentials(refresh_input, timeout_s=6.0)
+            if global_lock_held
+            else oauth.try_refresh_oauth_credentials(refresh_input)
+        )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
@@ -2552,7 +2571,7 @@ class ClaudeAccountSwitcher:
         outcome_creds = result.credentials
         try:
             try:
-                with FileLock(self.lock_file):
+                with slot_lock():
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )

@@ -957,6 +957,74 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+def _keepalive_command(argv: list[str]) -> None:
+    """Handle `cswap keepalive [--ahead SECONDS] [--ensure-file] [--dry-run] [--json]`.
+
+    Pre-dispatched before the main parser for the same reason as `auto`.
+    """
+    from claude_swap.keepalive import DEFAULT_AHEAD_S, run_keepalive
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} keepalive",
+        description=(
+            "Keep the active login fresh from one place: sync the macOS Keychain "
+            "and the credentials file, and refresh the access token ahead of "
+            "expiry. Meant to run every few minutes from the GUI session "
+            "(LaunchAgent). Exit code 0 when ok, 1 otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--ahead",
+        type=float,
+        default=DEFAULT_AHEAD_S,
+        metavar="SECONDS",
+        help="Refresh when the access token expires within this long (default 3600)",
+    )
+    parser.add_argument(
+        "--ensure-file",
+        action="store_true",
+        help="Also create the credentials file when only the Keychain holds the login",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would happen; change nothing but keepalive.json",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Print the report as JSON on stdout"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if not (math.isfinite(args.ahead) and args.ahead >= 0):
+        parser.error("--ahead must be a non-negative number of seconds")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        report = run_keepalive(
+            switcher,
+            ahead=args.ahead,
+            ensure_file=args.ensure_file,
+            dry_run=args.dry_run,
+        )
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    elif report["ok"]:
+        print(
+            f"Keepalive: {report['action']}; access token valid until "
+            f"{report['accessExpiresAt'] or 'unknown'}"
+        )
+    else:
+        error(f"Error: {report['error']['message']}")
+    sys.exit(0 if report["ok"] else 1)
+
+
 def _config_command(argv: list[str]) -> None:
     """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
 
@@ -1209,6 +1277,9 @@ def main() -> None:
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "keepalive":
+        _keepalive_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1280,6 +1351,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s keepalive                  sync and refresh the active login ahead of expiry
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

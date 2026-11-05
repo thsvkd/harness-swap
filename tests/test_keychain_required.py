@@ -171,6 +171,7 @@ class TestRefusals:
             ["swap", "1", "2"],
             ["auto", "--once"],
             ["auto"],
+            ["keepalive"],
             ["purge"],
             ["run", "2"],
         ],

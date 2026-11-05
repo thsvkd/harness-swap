@@ -56,7 +56,7 @@ from harness_swap.infrastructure import spawn
 PROG = "hswap claude"
 
 #: engine verbs dispatched before its flag table (see ``claude_swap.cli.main``)
-_ENGINE_VERBS = ("switch", "run", "auto", "map", "unmap", "unclaimed", "alias", "threshold", "priority", "swap", "move")
+_ENGINE_VERBS = ("switch", "run", "auto", "map", "unmap", "unclaimed", "alias", "threshold", "priority", "swap", "move", "keepalive")
 
 
 @functools.cache

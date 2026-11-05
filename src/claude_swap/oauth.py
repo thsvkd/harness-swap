@@ -83,7 +83,11 @@ def login_expires_at_iso(credentials: str) -> str | None:
     Code recorded the field carry nothing, which means "unknown", never "now".
     """
     data = extract_oauth_data(credentials)
-    value = data.get("refreshTokenExpiresAt") if data else None
+    return expires_at_iso(data.get("refreshTokenExpiresAt") if data else None)
+
+
+def expires_at_iso(value: object) -> str | None:
+    """An epoch-milliseconds expiry as ISO-8601 UTC, or ``None`` when unusable."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         return None
     return (

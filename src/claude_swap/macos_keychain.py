@@ -14,11 +14,12 @@ passwords, used instead of the third-party ``keyring`` library. Two reasons:
 The read/write/delete shapes mirror Claude Code's own implementation
 (``utils/secureStorage/macOsKeychainStorage.ts``):
 
-- ``set_password`` hex-encodes the value (``-X``) and pipes the command through
-  ``security -i`` (stdin) so the secret never appears in process argv (a
-  process-monitor / CrowdStrike concern). It falls back to argv only when the
-  command would overflow ``security -i``'s 4096-byte stdin line buffer, which
-  would otherwise truncate mid-argument and silently corrupt the entry.
+- ``set_password`` pipes the command through ``security -i`` (stdin) so the secret
+  never appears in process argv (``ps``, process audit logs). It hex-encodes the
+  value (``-X``) when that fits ``security -i``'s 4096-byte stdin line buffer, sends
+  it quoted (``-w``) when only that fits, and refuses otherwise. Unlike Claude
+  Code's own writer it never falls back to argv: a real credential's hex is longer
+  than the buffer, so the fallback would be the common case.
 - ``get_password`` uses ``find-generic-password ... -w`` and treats exit code 44
   as "not found" (returns ``None``); any *other* non-zero exit raises so callers
   can tell a genuine miss apart from a locked/denied/unavailable Keychain.
@@ -35,6 +36,7 @@ its functions are only meaningful on macOS.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import sys
@@ -63,6 +65,9 @@ _TIMEOUT = 5.0
 # PATH must not be able to intercept secrets. ``/usr/bin/security`` is present on
 # every macOS.
 _SECURITY = "/usr/bin/security"
+_SECURITY_FRAMEWORK = "/System/Library/Frameworks/Security.framework/Security"
+_CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+_UNLOCK_STATE_STATUS = 1  # kSecUnlockStateStatus
 
 
 class KeychainError(Exception):
@@ -123,10 +128,10 @@ def get_password(service: str, account: str) -> str | None:
             text=True,
             timeout=_TIMEOUT,
         )
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         raise KeychainError(
             f"security find-generic-password timed out after {_TIMEOUT}s"
-        ) from e
+        ) from None
     if result.returncode == 0:
         # `-w` prints the value followed by one newline; strip exactly that so
         # values with meaningful leading/trailing whitespace survive intact.
@@ -164,47 +169,35 @@ def item_exists(service: str, account: str) -> bool:
 def set_password(service: str, account: str, password: str) -> None:
     """Create or update a generic-password item (``-U``).
 
-    Prefers ``security -i`` stdin so the secret stays out of argv; falls back to
-    argv only for payloads that would overflow the stdin line buffer. Raises
-    :class:`KeychainError` on a non-zero exit or a timeout.
+    The secret only ever travels on ``security -i``'s stdin: as hex (``-X``) when
+    that fits the line buffer, else quoted (``-w``), which a typical credential's
+    JSON does. A value neither form can carry raises :class:`KeychainError`, as
+    does a non-zero exit or a timeout. Messages carry no argv and no stderr.
     """
-    hex_value = password.encode("utf-8").hex()
-    # `-X` passes the value as hex, avoiding any escaping issues for the secret.
-    command = (
-        f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} "
-        f"-X {hex_value}\n"
-    )
+    prefix = f"add-generic-password -U -a {_quote(account)} -s {_quote(service)}"
+    command = f"{prefix} -X {password.encode('utf-8').hex()}\n"
+    if len(command.encode("utf-8")) > SECURITY_STDIN_LINE_LIMIT:
+        # A line ends at a newline whatever the quoting, and argv ends at NUL.
+        if "\n" in password or "\0" in password:
+            raise KeychainError("value has a line break security -i cannot carry")
+        command = f"{prefix} -w {_quote(password)}\n"
+        if len(command.encode("utf-8")) > SECURITY_STDIN_LINE_LIMIT:
+            raise KeychainError("value is too long for security -i's line buffer")
     try:
-        if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
-            result = spawn.run(
-                [_SECURITY, "-i"],
-                input=command,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
-            )
-        else:
-            # Overflows the stdin line buffer; fall back to argv. Hex in argv is
-            # recoverable by a determined observer but defeats naive plaintext-grep
-            # rules, and the alternative — silent corruption — is strictly worse.
-            result = spawn.run(
-                [
-                    _SECURITY, "add-generic-password", "-U",
-                    "-a", account, "-s", service, "-X", hex_value,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT,
-            )
-    except subprocess.TimeoutExpired as e:
+        result = spawn.run(
+            [_SECURITY, "-i"],
+            input=command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
         raise KeychainError(
             f"security add-generic-password timed out after {_TIMEOUT}s"
-        ) from e
+        ) from None
     if result.returncode != 0:
-        raise KeychainError(
-            f"security add-generic-password failed (rc={result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
+        raise KeychainError(f"security add-generic-password failed (rc={result.returncode})")
 
 
 def delete_password(service: str, account: str) -> None:
@@ -219,10 +212,10 @@ def delete_password(service: str, account: str) -> None:
             text=True,
             timeout=_TIMEOUT,
         )
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         raise KeychainError(
             f"security delete-generic-password timed out after {_TIMEOUT}s"
-        ) from e
+        ) from None
     if result.returncode in (0, _NOT_FOUND_RC):
         return
     raise KeychainError(
@@ -261,18 +254,50 @@ def _login_keychain_path(runner: Callable[[list[str]], subprocess.CompletedProce
     return str(keychains / "login.keychain-db")
 
 
+def _login_keychain_unlocked(path: str) -> bool | None:
+    """Locked or not, asked so that no dialog can appear; None when unknown.
+
+    In-process because ``security`` has no such command, and it is safe here: a
+    status read touches no item, so it anchors no item's access to this interpreter
+    (the module docstring's reason to shell out). Nothing else in this process uses
+    the framework's keychain API, so interaction stays off.
+    """
+    try:
+        security = ctypes.CDLL(_SECURITY_FRAMEWORK)
+        core_foundation = ctypes.CDLL(_CORE_FOUNDATION)
+        security.SecKeychainSetUserInteractionAllowed(False)
+        keychain = ctypes.c_void_p()
+        status = ctypes.c_uint32()
+        if security.SecKeychainOpen(os.fsencode(path), ctypes.byref(keychain)) != 0:
+            return None
+        try:
+            if security.SecKeychainGetStatus(keychain, ctypes.byref(status)) != 0:
+                return None
+        finally:
+            if keychain:
+                core_foundation.CFRelease(keychain)
+        return bool(status.value & _UNLOCK_STATE_STATUS)
+    except (OSError, AttributeError):
+        return None
+
+
 def keychain_reachable(
     runner: Callable[[list[str]], subprocess.CompletedProcess] | None = None,
     *,
     platform: str = sys.platform,
+    unlocked: Callable[[str], bool | None] = _login_keychain_unlocked,
 ) -> bool | None:
     """Can this process actually use the login keychain? ``None`` off macOS.
 
     A find-generic-password rc 44 proves nothing: a LaunchDaemon or an SSH session
     gets it for an item that exists, because the login keychain is not in its
-    search list. So this asks the two questions that do separate them: is the
-    login keychain in this process's search list, and does it answer
+    search list. So this asks the questions that do separate them: is the login
+    keychain in this process's search list, is it unlocked, and does it answer
     ``show-keychain-info`` (rc 36 when no user session can unlock it)?
+
+    ``show-keychain-info`` runs with interaction allowed, so on a locked keychain
+    in a GUI session it can raise an unlock dialog. It only runs once the keychain
+    is known to be unlocked; a lock state that cannot be read counts as unreachable.
     """
     if platform != "darwin":
         return None
@@ -283,6 +308,8 @@ def keychain_reachable(
         if listed.returncode != 0 or os.path.realpath(login) not in {
             os.path.realpath(path) for path in _listed_paths(listed.stdout)
         }:
+            return False
+        if unlocked(login) is not True:
             return False
         return runner(["show-keychain-info", login]).returncode == 0
     except KEYCHAIN_ERRORS:

@@ -1,8 +1,18 @@
 """Logging configuration for Claude Swap."""
 
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+
+def _restrict(log_file: Path) -> None:
+    """The log and its rotated copies are the owner's: credential paths log here."""
+    for path in log_file.parent.glob(log_file.name + "*"):
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass  # a race with rotation, or a file that is not ours to change
 
 
 class _LazyDirRotatingFileHandler(RotatingFileHandler):
@@ -16,7 +26,10 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
     """
 
     def _open(self):  # type: ignore[override]
-        Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
+        path = Path(self.baseFilename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600))
+        _restrict(path)
         return super()._open()
 
 
@@ -42,6 +55,7 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     # File handler - opens lazily so the dir is only created when something
     # is actually logged.
     log_file = log_dir / "claude-swap.log"
+    _restrict(log_file)  # a run that logs nothing still narrows an old 0644 log
     file_handler = _LazyDirRotatingFileHandler(
         log_file,
         maxBytes=1024 * 1024,  # 1MB

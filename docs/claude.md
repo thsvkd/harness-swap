@@ -393,15 +393,21 @@ The cure is one refresher in a place that can see both stores, running early eno
 **1. Refuse to work from the wrong place.**
 
 ```bash
-hswap claude config set credentials.requireKeychain true   # or HSWAP_REQUIRE_KEYCHAIN=1|0, which wins over the setting
+hswap claude config set credentials.requireKeychain true   # or HSWAP_REQUIRE_KEYCHAIN=1 to force it on
 ```
 
-With this on (macOS only; off by default), every command checks that the login keychain is in this process's search list and answers `security show-keychain-info`. When it does not:
+The environment variable can only tighten: `HSWAP_REQUIRE_KEYCHAIN=0` does not turn off a configured `true`, so a process cannot reopen the plaintext fallback by setting a variable.
+
+With this on (macOS only; off by default), every command checks that the login keychain is in this process's search list, is unlocked, and answers `security show-keychain-info`. When it does not:
 
 - commands that can write a credential (`switch`, `add`, `add-token`, `remove`, `import`, `move`, `swap`, `purge`, `run`, `auto`, `keepalive`) refuse before touching anything: exit 1, and under `--json` an error envelope with type `keychain_unavailable`;
 - `list`, `status` and the dashboard show cached usage with no fetch, no refresh and no writes, and `list --json` adds `keychainUnavailable: true`.
 
 A Keychain write that fails anyway never falls back to the plaintext file or an `.enc` backup; the command fails instead. Every refresh POST re-checks reachability first. A leftover `.enc` backup no longer outranks a newer Keychain copy, and is removed once the Keychain is reachable.
+
+A locked login keychain in the GUI session counts as unreachable, and the check does not raise an unlock dialog. `security show-keychain-info` calls `SecKeychainCopySettings` with interaction allowed, and it returns `errSecInteractionNotAllowed` (rc 36) in a daemon, which means the call wants user interaction, so on a locked keychain in a GUI session it can prompt. hswap therefore reads the lock state first with `SecKeychainGetStatus` after `SecKeychainSetUserInteractionAllowed(false)`, in its own process, and runs `show-keychain-info` only once the keychain is known to be unlocked. If the lock state cannot be read, the keychain counts as unreachable. A keychain that locks after this check can still prompt on the next item read, for at most the 5 seconds `security` is given.
+
+**Credential size.** hswap sends a credential to the Keychain only through `security -i`'s stdin, never on a command line where `ps` and audit logs would show it, and that stdin takes one line of at most 4096 bytes. A credential that does not fit cannot be written: in keychain-required mode and in `keepalive` the write fails, and with the mode off hswap falls back to the file as for any other Keychain failure. A credential carrying many MCP logins (`mcpOAuth`) can reach this limit.
 
 **2. Run one refresher from the GUI session.** Save as `~/Library/LaunchAgents/com.example.hswap-keepalive.plist`:
 
@@ -436,6 +442,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hswap-keepal
 2. If the access token expires within `--ahead` (default 3600 seconds), refreshes it once and writes the result to the Keychain, the file (when present or `--ensure-file`) and the slot's backup. A racing refresh is adopted, not repeated. A rejected refresh token reports `relogin_required` and wipes nothing.
 
 A refresh token rotates and works once, and presenting a spent one can revoke the whole login. So a refresh whose result could not be written anywhere is parked in the stash, and the next run on any path adopts it instead of posting. Keepalive and keychain-required mode record every spent token's fingerprint in `cache/consumed_grants.json` (0600, no tokens), and nothing posts a token listed there; if nothing newer exists, `keepalive` reports `relogin_required`.
+
+After every write, `keepalive` reads the file back when it should hold the login, retries once, and otherwise reports `refresh_failed` with "file store could not be updated". The Keychain and the slot still hold the login in that case, and the next run repairs the file.
 
 It always needs the login keychain on macOS, even with the setting off, and never falls back to the file. On Linux and Windows there is no Keychain: it refreshes the file only.
 

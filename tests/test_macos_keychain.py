@@ -9,12 +9,15 @@ function bodies run against a fake process.)
 
 from __future__ import annotations
 
+import json
 import subprocess
+import traceback
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from claude_swap import macos_keychain
+from claude_swap.logging_config import setup_logging
 
 # Every test here drives the *real* wrapper bodies (mocking subprocess) or runs
 # against a temp keychain on CI, so opt the whole module out of the in-memory
@@ -78,7 +81,7 @@ def test_item_exists_false_on_rc44_and_errors():
 
 
 # ---------------------------------------------------------------------------
-# set_password — stdin (security -i) vs argv fallback
+# set_password — the secret only ever travels on security -i's stdin
 # ---------------------------------------------------------------------------
 
 
@@ -99,18 +102,110 @@ def test_set_password_small_payload_uses_security_i_stdin():
         assert '-a "acct"' in stdin and '-s "svc"' in stdin
 
 
-def test_set_password_large_payload_falls_back_to_argv():
-    big = "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT  # hex doubles the length
+def _split_line(line):
+    """`security -i`'s tokenizer (Security/SecurityTool/macOS/security.c, split_line):
+    quotes delimit, and a backslash copies the next character literally."""
+    args, current, quote, escaped, in_arg = [], [], None, False, False
+    for ch in line.rstrip("\n"):
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped, in_arg = True, True
+        elif quote:
+            if ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in "\"'":
+            quote, in_arg = ch, True
+        elif ch.isspace():
+            if in_arg:
+                args.append("".join(current))
+                current, in_arg = [], False
+        else:
+            current.append(ch)
+            in_arg = True
+    if in_arg:
+        args.append("".join(current))
+    return args
+
+
+def _stored_value(line):
+    """What `add-generic-password` stores from this stdin line."""
+    args = _split_line(line)
+    assert args[:2] == ["add-generic-password", "-U"]
+    assert "\n" not in line.rstrip("\n")
+    if "-X" in args:
+        return bytes.fromhex(args[args.index("-X") + 1]).decode()
+    return args[args.index("-w") + 1]
+
+
+def _credential(size):
+    """A real credential's shape, exactly `size` bytes of JSON."""
+    login = {
+        "accessToken": "sk-ant-oat01-" + "A" * 400,
+        "refreshToken": "sk-ant-ort01-" + "B" * 400,
+        "expiresAt": 1793900000000,
+        "scopes": ["user:inference", "user:profile"],
+    }
+    base = len(json.dumps({"claudeAiOauth": login, "pad": ""}))
+    return json.dumps({"claudeAiOauth": login, "pad": "C" * (size - base)})
+
+
+@pytest.mark.parametrize("size", [2048, 3500])
+def test_real_credential_sizes_never_reach_argv_and_round_trip(size):
+    secret = _credential(size)
+    assert len(secret) == size
     with patch("claude_swap.macos_keychain.subprocess.run") as run:
         run.return_value = _completed(0)
-        macos_keychain.set_password("svc", "acct", big)
+        macos_keychain.set_password("Claude Code-credentials", "me", secret)
+    assert run.call_count == 1
+    argv = " ".join(run.call_args.args[0])
+    assert run.call_args.args[0] == ["/usr/bin/security", "-i"]
+    assert secret not in argv and secret.encode().hex() not in argv and "sk-ant" not in argv
+    stdin = run.call_args.kwargs["input"]
+    assert " -w " in stdin  # the hex form would overflow the line buffer
+    assert len(stdin.encode()) <= macos_keychain.SECURITY_STDIN_LINE_LIMIT
+    assert _stored_value(stdin) == secret
 
-        args = run.call_args.args[0]
-        assert args[:3] == ["/usr/bin/security", "add-generic-password", "-U"]  # argv path
-        assert "input" not in run.call_args.kwargs  # not via stdin
-        # Hex value passed as a raw list element (no shell, no quoting).
-        assert big.encode().hex() in args
-        assert "acct" in args and "svc" in args
+
+@pytest.mark.parametrize(
+    "secret",
+    ['a"b', 'a\\b', 'trailing\\', '\\"', 'it\'s', "with space", '-w', 'é"\\'],
+)
+def test_quotes_and_backslashes_survive_security_i_parsing(secret):
+    padded = secret + "x" * 2100  # past the hex form's limit, so `-w`
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", padded)
+    assert " -w " in run.call_args.kwargs["input"]
+    assert _stored_value(run.call_args.kwargs["input"]) == padded
+
+
+def test_hex_form_is_kept_when_it_fits():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", "x" * 1900)
+    assert " -X " in run.call_args.kwargs["input"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT,  # too long either way
+        '"' * 2100,  # short, but escaping doubles it
+        "line\nbreak" + "x" * 2100,  # would end the command early
+        "nul\0" + "x" * 2100,
+    ],
+    ids=["too-long", "too-long-escaped", "newline", "nul"],
+)
+def test_a_value_stdin_cannot_carry_is_refused_not_sent_to_argv(value):
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        with pytest.raises(macos_keychain.KeychainError) as err:
+            macos_keychain.set_password("svc", "acct", value)
+    run.assert_not_called()
+    assert value not in str(err.value)
 
 
 def test_set_password_raises_on_nonzero():
@@ -178,6 +273,44 @@ def test_timeout_becomes_keychain_error(fn, args):
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):
         with pytest.raises(macos_keychain.KeychainError):
             getattr(macos_keychain, fn)(*args)
+
+
+@pytest.mark.parametrize("fn,args", [
+    ("get_password", ("svc", "acct")),
+    ("set_password", ("svc", "acct", "SECRET-TOKEN")),
+    ("delete_password", ("svc", "acct")),
+])
+def test_timeout_carries_no_command_into_message_chain_or_log(fn, args, tmp_path):
+    secret_hex = "SECRET-TOKEN".encode().hex()
+    timeout = subprocess.TimeoutExpired(
+        cmd=["security", "-w", "SECRET-TOKEN", "-X", secret_hex], timeout=5,
+        output="SECRET-TOKEN",
+    )
+    logger = setup_logging(tmp_path)
+    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=timeout):
+        with pytest.raises(macos_keychain.KeychainError) as err:
+            getattr(macos_keychain, fn)(*args)
+    exc = err.value
+    assert exc.__cause__ is None and exc.__suppress_context__ is True
+    try:
+        raise exc
+    except macos_keychain.KeychainError:
+        logger.warning("Persisting failed", exc_info=True)
+    for handler in logger.handlers:
+        handler.close()
+    rendered = "".join(traceback.format_exception(exc))
+    log_text = (tmp_path / "claude-swap.log").read_text()
+    for text in (str(exc), repr(exc), rendered, log_text):
+        assert "SECRET-TOKEN" not in text and secret_hex not in text
+    assert "KeychainError" in log_text
+
+
+def test_failed_write_message_carries_no_stderr():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(45, stderr="echoed SECRET-TOKEN")
+        with pytest.raises(macos_keychain.KeychainError) as err:
+            macos_keychain.set_password("svc", "acct", "SECRET-TOKEN")
+    assert "SECRET-TOKEN" not in str(err.value)
 
 
 def test_item_exists_stays_false_on_timeout_and_missing_binary():

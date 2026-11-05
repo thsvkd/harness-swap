@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -52,7 +53,7 @@ class TestPreflight:
 
     def _reachable(self, **answers):
         return macos_keychain.keychain_reachable(
-            _fake_security(**answers), platform="darwin"
+            _fake_security(**answers), platform="darwin", unlocked=lambda path: True
         )
 
     def test_login_keychain_listed_and_answering_is_reachable(self):
@@ -91,7 +92,9 @@ class TestPreflight:
             out = f'"{custom}"\n' if args[0] in ("login-keychain", "list-keychains") else ""
             return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
 
-        assert macos_keychain.keychain_reachable(run, platform="darwin") is True
+        assert macos_keychain.keychain_reachable(
+            run, platform="darwin", unlocked=lambda path: path == custom
+        ) is True
         assert ["show-keychain-info", custom] in seen
 
     @pytest.mark.parametrize(
@@ -99,6 +102,67 @@ class TestPreflight:
     )
     def test_a_security_that_cannot_run_is_unreachable(self, failure):
         assert self._reachable(**{"list-keychains": (failure, "")}) is False
+
+    @pytest.mark.parametrize("state", [False, None], ids=["locked", "unknown"])
+    def test_a_locked_keychain_never_reaches_the_command_that_can_prompt(self, state):
+        seen = []
+
+        def run(args):
+            seen.append(args[0])
+            out = f'"{LOGIN}"\n' if args[0] == "list-keychains" else ""
+            return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+        assert macos_keychain.keychain_reachable(
+            run, platform="darwin", unlocked=lambda path: state
+        ) is False
+        assert "show-keychain-info" not in seen
+
+    def _framework(self, monkeypatch, *, status=0, status_rc=0, open_rc=0):
+        calls = []
+
+        def set_interaction(allowed):
+            calls.append(("interaction", allowed))
+
+        def open_keychain(path, out):
+            calls.append(("open", path))
+            return open_rc
+
+        def get_status(keychain, out):
+            out._obj.value = status
+            calls.append(("status",))
+            return status_rc
+
+        def libraries(path):
+            return SimpleNamespace(
+                SecKeychainSetUserInteractionAllowed=set_interaction,
+                SecKeychainOpen=open_keychain,
+                SecKeychainGetStatus=get_status,
+                CFRelease=lambda keychain: calls.append(("release",)),
+            )
+
+        monkeypatch.setattr(macos_keychain.ctypes, "CDLL", libraries)
+        return calls
+
+    @pytest.mark.parametrize("status, expected", [(1, True), (0, False), (6, False), (7, True)])
+    def test_lock_state_reads_the_unlock_bit_with_interaction_off(
+        self, monkeypatch, status, expected
+    ):
+        calls = self._framework(monkeypatch, status=status)
+        assert macos_keychain._login_keychain_unlocked(LOGIN) is expected
+        assert calls[0] == ("interaction", False)  # before any keychain call
+        assert ("open", LOGIN.encode()) in calls
+
+    @pytest.mark.parametrize("failure", [{"open_rc": -25294}, {"status_rc": -25308}])
+    def test_lock_state_failure_is_unknown(self, monkeypatch, failure):
+        self._framework(monkeypatch, status=1, **failure)
+        assert macos_keychain._login_keychain_unlocked(LOGIN) is None
+
+    def test_lock_state_without_the_framework_is_unknown(self, monkeypatch):
+        def missing(path):
+            raise OSError("no such library")
+
+        monkeypatch.setattr(macos_keychain.ctypes, "CDLL", missing)
+        assert macos_keychain._login_keychain_unlocked(LOGIN) is None
 
     def test_not_applicable_off_macos(self):
         def never(args):
@@ -119,9 +183,15 @@ class TestSetting:
 
     @pytest.mark.parametrize(
         "stored, env, expected",
-        [("true", "0", False), ("false", "1", True), ("true", "junk", True)],
+        [
+            ("true", "0", True),  # a process's env cannot reopen the fallback
+            ("false", "1", True),
+            ("false", "0", False),
+            ("true", "junk", True),
+            ("false", "junk", False),
+        ],
     )
-    def test_env_wins(self, tmp_path, monkeypatch, stored, env, expected):
+    def test_env_may_only_tighten(self, tmp_path, monkeypatch, stored, env, expected):
         set_setting(tmp_path, "credentials.requireKeychain", stored)
         monkeypatch.setenv("HSWAP_REQUIRE_KEYCHAIN", env)
         assert require_keychain(tmp_path) is expected
@@ -665,3 +735,14 @@ class TestRequiredModeFetchPathR10:
         )
         s._fetch_active_usage("1", "a@example.com", expired, "")
         assert not (s.backup_dir / "cache" / consumed_grants.FILENAME).exists()
+
+
+class TestEnvOverrideCannotLoosen:
+    def test_zero_does_not_reopen_the_plaintext_fallback(self, temp_home, monkeypatch):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        monkeypatch.setenv("HSWAP_REQUIRE_KEYCHAIN", "0")
+        monkeypatch.setattr(macos_keychain, "set_password", _failing_set(None))
+        with pytest.raises(KeychainUnavailableError):
+            s._write_credentials(creds())
+        assert not (temp_home / ".claude" / ".credentials.json").exists()

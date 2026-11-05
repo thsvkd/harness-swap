@@ -1177,3 +1177,108 @@ class TestEnsureFileAtomic:
         assert [p.name for p in env.file.parent.iterdir() if ".credentials" in p.name] == [
             ".credentials.json"
         ]
+
+
+class TestFileStoreMustBeUpdated:
+    def _failing_file_writes(self, env, monkeypatch, *, failures=99):
+        real = env.store._store._write_active_credentials_file
+        left = [failures]
+        calls = []
+
+        def write(credentials):
+            calls.append(credentials)
+            if left[0] > 0:
+                left[0] -= 1
+                raise OSError("read-only")
+            real(credentials)
+
+        monkeypatch.setattr(env.store._store, "_write_active_credentials_file", write)
+        return calls
+
+    def test_refresh_with_a_stuck_file_is_not_reported_as_success(self, env, monkeypatch):
+        near = creds(expires_in_s=NEAR)
+        env.active(near)
+        env.file.write_text(near)
+        env.store._write_account_credentials(*SLOT, near)
+        self._failing_file_writes(env, monkeypatch)
+        report = env.run()
+        assert report["ok"] is False
+        assert report["error"] == {
+            "type": "refresh_failed", "message": "file store could not be updated",
+        }
+        assert report["action"] == "refreshed"
+        # The successor is safe, and the file still holds the spent token.
+        assert access_token(env.keychain_value()) == "sk-ant-oat01-ACCESS-NEW"
+        assert access_token(env.backup()) == "sk-ant-oat01-ACCESS-NEW"
+        assert env.file.read_text() == near
+        assert env.report_on_disk()["ok"] is False
+
+    def test_next_run_repairs_the_file_without_a_post(self, env, monkeypatch):
+        near = creds(expires_in_s=NEAR)
+        env.active(near)
+        env.file.write_text(near)
+        env.store._write_account_credentials(*SLOT, near)
+        with monkeypatch.context() as stuck:
+            self._failing_file_writes(env, stuck)
+            env.run()
+        assert len(env.post.posts) == 1
+        report = env.run()
+        assert report["ok"] is True and report["action"] == "synced-file"
+        assert len(env.post.posts) == 1
+        assert env.file.read_text() == env.keychain_value()
+
+    def test_one_failed_write_is_retried(self, env, monkeypatch):
+        env.active(creds("sk-new", expires_in_s=7200))
+        env.file.write_text(creds("sk-old", expires_in_s=3700))
+        calls = self._failing_file_writes(env, monkeypatch, failures=1)
+        report = env.run()
+        assert report["ok"] is True and report["action"] == "synced-file"
+        assert len(calls) == 2
+        assert env.file.read_text() == env.keychain_value()
+
+    def test_a_write_that_lands_wrong_is_caught_by_the_read_back(self, env, monkeypatch):
+        env.active(creds("sk-new", expires_in_s=7200))
+        env.file.write_text(creds("sk-old", expires_in_s=3700))
+        monkeypatch.setattr(
+            env.store._store, "_write_active_credentials_file", lambda credentials: None
+        )
+        report = env.run()
+        assert report["ok"] is False
+        assert report["error"]["message"] == "file store could not be updated"
+
+    def test_a_stuck_file_does_not_block_the_refresh(self, env, monkeypatch):
+        env.active(creds("sk-k", expires_in_s=NEAR))
+        env.file.write_text(creds("sk-f", expires_in_s=NEAR - 10))
+        env.store._write_account_credentials(*SLOT, env.keychain_value())
+        self._failing_file_writes(env, monkeypatch)
+        report = env.run()
+        assert report["action"] == "refreshed" and len(env.post.posts) == 1
+        assert report["error"]["message"] == "file store could not be updated"
+
+    def test_ensure_file_that_cannot_be_created_is_reported(self, env, monkeypatch):
+        env.active(creds())
+        self._failing_file_writes(env, monkeypatch)
+        report = env.run(ensure_file=True)
+        assert report["ok"] is False
+        assert report["error"]["message"] == "file store could not be updated"
+
+    def test_no_file_wanted_is_never_checked(self, env, monkeypatch):
+        env.active(creds(expires_in_s=NEAR))
+        env.store._write_account_credentials(*SLOT, env.keychain_value())
+        calls = self._failing_file_writes(env, monkeypatch)
+        report = env.run()
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert calls == [] and not env.file.exists()
+
+    def test_silently_swallowed_rewrite_is_the_case_this_guards(self, env, monkeypatch):
+        """The Keychain write's own file rewrite swallows its failure."""
+        near = creds(expires_in_s=NEAR)
+        env.active(near)
+        env.file.write_text(near)
+        env.store._write_account_credentials(*SLOT, near)
+        monkeypatch.setattr(
+            env.store._store, "_refresh_stale_credentials_file", lambda credentials: None
+        )
+        report = env.run()
+        assert report["ok"] is True  # the retry below it repaired the file
+        assert env.file.read_text() == env.keychain_value()

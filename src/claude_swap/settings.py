@@ -196,7 +196,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "credentials", "requireKeychain", "require_keychain", "bool",
-            help="macOS: refuse credential writes unless the login keychain is reachable (env: HSWAP_REQUIRE_KEYCHAIN=1|0)",
+            help="macOS: refuse credential writes unless the login keychain is reachable (HSWAP_REQUIRE_KEYCHAIN=1 forces it on)",
         ),
     )
 }
@@ -352,11 +352,13 @@ def load_credential_settings(backup_root: Path) -> CredentialSettings:
 
 
 def require_keychain(backup_root: Path) -> bool:
-    """Keychain-required mode: ``HSWAP_REQUIRE_KEYCHAIN=1|0`` wins over the setting."""
-    env = os.environ.get("HSWAP_REQUIRE_KEYCHAIN")
-    if env in ("0", "1"):
-        return env == "1"
-    return load_credential_settings(backup_root).require_keychain
+    """Keychain-required mode. The env may only tighten: ``HSWAP_REQUIRE_KEYCHAIN=1``
+    forces it on, and nothing in a process's environment can reopen the plaintext
+    fallback that the setting closed."""
+    return (
+        os.environ.get("HSWAP_REQUIRE_KEYCHAIN") == "1"
+        or load_credential_settings(backup_root).require_keychain
+    )
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

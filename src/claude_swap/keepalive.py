@@ -71,6 +71,7 @@ _MESSAGES = {
     "locked": "Credential locks stayed held; the next run retries.",
     "unmanaged": "The active login matches no managed account; add it to back it up.",
 }
+_FILE_NOT_UPDATED = "file store could not be updated"
 _UNSUPPORTED_STORE = (
     "CLAUDE_CONFIG_DIR or CLAUDE_SECURESTORAGE_CONFIG_DIR names a credential store "
     "keepalive does not manage; run it from a normal shell."
@@ -388,18 +389,42 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
         raise _Stop("split_brain")  # never trade a store's refresh token for none
 
     write_keychain = macos and keychain != composed
-    write_file = (bool(file_creds) or ensure_file) and file_creds != composed
+    file_wanted = bool(file_creds) or ensure_file
+    write_file = file_wanted and file_creds != composed
     if not dry_run:
         if write_keychain:
             store._write_oauth_credentials(composed)  # also rewrites a present file
-        if write_file and not (write_keychain and file_creds):
-            store._write_active_credentials_file(composed)
+        if file_wanted and (write_keychain or write_file):
+            _settle_file(store, report, composed)
     if write_keychain:
         report["action"] = "synced-keychain"
     elif write_file:
         report["action"] = "synced-file" if file_creds else "created-file"
     _report_expiry(report, composed)
     return composed
+
+
+def _file_text(path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _settle_file(store, report, expected: str) -> None:
+    """Processes that only see the file read it, so a write that silently missed
+    it must not read as success. The Keychain and the slot hold the login, so this
+    reports instead of raising and the next run's sync repairs the file."""
+    path = get_credentials_path()
+    for _ in range(2):
+        if _file_text(path) == expected:
+            return
+        try:
+            store._write_active_credentials_file(expected)
+        except (ClaudeSwitchError, OSError) as e:
+            _logger.warning("keepalive: file write failed: %s", type(e).__name__)
+    if _file_text(path) != expected:
+        report["error"] = {"type": "refresh_failed", "message": _FILE_NOT_UPDATED}
 
 
 def _spent_or_empty(loser: str, winner: str, verdict: bool | None) -> bool:
@@ -484,10 +509,9 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
         raise _Stop("refresh_failed")
 
     final = switcher._prepare_credentials_for_activation(outcome.credentials, current)
+    file_wanted = ensure_file or get_credentials_path().exists()
     try:
         store._write_oauth_credentials(final)
-        if ensure_file and not get_credentials_path().exists():
-            store._write_active_credentials_file(final)
     except (ClaudeSwitchError, OSError):
         # The gate stored it in the slot or its own stash, unless both failed.
         if not via_gate or (outcome.error and not outcome.stashed):
@@ -496,6 +520,8 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
                 "keepalive-live-write-failed",
             )
         raise
+    if file_wanted:
+        _settle_file(store, report, final)
     report["action"] = "refreshed"
     _report_expiry(report, final)
     if outcome.error is not None:

@@ -8,6 +8,9 @@ Run from the GUI session every few minutes, this refreshes well before that
 window and keeps both stores on one generation, so no Claude Code process ever
 reaches it. On Linux/Windows there is one store and only the refresh applies.
 
+The invariant: once a POST consumed a grant, its successor lands where the next
+run looks (the stores, the slot, or the stash), and no run POSTs a consumed token.
+
 The report is also the contract with whatever watches this machine: every run
 writes ``<store root>/cache/keepalive.json``. It carries no token and no path.
 """
@@ -16,17 +19,18 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from typing import NamedTuple
 
-from claude_swap import macos_keychain, oauth
+from claude_swap import consumed_grants, macos_keychain, oauth
 from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     _active_profile_is_default,
     _credential_object,
+    credential_generation,
 )
 from claude_swap.exceptions import (
     ClaudeSwitchError,
@@ -44,6 +48,10 @@ REPORT_FILENAME = "keepalive.json"
 # Same bound as `_fetch_active_usage`: the POST runs under locks a concurrent
 # switch waits on for 10 s.
 _POST_TIMEOUT_S = 6.0
+# The consume lock is named after the slot, so a switch landing while we wait for
+# it means releasing everything and starting over.
+_SLOT_ATTEMPTS = 3
+_UNMANAGED = "unmanaged"  # the stash's and the ledger's name for "no slot"
 
 _MESSAGES = {
     "keychain_unavailable": (
@@ -51,7 +59,8 @@ _MESSAGES = {
         "run keepalive from the logged-in GUI session."
     ),
     "relogin_required": (
-        "The refresh token was rejected; log in again and re-add the account."
+        "The refresh token was rejected or already spent; log in again and "
+        "re-add the account."
     ),
     "split_brain": (
         "The two stores hold different logins and the older one could not be "
@@ -79,6 +88,15 @@ class _Stop(Exception):
         self.message = message or _MESSAGES[kind]
 
 
+class _Active(NamedTuple):
+    """Who `.claude.json` says is logged in, read once."""
+
+    switcher: object
+    identity: tuple[str, str] | None
+    slot: str | None
+    accounts: dict
+
+
 def run_keepalive(
     switcher,
     *,
@@ -86,7 +104,7 @@ def run_keepalive(
     ensure_file: bool = False,
     dry_run: bool = False,
 ) -> dict:
-    """One pass. Never raises for an operational failure: the report says it."""
+    """One pass. Never raises for a failure of the run: the report says it."""
     report = {
         "schemaVersion": 1,
         "checkedAt": time.time(),
@@ -108,13 +126,7 @@ def run_keepalive(
         report["error"] = _error("keychain_unavailable")
     except LockError:
         report["error"] = _error("locked")
-    except (
-        ClaudeSwitchError,
-        macos_keychain.KeychainError,
-        OSError,
-        subprocess.TimeoutExpired,
-        ValueError,
-    ) as e:
+    except Exception as e:  # noqa: BLE001 - a watcher must always get a report
         _logger.warning("keepalive failed: %s", type(e).__name__)  # the text may hold a path
         report["error"] = _error("refresh_failed")
     report["ok"] = report["error"] is None
@@ -129,14 +141,18 @@ def _error(kind: str) -> dict:
     return {"type": kind, "message": _MESSAGES[kind]}
 
 
-def _keep(switcher, report, ahead, ensure_file, dry_run) -> None:
-    store = switcher._store
-    macos = switcher.platform == Platform.MACOS
-
+def _read_active(switcher) -> _Active:
     identity = switcher._get_current_account()
     data = switcher._get_sequence_data() or {}
     slot = switcher._find_account_slot(data, *identity) if identity else None
-    report["activeSlot"] = int(slot) if slot else None
+    return _Active(switcher, identity, slot, data.get("accounts", {}))
+
+
+def _keep(switcher, report, ahead, ensure_file, dry_run) -> None:
+    store = switcher._store
+    macos = switcher.platform == Platform.MACOS
+    active = _read_active(switcher)
+    report["activeSlot"] = int(active.slot) if active.slot else None
 
     # Switch and consume resolve the default store only; syncing another
     # profile's file against the default Keychain item would create a split.
@@ -147,35 +163,30 @@ def _keep(switcher, report, ahead, ensure_file, dry_run) -> None:
     if macos:
         if macos_keychain.keychain_reachable(platform="darwin") is False:
             raise _Stop("keychain_unavailable")
-        store.keychain_required = True  # whatever the setting says
+        store.pin_keychain()
+    store.records_consumed = True
 
-    token_account = None
-    final = None
-    with nullcontext() if dry_run else _locks(switcher, slot):
-        keychain, file_creds = _read_stores(store, macos)
-        if not keychain and not file_creds:
-            if store._read_managed_key():
-                report["note"] = "api_key"  # nothing here to sync or refresh
-                return _finish_unmanaged(report, slot)
-            raise _Stop("no_credentials")
-
-        backup = switcher._read_account_credentials_ex(slot, identity[0])[0] if slot else ""
-        final = _sync(switcher, report, slot, keychain, file_creds, backup, ensure_file, dry_run)
-        if _due(final, ahead):
-            if dry_run:
-                report["action"] = "refreshed"
-            else:
-                final, token_account = _refresh(
-                    switcher, report, slot, identity, final, backup, ensure_file
-                )
-
-    if slot and not dry_run:
-        _settle_slot(switcher, report, slot, identity, final, token_account)
-    _finish_unmanaged(report, slot)
+    if dry_run:
+        _pass(active, report, ahead, ensure_file, dry_run=True)
+        _finish(report, active, None, None, dry_run=True)
+        return
+    for _ in range(_SLOT_ATTEMPTS):
+        expected = _read_active(switcher).slot
+        with _locks(switcher, expected):
+            active = _read_active(switcher)
+            report["activeSlot"] = int(active.slot) if active.slot else None
+            if active.slot != expected:
+                continue
+            final, token_account = _pass(active, report, ahead, ensure_file, dry_run=False)
+        _finish(report, active, final, token_account, dry_run=False)
+        return
+    raise _Stop("locked")
 
 
-def _finish_unmanaged(report, slot) -> None:
-    if not slot and report["error"] is None:
+def _finish(report, active, final, token_account, dry_run) -> None:
+    if active.slot and final and not dry_run:
+        _settle_slot(active, report, final, token_account)
+    if not active.slot and report["error"] is None:
         report["error"] = _error("unmanaged")
 
 
@@ -192,6 +203,29 @@ def _locks(switcher, slot) -> Iterator[None]:
         yield
 
 
+def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict | None]:
+    switcher = active.switcher
+    store = switcher._store
+    keychain, file_creds = _read_stores(store, switcher.platform == Platform.MACOS)
+    if not keychain and not file_creds:
+        if store._read_managed_key():
+            report["note"] = "api_key"  # nothing here to sync or refresh
+            return None, None
+        raise _Stop("no_credentials")
+
+    backup, parked_entry = _adopted_backup(active, keychain, file_creds, dry_run)
+    final = _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run)
+    if parked_entry and oauth.credential_fingerprint(final) == oauth.credential_fingerprint(backup):
+        switcher._retire_stash_entry(parked_entry, _UNMANAGED)
+    token_account = None
+    if _due(final, ahead):
+        if dry_run:
+            report["action"] = "refreshed"
+        else:
+            final, token_account = _refresh(active, report, final, backup, ensure_file)
+    return final, token_account
+
+
 def _read_stores(store, macos: bool) -> tuple[str, str]:
     """The active login as each store holds it, ``""`` when absent."""
     keychain = ""
@@ -205,76 +239,153 @@ def _read_stores(store, macos: bool) -> tuple[str, str]:
     return keychain, file_creds if file_creds.strip() else ""
 
 
+def _adopted_backup(active, keychain, file_creds, dry_run) -> tuple[str, str | None]:
+    """The slot's copy, after adopting a successor parked for what the stores
+    still hold: posting past it would present a spent token. A login with no slot
+    has only the stash, whose copy plays the same part. Returns the entry to retire."""
+    switcher = active.switcher
+    email = active.identity[0] if active.identity else ""
+    backup = ""
+    if active.slot:
+        backup = switcher._read_account_credentials_ex(active.slot, email)[0]
+    if dry_run:
+        return backup, None
+    held = [creds for creds in (backup, keychain, file_creds) if creds]
+    if active.slot:
+        for creds in held:
+            adopted = switcher._adopt_stashed_successor(active.slot, email, creds)
+            if adopted:
+                return adopted, None
+        return backup, None
+    spent = {oauth.credential_fingerprint(creds) for creds in held}
+    for entry_id, row in switcher._store._read_stash_manifest().items():
+        if (
+            row.get("configSlot") == _UNMANAGED
+            and str(row.get("reason", "")).startswith("keepalive-")
+            and row.get("consumedFp") in spent
+        ):
+            parked, _ = switcher._store._read_unclaimed_credential(entry_id)
+            if parked:
+                return parked, entry_id
+    return backup, None
+
+
 def _oauth_payload(credentials: str) -> dict:
     data = _credential_object(credentials) or {}
     payload = data.get("claudeAiOauth")
     return payload if isinstance(payload, dict) else {}
 
 
-def _rank(credentials: str) -> float:
-    """``expiresAt`` for picking the newest copy. Claude Code wipes the token
-    fields in place when a refresh is rejected, so a copy with no access token
-    ranks last whatever date it still carries."""
-    payload = _oauth_payload(credentials)
-    expires_at = payload.get("expiresAt")
-    if not payload.get("accessToken") or isinstance(expires_at, bool):
-        return 0
-    return expires_at if isinstance(expires_at, (int, float)) else 0
+def _expires_at(credentials: str) -> float | None:
+    value = _oauth_payload(credentials).get("expiresAt")
+    return None if isinstance(value, bool) or not isinstance(value, (int, float)) else value
+
+
+def _is_expired(credentials: str) -> bool:
+    expires_at = _expires_at(credentials)
+    return expires_at is not None and expires_at <= time.time() * 1000
 
 
 def _due(credentials: str, ahead: float) -> bool:
-    payload = _oauth_payload(credentials)
-    if not payload.get("accessToken"):
+    if not _oauth_payload(credentials).get("accessToken"):
         return True  # nothing usable; the refresh attempt classifies it
-    expires_at = payload.get("expiresAt")
-    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+    expires_at = _expires_at(credentials)
+    if expires_at is None:
         return False  # a setup-token carries no expiry and has no refresh token
     return time.time() * 1000 + ahead * 1000 >= expires_at
 
 
-def _sync(switcher, report, slot, keychain, file_creds, backup, ensure_file, dry_run) -> str:
+def _belongs(active, credentials: str, backup: str, *, probe: bool) -> bool | None:
+    """Is this copy the current identity's login? None when nothing can tell."""
+    switcher = active.switcher
+    fingerprint = oauth.credential_fingerprint(credentials)
+    if active.slot and backup and fingerprint == oauth.credential_fingerprint(backup):
+        return True
+    spender = consumed_grants.slot_of(fingerprint)
+    if spender is not None:
+        return spender == (active.slot or _UNMANAGED)
+    for num, account in active.accounts.items():
+        if num != active.slot:
+            other = switcher._read_account_credentials_ex(num, account.get("email", ""))[0]
+            if other and oauth.credential_fingerprint(other) == fingerprint:
+                return False
+    token = _oauth_payload(credentials).get("accessToken")
+    if not probe or not token or _is_expired(credentials):
+        return None
+    # Network under these locks, like the POST: bounded at 5 s, and only reached
+    # when two stores drifted and nothing local can attribute a copy.
+    resolved = oauth.fetch_oauth_profile(token)
+    if not resolved:
+        return None
+    if active.slot:
+        return switcher._resolved_matches_slot_identity(active.slot, resolved, backfill=False)
+    if not active.identity:
+        return None
+    email, org_uuid = active.identity
+    if resolved.get("email") != email:
+        return False if resolved.get("email") else None
+    org = resolved.get("organizationUuid")
+    return None if org is None else (org or "") == org_uuid
+
+
+def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) -> str:
     """Bring both stores to the authoritative copy; returns what they now hold."""
+    switcher = active.switcher
     store = switcher._store
     macos = switcher.platform == Platform.MACOS
-    # A tie goes to the Keychain: it is what Claude Code reads first.
-    authoritative = keychain if _rank(keychain) >= _rank(file_creds) and keychain else file_creds
+    live = [creds for creds in (keychain, file_creds) if creds]
+    drifted = len({oauth.credential_fingerprint(creds) for creds in live}) > 1
+    verdicts: dict[str, bool | None] = {}
+
+    def belongs(creds: str) -> bool | None:
+        if creds not in verdicts:
+            verdicts[creds] = _belongs(active, creds, backup, probe=drifted)
+        return verdicts[creds]
+
+    # Newest first, the Keychain winning a tie (`sorted` is stable and Claude Code
+    # reads it first). The first that is not another account's: a switch this run
+    # did not see must not be undone by a stale, longer-lived copy.
+    ordered = sorted(live, key=credential_generation, reverse=True)
+    authoritative = next((creds for creds in ordered if belongs(creds) is not False), None)
     # The slot holding a newer generation means a live store was stranded on the
     # consumed one (a write that failed after a refresh): `_fetch_active_usage`
     # restores in that case too, and POSTing the live bytes could only fail.
-    if slot and _rank(backup) > _rank(authoritative) and _oauth_payload(backup).get("refreshToken"):
+    if _oauth_payload(backup).get("refreshToken") and (
+        credential_generation(backup) > credential_generation(authoritative)
+        if authoritative
+        # Every live copy is another account's. Overwriting a login takes a slot
+        # copy that can still work: a duplicated lineage can look foreign too.
+        else not _is_expired(backup)
+        and consumed_grants.slot_of(oauth.credential_fingerprint(backup)) is None
+    ):
         authoritative = backup
+    if authoritative is None:
+        raise _Stop("unmanaged")
 
     fingerprint = oauth.credential_fingerprint(authoritative)
-    losers = {
-        creds
-        for creds in (keychain, file_creds)
-        if creds and creds != authoritative
-        and oauth.credential_fingerprint(creds) != fingerprint
-    }
-    if losers:
-        report["note"] = "split_brain"
+    for loser in dict.fromkeys(live):
+        if loser == authoritative or oauth.credential_fingerprint(loser) == fingerprint:
+            continue
+        verdict = belongs(loser)
+        if verdict is True or _spent_or_empty(loser, authoritative, verdict):
+            continue  # a stale generation of this login is not a split
+        if verdict is False:
+            report["note"] = "split_brain"
         if not dry_run:
-            for loser in losers:
-                try:
-                    store._write_unclaimed_credential(
-                        loser,
-                        {
-                            "reason": "keepalive-split-brain",
-                            "configSlot": slot or "unmanaged",
-                            "fingerprint": oauth.credential_fingerprint(loser),
-                        },
-                    )
-                except (ClaudeSwitchError, OSError) as e:
-                    raise _Stop("split_brain") from e
+            _stash_loser(active, loser)
 
     # The engine's composition with the Keychain as the live store: it wins the
     # machine-shared fields (mcpOAuth, ...), the login comes from the winner.
-    live = keychain or file_creds
+    current = keychain or file_creds
     composed = (
         authoritative
-        if authoritative == live
-        else switcher._prepare_credentials_for_activation(authoritative, live)
+        if authoritative == current
+        else switcher._prepare_credentials_for_activation(authoritative, current)
     )
+    if not _oauth_payload(composed).get("refreshToken") and any(
+        _oauth_payload(creds).get("refreshToken") for creds in live
+    ):
+        raise _Stop("split_brain")  # never trade a store's refresh token for none
 
     write_keychain = macos and keychain != composed
     write_file = (bool(file_creds) or ensure_file) and file_creds != composed
@@ -291,38 +402,75 @@ def _sync(switcher, report, slot, keychain, file_creds, backup, ensure_file, dry
     return composed
 
 
+def _spent_or_empty(loser: str, winner: str, verdict: bool | None) -> bool:
+    """Nothing worth keeping: wiped token fields, or an unattributed copy that is
+    expired and older than the winner, so its refresh token is presumed consumed."""
+    payload = _oauth_payload(loser)
+    if not payload:
+        return False  # unparseable: we cannot say what it held
+    if not payload.get("accessToken") and not payload.get("refreshToken"):
+        return True
+    return (
+        verdict is None
+        and _is_expired(loser)
+        and (_expires_at(loser) or 0) < (_expires_at(winner) or 0)
+    )
+
+
+def _stash_loser(active, loser: str) -> None:
+    store = active.switcher._store
+    fingerprint = oauth.credential_fingerprint(loser)
+    try:
+        if any(
+            row.get("fingerprint") == fingerprint
+            for row in store._list_unclaimed_credentials().values()
+        ):
+            return
+        store._write_unclaimed_credential(
+            loser,
+            {
+                "reason": "keepalive-split-brain",
+                "configSlot": active.slot or _UNMANAGED,
+                "fingerprint": fingerprint,
+            },
+        )
+    except (ClaudeSwitchError, OSError) as e:
+        raise _Stop("split_brain") from e
+
+
 def _report_expiry(report, credentials: str) -> None:
-    report["accessExpiresAt"] = oauth.expires_at_iso(
-        _oauth_payload(credentials).get("expiresAt")
-    )
-    report["loginExpiresAt"] = oauth.expires_at_iso(
-        _oauth_payload(credentials).get("refreshTokenExpiresAt")
-    )
+    report["accessExpiresAt"] = oauth.expires_at_iso(_expires_at(credentials))
+    report["loginExpiresAt"] = oauth.login_expires_at_iso(credentials)
 
 
-def _refresh(
-    switcher, report, slot, identity, current, backup, ensure_file
-) -> tuple[str, dict | None]:
+def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | None]:
     """POST once, under every lock, on bytes just re-read. Writes the successor
     to the Keychain, a present file and the slot."""
+    switcher = active.switcher
     store = switcher._store
+    slot = active.slot
     fingerprint = oauth.credential_fingerprint(current)
     # The gate consumes the SLOT's copy, so it only applies when that copy is this
     # lineage, and only with these exact bytes: it reads any other access token as
     # "the world moved on" and hands the older copy back without a POST.
     via_gate = bool(slot and backup and oauth.credential_fingerprint(backup) == fingerprint)
     if via_gate:
+        email = active.identity[0]
         if backup != current:
-            switcher._write_account_credentials(slot, identity[0], current)
+            switcher._write_account_credentials(slot, email, current)
         outcome = switcher._consume_backup_grant_locked(
-            slot, identity[0], current, global_lock_held=True
+            slot, email, current, global_lock_held=True
         )
     else:
         # Unmanaged, or a rotation the slot has not caught up with. Posting the
         # live store's own grant is what Claude Code itself would do.
-        outcome = oauth.try_refresh_oauth_credentials(current, timeout_s=_POST_TIMEOUT_S)
+        outcome = switcher.post_refresh(
+            slot or _UNMANAGED, current, timeout_s=_POST_TIMEOUT_S
+        )
 
     if not outcome.credentials:
+        if outcome.error == "consumed":
+            raise _Stop("relogin_required")  # nothing parked and no POST can help
         if outcome.error in PERMANENT_AUTH_ERRORS:
             if slot:
                 switcher._usage_store.record(
@@ -330,7 +478,7 @@ def _refresh(
                         error=outcome.error,
                         struck_fp=outcome.consumed_fp or fingerprint,
                     )},
-                    {slot: tuple(identity)},
+                    {slot: active.identity},
                 )
             raise _Stop("relogin_required")
         raise _Stop("refresh_failed")
@@ -341,8 +489,12 @@ def _refresh(
         if ensure_file and not get_credentials_path().exists():
             store._write_active_credentials_file(final)
     except (ClaudeSwitchError, OSError):
-        if not via_gate:  # the grant is spent and no other store holds its successor
-            _stash_successor(store, outcome.credentials, fingerprint)
+        # The gate stored it in the slot or its own stash, unless both failed.
+        if not via_gate or (outcome.error and not outcome.stashed):
+            switcher.stash_consumed_successor(
+                slot or _UNMANAGED, outcome.credentials, fingerprint,
+                "keepalive-live-write-failed",
+            )
         raise
     report["action"] = "refreshed"
     _report_expiry(report, final)
@@ -353,37 +505,24 @@ def _refresh(
     return final, outcome.token_account
 
 
-def _stash_successor(store, credentials: str, consumed_fp: str | None) -> None:
-    try:
-        store._write_unclaimed_credential(
-            credentials,
-            {
-                "reason": "keepalive-live-write-failed",
-                "consumedFp": consumed_fp,
-                "fingerprint": oauth.credential_fingerprint(credentials),
-            },
-        )
-    except (ClaudeSwitchError, OSError):
-        _logger.error("keepalive: a refreshed credential could not be stored anywhere")
-
-
-def _settle_slot(switcher, report, slot, identity, final, token_account) -> None:
+def _settle_slot(active, report, final, token_account) -> None:
     """The slot's records, with no lock held: the identity helpers may take it."""
-    email, org_uuid = identity
+    switcher = active.switcher
+    slot = active.slot
+    email, org_uuid = active.identity
     store = switcher._usage_store
     if report["action"] == "refreshed":
-        store.clear_dead_token([slot], {slot: tuple(identity)})
+        store.clear_dead_token([slot], {slot: active.identity})
     login_expires_at = report["loginExpiresAt"]
-    if store.entries({slot: tuple(identity)})[slot].login_expires_at != login_expires_at:
-        store.set_login_expiry(slot, tuple(identity), login_expires_at)
+    if store.entries({slot: active.identity})[slot].login_expires_at != login_expires_at:
+        store.set_login_expiry(slot, active.identity, login_expires_at)
 
     # A lineage the slot does not hold yet, or a token answering as someone else.
+    fingerprint = oauth.credential_fingerprint(final) or ""
     if token_account:
         match = switcher._resolved_matches_slot_identity(slot, token_account)
         if match is not None:
-            key = switcher._lineage_key(slot, email, oauth.credential_fingerprint(final) or "")
-            switcher._probe_verdicts[key] = match
+            switcher._probe_verdicts[switcher._lineage_key(slot, email, fingerprint)] = match
     switcher._resync_rotated_backup(slot, email, org_uuid, final)
-    key = switcher._lineage_key(slot, email, oauth.credential_fingerprint(final) or "")
-    if switcher._probe_verdicts.get(key) is False:
+    if switcher._probe_verdicts.get(switcher._lineage_key(slot, email, fingerprint)) is False:
         report["error"] = _error("unmanaged")

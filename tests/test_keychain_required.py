@@ -4,16 +4,19 @@ fallback tests (tests/test_switcher.py, tests/test_credentials.py)."""
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from claude_swap import cli, macos_keychain
+from claude_swap import cli, consumed_grants, macos_keychain, oauth
 from claude_swap.exceptions import ClaudeSwitchError, KeychainUnavailableError
+from claude_swap.keepalive import run_keepalive
 from claude_swap.models import Platform
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -428,3 +431,237 @@ class TestNoFallback:
         s._write_credentials(creds())
         s._write_account_credentials("1", "a@example.com", creds())
         assert len(self._plaintext(s, temp_home)) == 2
+
+
+class TestNoReadPathWrites:
+    def _strip_org(self, s):
+        data = s._get_sequence_data()
+        del data["accounts"]["1"]["organizationUuid"]
+        s._write_json(s.sequence_file, data)
+
+    def test_R8_status_and_list_do_not_migrate_sequence_json(
+        self, temp_home, block_real_keychain, capsys
+    ):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        self._strip_org(s)
+        block_real_keychain.reachable = False
+        before = snapshot(temp_home, block_real_keychain)
+        s._build_status_payload()
+        s.status()
+        s.list_accounts(json_output=True)
+        s.list_accounts()
+        s.accounts_snapshot()
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_R8_status_cli_writes_nothing_with_a_pending_migration(
+        self, temp_home, block_real_keychain, capsys
+    ):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        self._strip_org(s)
+        block_real_keychain.reachable = False
+        before = snapshot(temp_home, block_real_keychain)
+        code, _, _ = _main(["status", "--json"], capsys)
+        assert code == 0
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_R8_construction_runs_no_migration_in_the_closed_view(
+        self, temp_home, block_real_keychain
+    ):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        block_real_keychain.reachable = False
+        state = s.backup_dir / ".migrations.json"
+        state.unlink()
+        with patch("claude_swap.models.Platform.detect", return_value=Platform.MACOS):
+            ClaudeAccountSwitcher()
+        assert not state.exists()
+
+    def test_R8_migration_still_runs_when_the_keychain_is_reachable(self, temp_home):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        self._strip_org(s)
+        assert "organizationUuid" in s._get_sequence_data_migrated()["accounts"]["1"]
+
+
+class TestEncDoesNotShadowR9:
+    @pytest.fixture
+    def store(self, temp_home):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        return s
+
+    def _seed(self, s, *, enc_expires, keychain_expires):
+        s._write_account_credentials(
+            "2", "b@example.com", creds("AT-kc", "RT-kc", expires_in_s=keychain_expires)
+        )
+        s._store._write_backup_enc(
+            "2", "b@example.com", creds("AT-enc", "RT-enc", expires_in_s=enc_expires)
+        )
+        return s._store._backup_enc_path("2", "b@example.com")
+
+    def _access(self, s):
+        return oauth.extract_oauth_data(s._read_account_credentials("2", "b@example.com"))[
+            "accessToken"
+        ]
+
+    def test_R9_newer_keychain_wins_and_the_stale_enc_goes(self, store):
+        enc = self._seed(store, enc_expires=100, keychain_expires=7200)
+        assert self._access(store) == "AT-kc"
+        assert not enc.exists()
+
+    def test_R9_newer_enc_still_wins(self, store):
+        enc = self._seed(store, enc_expires=7200, keychain_expires=100)
+        assert self._access(store) == "AT-enc"
+        assert enc.exists()
+
+    def test_R9_refresh_token_outranks_a_later_date(self, store):
+        enc = store._store._backup_enc_path("2", "b@example.com")
+        store._write_account_credentials("2", "b@example.com", creds("AT-kc", "RT-kc"))
+        data = json.loads(creds("AT-enc", "x", expires_in_s=99999))
+        del data["claudeAiOauth"]["refreshToken"]
+        store._store._write_backup_enc("2", "b@example.com", json.dumps(data))
+        assert self._access(store) == "AT-kc"
+        assert not enc.exists()
+
+    def test_R9_read_writes_nothing_when_the_keychain_is_unreachable(
+        self, store, block_real_keychain
+    ):
+        enc = self._seed(store, enc_expires=100, keychain_expires=7200)
+        block_real_keychain.reachable = False
+        store._read_account_credentials("2", "b@example.com")
+        assert enc.exists()
+
+    def test_R9_keychain_read_failure_falls_back_on_the_enc(self, store, monkeypatch):
+        self._seed(store, enc_expires=100, keychain_expires=7200)
+        monkeypatch.setattr(
+            macos_keychain, "get_password",
+            lambda *a: (_ for _ in ()).throw(macos_keychain.KeychainError("denied")),
+        )
+        assert self._access(store) == "AT-enc"
+
+    def test_R9_default_mode_keeps_enc_wins(self, temp_home):
+        s = macos_store(temp_home)
+        self._seed(s, enc_expires=100, keychain_expires=7200)
+        assert self._access(s) == "AT-enc"
+
+
+class _RotatingEndpoint:
+    def __init__(self):
+        self.posts = []
+
+    def __call__(self, request, timeout=None):
+        self.posts.append(json.loads(request.data)["refresh_token"])
+        n = len(self.posts)
+        return io.BytesIO(json.dumps({
+            "access_token": f"AT-{n}", "refresh_token": f"RT-{n}", "expires_in": 28800,
+        }).encode())
+
+
+class TestRequiredModeFetchPathR10:
+    @pytest.fixture
+    def setup(self, temp_home, block_real_keychain, monkeypatch):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        expired = creds("AT-0", "RT-0", expires_in_s=-100)
+        block_real_keychain.data[ACTIVE_ITEM] = expired
+        s._write_account_credentials("1", "a@example.com", expired)
+        endpoint = _RotatingEndpoint()
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", endpoint)
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            lambda *a, **kw: oauth.UsageOutcome(None, error="timeout"),
+        )
+        return s, expired, endpoint
+
+    def test_R10_successor_survives_a_keychain_that_fails_after_the_post(
+        self, setup, block_real_keychain, monkeypatch
+    ):
+        s, expired, endpoint = setup
+        real_set = block_real_keychain.set_password
+        real_endpoint = endpoint
+
+        def post_then_lock(request, timeout=None):
+            response = real_endpoint(request, timeout)
+            monkeypatch.setattr(macos_keychain, "set_password", _failing_set(None))
+            return response
+
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", post_then_lock)
+        s._fetch_active_usage("1", "a@example.com", expired, "")
+        assert endpoint.posts == ["RT-0"]
+        spent = oauth.credential_fingerprint(expired)
+        assert consumed_grants.slot_of(spent) == "1"
+        rows = s._store._list_unclaimed_credentials()
+        assert [row["consumedFp"] for row in rows.values()] == [spent]
+        assert [row["configSlot"] for row in rows.values()] == ["1"]
+        assert not list(s.credentials_dir.glob(".creds-*.enc"))
+        assert not (s.home / ".claude" / ".credentials.json").exists()
+
+        # The next pass, on the same path, adopts it instead of posting again.
+        monkeypatch.setattr(macos_keychain, "set_password", real_set)
+        fresh = ClaudeAccountSwitcher()
+        fresh.platform = Platform.MACOS
+        fresh._fetch_active_usage("1", "a@example.com", expired, "")
+        assert endpoint.posts == ["RT-0"]
+        assert oauth.extract_access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
+        assert oauth.extract_access_token(fresh._read_account_credentials("1", "a@example.com")) == "AT-1"
+        assert fresh._store._list_unclaimed_credentials() == {}
+
+    def test_R10_keepalive_adopts_what_the_fetch_path_parked(
+        self, setup, block_real_keychain, monkeypatch
+    ):
+        s, expired, endpoint = setup
+        s.stash_consumed_successor(
+            "1", creds("AT-P", "RT-P"), oauth.credential_fingerprint(expired),
+            "active-refresh-persist-failed",
+        )
+        consumed_grants.record(oauth.credential_fingerprint(expired), "1")
+        report = run_keepalive(s)
+        assert report["ok"] is True and report["action"] == "synced-keychain"
+        assert endpoint.posts == []
+        assert oauth.extract_access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-P"
+
+    def test_R10_fetch_path_preflights_before_the_post(
+        self, setup, block_real_keychain
+    ):
+        s, expired, endpoint = setup
+        assert s.keychain_gate_closed() is False  # a cached answer: reachable
+        block_real_keychain.reachable = False
+        before = snapshot(s.home, block_real_keychain)
+        s._fetch_active_usage("1", "a@example.com", expired, "")
+        assert endpoint.posts == []
+        assert snapshot(s.home, block_real_keychain) == before
+
+    def test_R10_consume_gate_and_freshen_preflight_before_the_post(
+        self, setup, block_real_keychain
+    ):
+        from claude_swap.autoswitch import AutoSwitchEngine
+        from claude_swap.settings import load_settings
+
+        s, _, endpoint = setup
+        stale = creds("AT-b", "RT-b", expires_in_s=-100)
+        s._write_account_credentials("2", "b@example.com", stale)
+        assert s.keychain_gate_closed() is False
+        block_real_keychain.reachable = False
+        assert s.consume_backup_grant("2", "b@example.com", stale).error == "transient"
+        # Still inside the cached answer's TTL: the POST itself re-asks.
+        s._keychain_gate = (time.monotonic(), False)
+        assert s._consume_backup_grant_locked("2", "b@example.com", stale).error == "transient"
+        s._keychain_gate = (time.monotonic(), False)
+        engine = AutoSwitchEngine(s, load_settings(s.backup_dir), lambda event: None)
+        assert engine._freshen_target("2", "b@example.com") == "transient"
+        assert endpoint.posts == []
+
+    def test_R10_default_mode_records_no_ledger(self, temp_home, block_real_keychain, monkeypatch):
+        s = macos_store(temp_home)
+        expired = creds("AT-0", "RT-0", expires_in_s=-100)
+        block_real_keychain.data[ACTIVE_ITEM] = expired
+        s._write_account_credentials("1", "a@example.com", expired)
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", _RotatingEndpoint())
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            lambda *a, **kw: oauth.UsageOutcome(None, error="timeout"),
+        )
+        s._fetch_active_usage("1", "a@example.com", expired, "")
+        assert not (s.backup_dir / "cache" / consumed_grants.FILENAME).exists()

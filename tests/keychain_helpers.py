@@ -66,12 +66,11 @@ def macos_store(home: Path, *, active: str = "a@example.com") -> ClaudeAccountSw
 
 def snapshot(home: Path, keychain) -> dict:
     """Every credential-bearing byte: the files under HOME and the Keychain fake."""
-    skip = {".log", ".lock", ".takeover"}
     files = {
         str(path.relative_to(home)): path.read_bytes()
         for path in sorted(home.rglob("*"))
         if path.is_file()
-        and path.suffix not in skip
+        and not path.name.endswith((".log", ".lock", ".takeover"))
         and path.name != "keepalive.json"
     }
     return {"files": files, "keychain": dict(keychain.data)}

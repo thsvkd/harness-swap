@@ -259,6 +259,23 @@ ACCOUNT_CREDENTIAL_KEYS = frozenset({
 })
 
 
+def credential_generation(credentials: str | None) -> tuple[bool, float]:
+    """Orders copies of one login: a refresh token beats none, then the later
+    ``expiresAt``. Claude Code wipes the token fields in place when a refresh is
+    rejected, so a date on a copy with no access token counts for nothing."""
+    data = _credential_object(credentials)
+    payload = data.get("claudeAiOauth") if data else None
+    if not isinstance(payload, dict):
+        return (False, 0)
+    expires_at = payload.get("expiresAt")
+    usable = (
+        payload.get("accessToken")
+        and isinstance(expires_at, (int, float))
+        and not isinstance(expires_at, bool)
+    )
+    return (bool(payload.get("refreshToken")), expires_at if usable else 0)
+
+
 def shared_credential_fields(credentials: str | None) -> dict | None:
     """Return the machine-shared fields of a Claude OAuth credential object.
 
@@ -399,15 +416,30 @@ class CredentialStore:
         # Set by a command that needs keychain-required semantics whatever the
         # setting says (keepalive).
         self.keychain_required: bool = False
+        # Likewise for the consumed-grant ledger (keepalive, on every platform).
+        self.records_consumed: bool = False
+
+    def pin_keychain(self) -> None:
+        """Reachability is proven: Keychain semantics from here, whatever the
+        setting says, and no backoff an earlier failure armed in this process."""
+        self.keychain_required = True
+        self._keychain_usable_cache = None
+        self._keychain_disabled_until = 0.0
+
+    def _keychain_is_required(self) -> bool:
+        if self._host.platform != Platform.MACOS:
+            return False
+        # credentials_dir is <backup root>/credentials; the host view is data only.
+        return self.keychain_required or require_keychain(
+            self._host.credentials_dir.parent
+        )
+
+    def records_consumed_grants(self) -> bool:
+        return self.records_consumed or self._keychain_is_required()
 
     def _refuse_file_fallback(self, cause: Exception | None = None) -> None:
         """Keychain-required mode: a Keychain failure raises, never reaches a file."""
-        if self._host.platform != Platform.MACOS:
-            return
-        # credentials_dir is <backup root>/credentials; the host view is data only.
-        if self.keychain_required or require_keychain(
-            self._host.credentials_dir.parent
-        ):
+        if self._keychain_is_required():
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE) from cause
 
     def _kc_call(self, fn, *args):
@@ -433,6 +465,10 @@ class CredentialStore:
             # observation, and an observation cannot be undone by a later
             # choice. See `_keychain_unreadable`.
             self._keychain_op_failed = True
+            if self._keychain_is_required():
+                # No file mode to route to, and sticking would refuse the next
+                # write after one transient failure: a spent grant's successor.
+                raise
             self._keychain_usable_cache = False
             # Monotonic so a wall-clock jump can't expire the cooldown early/late.
             self._keychain_disabled_until = (
@@ -1356,6 +1392,8 @@ class CredentialStore:
                     # failure, so this does NOT mark `failed`.
                     self._host._logger.warning(f"Failed to read credentials file: {e}")
                 else:
+                    if decoded and self._keychain_is_required():
+                        return self._newest_backup(account_num, email, decoded, cached)
                     if decoded:
                         return decoded
                     # Empty/whitespace .enc is not a real backup → try the Keychain.
@@ -1378,6 +1416,25 @@ class CredentialStore:
                     failed.append(True)
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
+
+    def _newest_backup(
+        self, account_num: str, email: str, enc_value: str, cached: bool
+    ) -> str:
+        """Keychain-required mode ranks by generation: `.enc`-wins exists for a
+        Keychain that may be stale, and here the `.enc` is the leftover."""
+        try:
+            keychain_value = self._kc_read_backup(account_num, email, cached=cached)
+        except macos_keychain.KEYCHAIN_ERRORS:
+            return enc_value
+        if credential_generation(keychain_value) <= credential_generation(enc_value):
+            return enc_value
+        # A read path may not write from a process that cannot reach the keychain.
+        if macos_keychain.keychain_reachable(platform="darwin") is not False:
+            try:
+                self._backup_enc_path(account_num, email).unlink(missing_ok=True)
+            except OSError as e:
+                self._host._logger.warning(f"Could not remove a stale .enc: {e}")
+        return keychain_value
 
     def _read_account_credentials_ex(
         self, account_num: str, email: str, *, cached: bool = False

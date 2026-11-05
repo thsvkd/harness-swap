@@ -17,7 +17,14 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import claude_locks, cli, keepalive, macos_keychain, oauth
+from claude_swap import (
+    claude_locks,
+    cli,
+    consumed_grants,
+    keepalive,
+    macos_keychain,
+    oauth,
+)
 from claude_swap.keepalive import run_keepalive
 from claude_swap.models import Platform
 from claude_swap.settings import set_setting
@@ -28,6 +35,8 @@ from .keychain_helpers import ACTIVE_ITEM, creds, macos_store, snapshot
 SLOT = ("1", "a@example.com")
 IDENTITY = {"1": ("a@example.com", "")}
 NEAR = 600  # inside the default --ahead, outside Claude Code's 5 minutes
+OWN_ACCOUNT = {"uuid": "uuid-1", "email": "a@example.com", "organizationUuid": ""}
+OTHER_ACCOUNT = {"uuid": "uuid-9", "email": "z@example.com", "organizationUuid": ""}
 
 
 class TokenEndpoint:
@@ -136,11 +145,14 @@ class TestSync:
         assert report["action"] == "synced-keychain"
         assert env.keychain_value() == env.file.read_text()
 
-    def test_different_lineages_stash_the_loser_then_sync(self, env):
+    def test_different_account_stashes_the_loser_then_syncs(self, env, monkeypatch):
         winner = creds("sk-win", "rt-win", expires_in_s=7200)
         loser = creds("sk-lose", "rt-lose", expires_in_s=3700)
         env.active(loser)
         env.file.write_text(winner)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: (
+            OTHER_ACCOUNT if token == "sk-lose" else OWN_ACCOUNT
+        ))
         report = env.run()
         assert report["action"] == "synced-keychain"
         assert report["note"] == "split_brain"
@@ -151,10 +163,13 @@ class TestSync:
         entry = next(iter(stash))
         assert env.store._store._read_unclaimed_credential(entry)[0] == loser
 
-    def test_different_lineages_file_loses_too(self, env):
+    def test_different_account_file_loses_too(self, env, monkeypatch):
         env.active(creds("sk-win", "rt-win", expires_in_s=7200))
         loser = creds("sk-lose", "rt-lose", expires_in_s=3700)
         env.file.write_text(loser)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: (
+            OTHER_ACCOUNT if token == "sk-lose" else OWN_ACCOUNT
+        ))
         report = env.run()
         assert report["action"] == "synced-file" and report["note"] == "split_brain"
         assert env.file.read_text() == env.keychain_value()
@@ -531,9 +546,12 @@ class TestReport:
         on_disk = env.report_on_disk()
         assert on_disk["ok"] is False and on_disk["error"]["type"] == "no_credentials"
 
-    def test_dry_run_changes_nothing_and_says_so(self, env):
+    def test_dry_run_changes_nothing_and_says_so(self, env, monkeypatch):
         env.active(creds("sk-k", "rt-a", expires_in_s=NEAR))
         env.file.write_text(creds("sk-f", "rt-b", expires_in_s=NEAR - 10))
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: (
+            OTHER_ACCOUNT if token == "sk-f" else OWN_ACCOUNT
+        ))
         before = snapshot(env.home, env.keychain)
         report = env.run(dry_run=True, ensure_file=True)
         assert report["dryRun"] is True
@@ -601,10 +619,13 @@ class TestCli:
 
     def test_no_token_or_home_path_anywhere(self, env, capsys):
         """Every outcome, stdout, stderr and the file."""
-        access, refresh = "sk-ant-oat01-SECRETACCESS", "sk-ant-ort01-SECRETREFRESH"
-        secret = creds(access, refresh, expires_in_s=NEAR)
+        refresh = "sk-ant-ort01-SECRETREFRESH"
+        generation = iter(range(100))
 
         def reset():
+            # A fresh grant each time: a spent one is refused before any POST.
+            n = next(generation)
+            secret = creds(f"sk-ant-oat01-SECRET{n}", f"{refresh}{n}", expires_in_s=NEAR)
             env.active(secret)
             env.file.write_text(secret)
             env.store._write_account_credentials(*SLOT, secret)
@@ -644,3 +665,515 @@ class TestCli:
         env.active(creds())
         code, *_ = self._main(["--json"], capsys)
         assert code == 0
+
+
+class RotatingEndpoint:
+    """Rotates like the real one: a consumed refresh token gets invalid_grant."""
+
+    def __init__(self):
+        self.posts = []
+        self.spent = set()
+
+    def __call__(self, request, timeout=None):
+        token = json.loads(request.data)["refresh_token"]
+        self.posts.append(token)
+        if token in self.spent:
+            raise urllib.error.HTTPError(
+                "u", 400, "bad", {}, io.BytesIO(b'{"error":"invalid_grant"}')
+            )
+        self.spent.add(token)
+        n = len(self.spent)
+        return io.BytesIO(json.dumps({
+            "access_token": f"AT-{n}", "refresh_token": f"RT-{n}", "expires_in": 28800,
+        }).encode())
+
+
+@pytest.fixture
+def rotating(monkeypatch):
+    fake = RotatingEndpoint()
+    monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", fake)
+    monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+    return fake
+
+
+def new_process():
+    s = ClaudeAccountSwitcher()
+    s.platform = Platform.MACOS
+    return s
+
+
+def strikes(s):
+    return s._usage_store.entries(IDENTITY)["1"].auth_dead_strikes
+
+
+def _active_item_write_fails(keychain):
+    real = keychain.set_password
+
+    def set_password(service, account, password):
+        if service == ACTIVE_ITEM[0]:
+            raise macos_keychain.KeychainError("-25308")
+        real(service, account, password)
+
+    return set_password
+
+
+class TestConsumedGrantIsNeverPostedAgain:
+    def test_R1_one_transient_read_failure_does_not_strand_the_successor(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s = macos_store(temp_home)
+        near = creds("AT-0", "RT-0", expires_in_s=NEAR)
+        block_real_keychain.data[ACTIVE_ITEM] = near
+        s._write_account_credentials(*SLOT, near)
+        real_get = macos_keychain.get_password
+        failures = [macos_keychain.KeychainError("transient")]
+
+        def flaky(service, account):
+            if (service, account) == ACTIVE_ITEM and failures:
+                raise failures.pop()
+            return real_get(service, account)
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky)
+        report = run_keepalive(s)
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
+
+        second = new_process()
+        assert run_keepalive(second)["ok"] is True
+        assert rotating.posts == ["RT-0"]
+        assert strikes(second) == 0
+
+    def test_R1_a_backoff_armed_before_the_run_is_cleared(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home)
+        near = creds("AT-0", "RT-0", expires_in_s=NEAR)
+        block_real_keychain.data[ACTIVE_ITEM] = near
+        s._write_account_credentials(*SLOT, near)
+        # A failure in this process before keepalive proved reachability.
+        s._store._keychain_usable_cache = False
+        s._store._keychain_disabled_until = time.monotonic() + 60
+        report = run_keepalive(s)
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
+        assert rotating.posts == ["RT-0"]
+
+    def test_R1_routing_is_not_sticky_when_the_keychain_is_required(
+        self, temp_home, block_real_keychain, monkeypatch
+    ):
+        s = macos_store(temp_home)
+        s._store.keychain_required = True
+        monkeypatch.setattr(
+            macos_keychain, "get_password",
+            lambda *a: (_ for _ in ()).throw(macos_keychain.KeychainError("transient")),
+        )
+        with pytest.raises(macos_keychain.KeychainError):
+            s._store._kc_call(macos_keychain.get_password, "svc", "acct")
+        assert s._store._use_keychain() is True
+        assert s._store._keychain_disabled_until == 0.0
+
+    def test_R2_direct_post_write_failure_is_adopted_not_reposted(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s = macos_store(temp_home)
+        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-0", "RT-0", expires_in_s=NEAR)
+        # The slot is one rotation behind, so this POST bypasses the gate.
+        s._write_account_credentials(*SLOT, creds("AT-old", "RT-old", expires_in_s=-100))
+        real_set = block_real_keychain.set_password
+        monkeypatch.setattr(
+            macos_keychain, "set_password", _active_item_write_fails(block_real_keychain)
+        )
+        report = run_keepalive(s)
+        assert report["error"]["type"] == "keychain_unavailable"
+        assert rotating.posts == ["RT-0"]
+
+        monkeypatch.setattr(macos_keychain, "set_password", real_set)
+        second = new_process()
+        report = run_keepalive(second)
+        assert report["ok"] is True and report["action"] == "synced-keychain"
+        assert rotating.posts == ["RT-0"]
+        assert strikes(second) == 0
+        assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
+        assert second._store._list_unclaimed_credentials() == {}
+        assert access_token(second._read_account_credentials(*SLOT)) == "AT-1"
+
+    def test_R2_unmanaged_successor_is_adopted_from_the_stash(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s = macos_store(temp_home, active="stranger@example.com")
+        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-0", "RT-0", expires_in_s=NEAR)
+        real_set = block_real_keychain.set_password
+        monkeypatch.setattr(
+            macos_keychain, "set_password", _active_item_write_fails(block_real_keychain)
+        )
+        assert run_keepalive(s)["error"]["type"] == "keychain_unavailable"
+        monkeypatch.setattr(macos_keychain, "set_password", real_set)
+        second = new_process()
+        report = run_keepalive(second)
+        assert report["action"] == "synced-keychain"
+        assert report["error"]["type"] == "unmanaged"
+        assert rotating.posts == ["RT-0"]
+        assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
+        assert second._store._list_unclaimed_credentials() == {}
+
+    def test_spent_token_with_nothing_parked_is_relogin_without_a_post(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home)
+        spent = creds("AT-0", "RT-0", expires_in_s=NEAR)
+        block_real_keychain.data[ACTIVE_ITEM] = spent
+        s._write_account_credentials(*SLOT, spent)
+        assert run_keepalive(s)["action"] == "refreshed"
+        # Something outside hswap put the spent generation back everywhere.
+        block_real_keychain.data[ACTIVE_ITEM] = spent
+        s._write_account_credentials(*SLOT, spent)
+        report = run_keepalive(new_process())
+        assert report["ok"] is False and report["error"]["type"] == "relogin_required"
+        assert rotating.posts == ["RT-0"]
+
+    def test_ledger_holds_fingerprints_only_at_0600(self, env):
+        near = creds("AT-LEDGER", "RT-LEDGER", expires_in_s=NEAR)
+        env.active(near)
+        env.store._write_account_credentials(*SLOT, near)
+        env.run()
+        path = env.store.backup_dir / "cache" / consumed_grants.FILENAME
+        text = path.read_text()
+        assert oauth.credential_fingerprint(near) in text
+        assert "RT-LEDGER" not in text and "sk-ant" not in text
+        if os.name == "posix":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_ledger_stays_bounded(self, temp_home):
+        for n in range(consumed_grants.MAX_ENTRIES + 5):
+            consumed_grants.record(f"sha256:{n}", "1")
+        assert consumed_grants.slot_of("sha256:0") is None
+        assert consumed_grants.slot_of(f"sha256:{consumed_grants.MAX_ENTRIES + 4}") == "1"
+
+    def test_a_server_that_does_not_rotate_spends_nothing(self, env, monkeypatch):
+        near = creds("AT-0", "RT-same", expires_in_s=NEAR)
+        env.active(near)
+        env.store._write_account_credentials(*SLOT, near)
+
+        def no_rotation(request, timeout=None):
+            return io.BytesIO(json.dumps({"access_token": "AT-1", "expires_in": 28800}).encode())
+
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", no_rotation)
+        assert env.run()["action"] == "refreshed"
+        assert consumed_grants.slot_of(oauth.credential_fingerprint(near)) is None
+
+    def test_the_post_chokepoint_refuses_every_path(self, temp_home, rotating):
+        spent = creds("AT-0", "RT-0")
+        consumed_grants.record(oauth.credential_fingerprint(spent), "1")
+        assert oauth.try_refresh_oauth_credentials(spent).error == "consumed"
+        assert rotating.posts == []
+
+    def test_consume_gate_adopts_a_keepalive_stash_before_it_would_post(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home)
+        spent = creds("AT-0", "RT-0", expires_in_s=NEAR)
+        s._write_account_credentials(*SLOT, spent)
+        consumed_grants.record(oauth.credential_fingerprint(spent), "1")
+        s.stash_consumed_successor(
+            "1", creds("AT-1", "RT-1"), oauth.credential_fingerprint(spent),
+            "keepalive-live-write-failed",
+        )
+        outcome = s.consume_backup_grant(*SLOT, spent)
+        assert outcome.error is None and access_token(outcome.credentials) == "AT-1"
+        assert rotating.posts == []
+
+
+class TestSwitchWhileWaitingR3:
+    def _racing_lock(self, monkeypatch, home, keychain, *, file_copy=None):
+        """A switch 1 -> 2 finishes while keepalive waits on the locks."""
+        real = keepalive.claude_credentials_lock
+        b = creds("AT-B", "RT-B", expires_in_s=7200)
+
+        @contextmanager
+        def racing():
+            with real():
+                keychain.data[ACTIVE_ITEM] = b
+                (home / ".claude.json").write_text(json.dumps({
+                    "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
+                }))
+                yield
+
+        monkeypatch.setattr(keepalive, "claude_credentials_lock", racing)
+        return b
+
+    def test_R3_account_switched_away_from_is_not_resurrected(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s = macos_store(temp_home)
+        a = creds("AT-A", "RT-A", expires_in_s=20000)
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", creds("AT-B", "RT-B", expires_in_s=7200))
+        b = self._racing_lock(monkeypatch, temp_home, block_real_keychain)
+        report = run_keepalive(s)
+        assert report["ok"] is True and report["activeSlot"] == 2
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+        assert rotating.posts == []
+
+    def test_R3_consume_lock_follows_the_slot_after_a_switch(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s = macos_store(temp_home)
+        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-A", "RT-A")
+        s._write_account_credentials("2", "b@example.com", creds("AT-B", "RT-B", expires_in_s=7200))
+        self._racing_lock(monkeypatch, temp_home, block_real_keychain)
+        taken = []
+        real_file_lock = keepalive.FileLock
+
+        def spying(path, *a, **kw):
+            taken.append(path.name)
+            return real_file_lock(path, *a, **kw)
+
+        monkeypatch.setattr(keepalive, "FileLock", spying)
+        run_keepalive(s)
+        consumes = [name for name in taken if name.startswith(".consume-")]
+        assert consumes == [".consume-1.lock", ".consume-2.lock"]
+
+    def test_R3_a_stale_longer_lived_copy_of_the_old_account_loses(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home, active="b@example.com")
+        a = creds("AT-A", "RT-A", expires_in_s=20000)
+        b = creds("AT-B", "RT-B", expires_in_s=7200)
+        s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", b)
+        block_real_keychain.data[ACTIVE_ITEM] = b
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(a)
+        report = run_keepalive(s)
+        assert report["activeSlot"] == 2 and report["action"] == "synced-file"
+        assert report["note"] == "split_brain"
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+        assert file_path.read_text() == b
+
+    def test_R3_only_the_old_accounts_copy_live_restores_the_slot(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home, active="b@example.com")
+        a = creds("AT-A", "RT-A", expires_in_s=20000)
+        b = creds("AT-B", "RT-B", expires_in_s=7200)
+        s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", b)
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        report = run_keepalive(s)
+        assert report["action"] == "synced-keychain"
+        assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-B"
+
+    @pytest.mark.parametrize("spent", [False, True], ids=["expired", "on-ledger"])
+    def test_R3_a_slot_copy_that_cannot_work_never_overwrites_a_live_login(
+        self, temp_home, block_real_keychain, rotating, spent
+    ):
+        s = macos_store(temp_home, active="b@example.com")
+        a = creds("AT-A", "RT-A", expires_in_s=20000)
+        b = creds("AT-B", "RT-B", expires_in_s=7200 if spent else -60)
+        s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", b)
+        if spent:
+            consumed_grants.record(oauth.credential_fingerprint(b), "2")
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        report = run_keepalive(s)
+        assert report["error"]["type"] == "unmanaged"
+        assert block_real_keychain.data[ACTIVE_ITEM] == a
+        assert rotating.posts == []
+
+    def test_R3_nothing_matches_the_identity_changes_nothing(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home, active="b@example.com")
+        a = creds("AT-A", "RT-A", expires_in_s=NEAR)
+        s._write_account_credentials("1", "a@example.com", a)
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        report = run_keepalive(s)
+        assert report["ok"] is False and report["error"]["type"] == "unmanaged"
+        assert block_real_keychain.data[ACTIVE_ITEM] == a
+        assert rotating.posts == []
+
+    def test_R3_slot_that_keeps_moving_reports_locked(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s = macos_store(temp_home)
+        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-A", "RT-A", expires_in_s=NEAR)
+        real = keepalive._read_active
+        calls = iter(range(100))
+
+        def moving(switcher):
+            active = real(switcher)
+            return active._replace(slot=str(next(calls)))
+
+        monkeypatch.setattr(keepalive, "_read_active", moving)
+        report = run_keepalive(s)
+        assert report["error"]["type"] == "locked"
+        assert rotating.posts == []
+
+
+class TestGenerationRankR4:
+    def _access_only(self, expires_in_s):
+        data = json.loads(creds("AT-F", "x", expires_in_s=expires_in_s))
+        del data["claudeAiOauth"]["refreshToken"]
+        return json.dumps(data)
+
+    def test_R4_a_copy_with_a_refresh_token_beats_a_later_one_without(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home)
+        full = creds("AT-K", "RT-K", expires_in_s=7200)
+        block_real_keychain.data[ACTIVE_ITEM] = full
+        s._write_account_credentials(*SLOT, full)
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(self._access_only(9000))
+        report = run_keepalive(s)
+        assert report["action"] == "synced-file"
+        assert block_real_keychain.data[ACTIVE_ITEM] == full
+        assert file_path.read_text() == full
+
+    def test_R4_file_with_a_refresh_token_replaces_an_access_only_keychain(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s = macos_store(temp_home)
+        block_real_keychain.data[ACTIVE_ITEM] = self._access_only(9000)
+        (temp_home / ".claude" / ".credentials.json").write_text(creds("AT-F", "RT-F"))
+        run_keepalive(s)
+        stored = oauth.extract_oauth_data(block_real_keychain.data[ACTIVE_ITEM])
+        assert stored["refreshToken"] == "RT-F"
+
+    def test_R4_never_trades_a_refresh_token_for_none(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        # The refresh-token copy is another account's, so it cannot win, and the
+        # access-only one must not overwrite it either.
+        s = macos_store(temp_home, active="stranger@example.com")
+        foreign = creds("AT-A", "RT-A", expires_in_s=7200)
+        s._write_account_credentials("1", "a@example.com", foreign)
+        block_real_keychain.data[ACTIVE_ITEM] = foreign
+        file_copy = self._access_only(9000)
+        (temp_home / ".claude" / ".credentials.json").write_text(file_copy)
+        report = run_keepalive(s)
+        assert report["ok"] is False and report["error"]["type"] == "split_brain"
+        assert block_real_keychain.data[ACTIVE_ITEM] == foreign
+
+
+class TestReportSurvivesR6:
+    def test_R6_null_oauth_account_still_reports(self, env, capsys):
+        env.active(creds())
+        (env.home / ".claude.json").write_text(json.dumps({"oauthAccount": None}))
+        report = env.run()
+        assert report["ok"] is False and report["error"]["type"] == "unmanaged"
+        assert env.report_on_disk()["error"]["type"] == "unmanaged"
+
+    def test_R6_null_oauth_account_does_not_crash_other_commands(self, env):
+        (env.home / ".claude.json").write_text(json.dumps({"oauthAccount": None}))
+        assert env.store._get_current_account() is None
+
+    def test_R6_any_exception_is_a_report_with_the_type_name_only(
+        self, env, monkeypatch, caplog
+    ):
+        env.active(creds())
+
+        def boom():
+            raise RuntimeError("sk-ant-ort01-SECRET in /Users/me/.claude")
+
+        monkeypatch.setattr(env.store, "_get_current_account", boom)
+        report = env.run()
+        assert report["ok"] is False and report["error"]["type"] == "refresh_failed"
+        on_disk = (env.store.backup_dir / "cache" / "keepalive.json").read_text()
+        assert "SECRET" not in on_disk and "/Users" not in on_disk
+        assert "SECRET" not in caplog.text
+        assert "RuntimeError" in caplog.text
+
+
+class TestOrdinaryRotationR7:
+    def _loser_needs_no_probe(self, monkeypatch):
+        monkeypatch.setattr(
+            oauth, "fetch_oauth_profile",
+            lambda token: pytest.fail("no probe needed") if token == "AT-0" else OWN_ACCOUNT,
+        )
+
+    def _assert_plain_sync(self, env, report):
+        assert report["action"] == "synced-file"
+        assert report["note"] is None
+        assert env.store._store._list_unclaimed_credentials() == {}
+        assert env.file.read_text() == env.keychain_value()
+
+    def test_R7_probe_says_same_account(self, env, monkeypatch):
+        env.active(creds("AT-1", "RT-1", expires_in_s=7200))
+        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000))
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
+        self._assert_plain_sync(env, env.run())
+
+    def test_R7_loser_lineage_is_the_slot_backup(self, env, monkeypatch):
+        older = creds("AT-0", "RT-0", expires_in_s=7000)
+        env.active(creds("AT-1", "RT-1", expires_in_s=7200))
+        env.file.write_text(older)
+        env.store._write_account_credentials(*SLOT, older)
+        self._loser_needs_no_probe(monkeypatch)
+        self._assert_plain_sync(env, env.run())
+
+    def test_R7_loser_lineage_is_on_the_consumed_ledger(self, env, monkeypatch):
+        older = creds("AT-0", "RT-0", expires_in_s=7000)
+        env.active(creds("AT-1", "RT-1", expires_in_s=7200))
+        env.file.write_text(older)
+        consumed_grants.record(oauth.credential_fingerprint(older), "1")
+        self._loser_needs_no_probe(monkeypatch)
+        self._assert_plain_sync(env, env.run())
+
+    def test_R7_expired_and_older_is_presumed_consumed(self, env, monkeypatch):
+        env.active(creds("AT-1", "RT-1", expires_in_s=7200))
+        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=-60))
+        monkeypatch.setattr(
+            oauth, "fetch_oauth_profile",
+            lambda token: pytest.fail("an expired token proves nothing") if token == "AT-0" else None,
+        )
+        self._assert_plain_sync(env, env.run())
+
+    def test_R7_rotations_do_not_grow_the_stash_over_runs(self, env, monkeypatch):
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
+        for i in range(3):
+            env.active(creds(f"AT{i + 1}", f"RT{i + 1}", expires_in_s=7200 + 100 * i))
+            env.file.write_text(creds(f"AT{i}", f"RT{i}", expires_in_s=7000 + 100 * i))
+            assert env.run()["note"] is None
+        assert env.store._store._list_unclaimed_credentials() == {}
+
+    def test_R7_unattributable_live_copy_is_kept_without_the_note(self, env):
+        loser = creds("AT-0", "RT-0", expires_in_s=7000)  # the probe answers nothing
+        env.active(creds("AT-1", "RT-1", expires_in_s=7200))
+        env.file.write_text(loser)
+        report = env.run()
+        assert report["action"] == "synced-file" and report["note"] is None
+        stash = env.store._store._list_unclaimed_credentials()
+        assert len(stash) == 1
+        assert env.store._store._read_unclaimed_credential(next(iter(stash)))[0] == loser
+
+    def test_R7_the_same_bytes_are_stashed_once(self, env):
+        loser = creds("AT-0", "RT-0", expires_in_s=7000)
+        for _ in range(3):
+            env.active(creds("AT-1", "RT-1", expires_in_s=7200))
+            env.file.write_text(loser)
+            env.run()
+        assert len(env.store._store._list_unclaimed_credentials()) == 1
+
+    def test_R7_unparseable_copy_is_not_discarded(self, env):
+        env.active(creds("AT-1", "RT-1"))
+        env.file.write_text("not json")
+        env.run()
+        assert len(env.store._store._list_unclaimed_credentials()) == 1
+
+
+class TestEnsureFileAtomic:
+    def test_created_by_rename_and_narrowed_to_0600(self, env):
+        env.active(creds())
+        env.file.write_text("old")
+        env.file.chmod(0o644)
+        inode = env.file.stat().st_ino
+        env.run(ensure_file=True)
+        assert env.file.stat().st_ino != inode
+        assert env.file.read_text() == env.keychain_value()
+        if os.name == "posix":
+            assert stat.S_IMODE(env.file.stat().st_mode) == 0o600
+        assert [p.name for p in env.file.parent.iterdir() if ".credentials" in p.name] == [
+            ".credentials.json"
+        ]

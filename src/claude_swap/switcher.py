@@ -18,8 +18,9 @@ from pathlib import Path
 from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
-    KeychainUnavailableError,
     AccountNotFoundError,
+    ClaudeSwitchError,
+    KeychainUnavailableError,
     ConfigError,
     CredentialReadError,
     LockError,
@@ -27,7 +28,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import consumed_grants, oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -406,7 +407,8 @@ class ClaudeAccountSwitcher:
         # aborts construction. No-op on fresh installs / once recorded.
         from claude_swap.migrations import run_migrations
 
-        run_migrations(self)
+        if not self.keychain_gate_closed():
+            run_migrations(self)
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -653,6 +655,42 @@ class ClaudeAccountSwitcher:
         """The first step of every command that can write a credential."""
         if self.keychain_gate_closed(fresh=True):
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
+
+    def post_refresh(
+        self, account_num: str, credentials: str, **kwargs
+    ) -> "oauth.RefreshOutcome":
+        """Every engine POST of a refresh token: no POST whose successor could
+        not be stored, and the spent token goes on the ledger before anything
+        else can fail. A server that did not rotate spent nothing."""
+        if self.keychain_gate_closed(fresh=True):
+            return oauth.RefreshOutcome(None, "transient")
+        result = oauth.try_refresh_oauth_credentials(credentials, **kwargs)
+        if result.credentials and self._store.records_consumed_grants():
+            spent = oauth.credential_fingerprint(credentials)
+            if oauth.credential_fingerprint(result.credentials) != spent:
+                consumed_grants.record(spent, account_num)
+        return result
+
+    def stash_consumed_successor(
+        self, account_num: str, credentials: str, consumed_fp: str | None, reason: str
+    ) -> None:
+        """No store took a spent grant's successor: park it where the next pass
+        adopts it (``_adopt_stashed_successor``). Never raises; a POST is done."""
+        try:
+            self._store._write_unclaimed_credential(
+                credentials,
+                {
+                    "reason": reason,
+                    "configSlot": account_num,
+                    "consumedFp": consumed_fp,
+                    "fingerprint": oauth.credential_fingerprint(credentials),
+                },
+            )
+        except (ClaudeSwitchError, OSError):
+            self._logger.error(
+                "Account %s's refreshed credential could not be stored anywhere; "
+                "it needs a fresh login.", account_num,
+            )
 
     def _read_credentials(self) -> str | None:
         return self._store._read_credentials()
@@ -2534,10 +2572,8 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = (
-            oauth.try_refresh_oauth_credentials(refresh_input, timeout_s=6.0)
-            if global_lock_held
-            else oauth.try_refresh_oauth_credentials(refresh_input)
+        result = self.post_refresh(
+            account_num, refresh_input, **({"timeout_s": 6.0} if global_lock_held else {})
         )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
@@ -3264,7 +3300,7 @@ class ClaudeAccountSwitcher:
         data = self._read_json(config_path)
         if not data:
             return None
-        oauth_account = data.get("oauthAccount", {})
+        oauth_account = data.get("oauthAccount") or {}
         email = oauth_account.get("emailAddress", "")
         if not email:
             return None
@@ -3288,7 +3324,7 @@ class ClaudeAccountSwitcher:
         return identity is not None and identity == (email, org_uuid or "")
 
     def _resolved_matches_slot_identity(
-        self, account_num: str, resolved: dict
+        self, account_num: str, resolved: dict, *, backfill: bool = True
     ) -> bool | None:
         """Whether an oracle-resolved identity is this slot's account.
 
@@ -3307,6 +3343,8 @@ class ClaudeAccountSwitcher:
         - None: unverifiable (slot has no uuid and the resolved identity
           is too partial to condemn or affirm). Must be treated like a
           probe failure — never cached.
+
+        ``backfill=False`` for a caller already holding ``self.lock_file``.
         """
         own = self.account_identity(account_num)
         r_uuid = (resolved.get("uuid") or "").strip()
@@ -3332,10 +3370,11 @@ class ClaudeAccountSwitcher:
             if r_org is None:
                 return None
             if (r_org or "") == own["organizationUuid"]:
-                self.backfill_account_uuid(
-                    account_num, r_uuid,
-                    expected_email=r_email, expected_org=r_org or "",
-                )
+                if backfill:
+                    self.backfill_account_uuid(
+                        account_num, r_uuid,
+                        expected_email=r_email, expected_org=r_org or "",
+                    )
                 return True
             return False
         if r_email and r_org is not None:
@@ -3704,7 +3743,8 @@ class ClaudeAccountSwitcher:
             "organizationUuid" not in acc
             for acc in data.get("accounts", {}).values()
         )
-        if needs_migration:
+        # The cached view reads: `_find_account_slot` tolerates the missing field.
+        if needs_migration and not self.keychain_gate_closed():
             self._migrate_org_fields()
             data = self._get_sequence_data()  # Re-read after migration
         return data
@@ -4333,10 +4373,9 @@ class ClaudeAccountSwitcher:
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
         """
-        # Cached view: no Keychain read (none can be trusted here) and no
-        # org-field migration write. The rows' creds stay empty.
+        # Cached view: no Keychain read, none can be trusted here. Rows' creds stay empty.
         closed = self.keychain_gate_closed()
-        data = (self._get_sequence_data() if closed else self._get_sequence_data_migrated()) or {}
+        data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
@@ -4613,6 +4652,23 @@ class ClaudeAccountSwitcher:
                 #   backup.
                 if not self._live_identity_matches(email, org_uuid):
                     return _defer(force_refresh)
+                # A successor an earlier pass could not persist: nothing below
+                # may POST past it, the generation it supersedes is spent.
+                for held in (backup, live):
+                    adopted = (
+                        self._adopt_stashed_successor(account_num, email, held)
+                        if held else None
+                    )
+                    if adopted:
+                        backup = adopted
+                        backup_fp = oauth.credential_fingerprint(backup)
+                        backup_oauth = oauth.extract_oauth_data(backup)
+                        backup_usable = bool(
+                            backup_oauth
+                            and backup_oauth.get("accessToken")
+                            and backup_oauth.get("refreshToken")
+                        )
+                        break
                 if (
                     live_oauth
                     and live != creds
@@ -4783,8 +4839,8 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
-                        result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                        result = self.post_refresh(
+                            account_num, refresh_input, timeout_s=6.0
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -4906,6 +4962,12 @@ class ClaudeAccountSwitcher:
                             "" if backup_ok
                             else "; the rotated credential was NOT persisted "
                                  "anywhere — re-login may be required",
+                        )
+                    if restore_source is None and not backup_ok and not live_ok:
+                        self.stash_consumed_successor(
+                            account_num, working,
+                            oauth.credential_fingerprint(refresh_input),
+                            "active-refresh-persist-failed",
                         )
                     if not live_ok:
                         # Live still holds the dead token — don't serve

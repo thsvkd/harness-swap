@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from claude_swap import consumed_grants
 from claude_swap.printer import warning as print_warning
 from harness_swap.ui.fmt import reset_clock_string
 
@@ -121,6 +122,8 @@ class RefreshOutcome:
     - ``"no_refresh_token"`` — the stored credential carries no usable refresh
       token (also permanent for retry purposes)
     - ``"transient"`` — network/server error; the token may still be valid
+    - ``"consumed"`` — not POSTed: this machine already spent this refresh token
+      (see ``consumed_grants``). No server verdict, so nothing strikes on it
 
     ``token_account`` is the account identity the token endpoint optionally
     includes alongside a successful grant (``{"uuid", "email",
@@ -170,6 +173,8 @@ def try_refresh_oauth_credentials(
     oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
+    if consumed_grants.slot_of(credential_fingerprint(credentials)) is not None:
+        return RefreshOutcome(None, "consumed")
 
     try:
         body = json.dumps({

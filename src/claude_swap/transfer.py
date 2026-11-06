@@ -324,12 +324,8 @@ def import_accounts(
     Raises:
         TransferError: malformed file, version mismatch, encrypted payload.
     """
+    switcher.refuse_in_required_mode("import")
     switcher.refuse_if_keychain_unavailable()
-    with switcher._required_mode_section():
-        _import_accounts(switcher, source, force)
-
-
-def _import_accounts(switcher: ClaudeAccountSwitcher, source: str, force: bool) -> None:
     if source == "-":
         text = sys.stdin.read()
     else:
@@ -534,9 +530,6 @@ def _import_accounts(switcher: ClaudeAccountSwitcher, source: str, force: bool) 
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
-        switcher._keep_slot_copy_before_overwrite(
-            target_num, entry["email"], entry["org_uuid"], entry["creds_text"], new_login=True
-        )
         switcher._write_account_credentials(
             target_num, entry["email"], entry["creds_text"]
         )

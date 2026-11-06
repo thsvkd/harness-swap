@@ -10,7 +10,7 @@ import re
 import sys
 
 from claude_swap import __version__, macos_keychain, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, RequiredModeUnsupportedError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
@@ -32,6 +32,7 @@ from claude_swap.settings import (
     load_run_settings,
     load_ui_settings,
     load_update_settings,
+    require_keychain,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -203,6 +204,7 @@ Examples:
     args = parser.parse_args(head)
 
     try:
+        _refuse_in_required_mode("run")
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
 
@@ -270,6 +272,13 @@ def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
         )
         return False
     return enabled
+
+
+def _refuse_in_required_mode(command: str) -> None:
+    """The first thing an unsupported command does, ahead even of the switcher's own
+    startup work. The switcher has the same check for the UIs, which call it directly."""
+    if Platform.detect() == Platform.MACOS and require_keychain(paths.get_backup_root()):
+        raise RequiredModeUnsupportedError(command)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -416,6 +425,8 @@ def _unclaimed_command(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     try:
+        if args.purge:
+            _refuse_in_required_mode("unclaimed --purge")
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         entries = switcher.list_unclaimed_credentials()
@@ -424,8 +435,7 @@ def _unclaimed_command(argv: list[str]) -> None:
             if args.purge not in entries:
                 error(f"Error: no unclaimed entry {args.purge}")
                 sys.exit(1)
-            with switcher._required_mode_section():
-                switcher._store._remove_unclaimed_credential(args.purge)
+            switcher._store._remove_unclaimed_credential(args.purge)
             print(f"{accent('Purged')} {args.purge}")
             return
 
@@ -472,6 +482,7 @@ Examples:
     args = parser.parse_args(argv)
 
     try:
+        _refuse_in_required_mode("swap")
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         num_a, num_b = switcher.swap_accounts(args.first, args.second)
@@ -518,6 +529,7 @@ Examples:
     args = parser.parse_args(argv)
 
     try:
+        _refuse_in_required_mode("move")
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         num_src, num_target, swapped = switcher.move_account(args.account, args.slot)
@@ -1758,6 +1770,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # serializes it (so no command writes JSON to stdout itself).
     payload: dict | None = None
     try:
+        if args.add_token is not None:
+            _refuse_in_required_mode("add-token")
+        if args.import_:
+            _refuse_in_required_mode("import")
+        if args.purge:
+            _refuse_in_required_mode("purge")
         switcher = ClaudeAccountSwitcher(debug=args.debug)
 
         # Check for root (unless in container) - POSIX only

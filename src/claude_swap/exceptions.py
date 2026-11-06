@@ -57,6 +57,19 @@ class ReloginRequiredError(CredentialError):
     json_type = "relogin_required"
 
 
+class RequiredModeUnsupportedError(ClaudeSwitchError):
+    """Keychain-required mode supports a small set of commands, and this is not one."""
+
+    json_type = "required_mode_unsupported"
+
+    def __init__(self, command: str):
+        super().__init__(
+            f"required_mode_unsupported: {command} is not supported in keychain-required "
+            "mode. Turn off credentials.requireKeychain temporarily to use it, or use "
+            "/login and hswap claude add."
+        )
+
+
 class ConfigError(ClaudeSwitchError):
     """Error related to configuration operations."""
 

@@ -28,6 +28,7 @@ from claude_swap.exceptions import (
     LockError,
     RELOGIN_REQUIRED_MESSAGE,
     ReloginRequiredError,
+    RequiredModeUnsupportedError,
     SessionError,
     STORES_DISAGREE_MESSAGE,
     StoresDisagreeError,
@@ -745,6 +746,12 @@ class ClaudeAccountSwitcher:
         except consumed_grants.LedgerUnreadable:
             return False
 
+    def refuse_in_required_mode(self, command: str) -> None:
+        """Keychain-required mode supports what the keepalive workflow uses, and every
+        other command is refused here, before it does anything."""
+        if self._store._keychain_is_required():
+            raise RequiredModeUnsupportedError(command)
+
     def _required_mode_locks(self):
         """Claude Code's refresh locks, which the gate needs held. Default mode: none."""
         return claude_credentials_lock() if self._store._keychain_is_required() else nullcontext()
@@ -1414,6 +1421,7 @@ class ClaudeAccountSwitcher:
 
         Returns the two resolved slot numbers ``(first_num, second_num)``.
         """
+        self.refuse_in_required_mode("swap")
         self.refuse_if_keychain_unavailable()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -1423,8 +1431,7 @@ class ClaudeAccountSwitcher:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file), self._required_mode_locks():
-            self._required_mode_gate()
+        with FileLock(self.lock_file):
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -1850,6 +1857,7 @@ class ClaudeAccountSwitcher:
         Returns ``(source_num, target_num, swapped)`` where ``swapped`` is True
         when an occupant was displaced.
         """
+        self.refuse_in_required_mode("move")
         self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         if not self.sequence_file.exists():
@@ -1867,8 +1875,7 @@ class ClaudeAccountSwitcher:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file), self._required_mode_locks():
-            self._required_mode_gate()
+        with FileLock(self.lock_file):
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -2646,10 +2653,28 @@ class ClaudeAccountSwitcher:
         """Body of ``consume_backup_grant``; caller holds the consume lock.
 
         ``global_lock_held``: the caller already holds ``self.lock_file`` in the
-        switch path's order (keepalive, which keeps Claude Code's locks across
-        the POST). The POST is then bounded like ``_fetch_active_usage``'s, well
+        switch path's order and keeps Claude Code's locks across the POST (keepalive,
+        and every consume in required mode). The POST is then bounded like ``_fetch_active_usage``'s, well
         inside a concurrent switch's acquire budget.
         """
+        # Required mode: no gap between the gate and the POST for a switch to land in.
+        # Under the locks the account can have become the active one, and this path
+        # writes only the slot, so the stores would keep the spent token.
+        if self._store._keychain_is_required() and not global_lock_held:
+            try:
+                with FileLock(self.lock_file), claude_credentials_lock():
+                    org_uuid = self.account_identity(account_num)["organizationUuid"] or ""
+                    if self._get_current_account() in (None, (email, org_uuid)):
+                        return oauth.RefreshOutcome(None, "transient")
+                    return self._consume_backup_grant_locked(
+                        account_num, email, snapshot, global_lock_held=True
+                    )
+            except LockError:
+                self._logger.info(
+                    "Locks held elsewhere; deferring account %s's refresh.", account_num
+                )
+                return oauth.RefreshOutcome(None, "transient")
+
         def slot_lock():
             return nullcontext() if global_lock_held else FileLock(self.lock_file)
 
@@ -2661,7 +2686,7 @@ class ClaudeAccountSwitcher:
         )
 
         try:
-            with slot_lock(), nullcontext() if global_lock_held else self._required_mode_locks():
+            with slot_lock():
                 self._required_mode_gate()
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
@@ -4441,6 +4466,7 @@ class ClaudeAccountSwitcher:
             assume_yes: Skip the occupied-slot overwrite prompt (callers with
                    their own confirmation UI, e.g. the TUI, confirm first).
         """
+        self.refuse_in_required_mode("add-token")
         self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         import getpass
@@ -4506,11 +4532,7 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            with self._required_mode_section():
-                self._keep_slot_copy_before_overwrite(
-                    account_num, email, "", credentials, new_login=True
-                )
-                self._write_account_credentials(account_num, email, credentials)
+            self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
             # A refreshed credential invalidates any dead-token quarantine on this
             # slot (mirrors ``add_account``); otherwise the stale strike row keeps
@@ -4594,11 +4616,7 @@ class ClaudeAccountSwitcher:
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
 
-        with self._required_mode_section():
-            self._keep_slot_copy_before_overwrite(
-                account_num, email, "", credentials, new_login=True
-            )
-            self._write_account_credentials(account_num, email, credentials)
+        self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
         # Reusing/overwriting a slot with a fresh credential lifts any dead-token
         # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
@@ -4690,6 +4708,10 @@ class ClaudeAccountSwitcher:
 
         email = account_info.get("email")
         active_account = data.get("activeAccountNumber")
+        if str(active_account) == account_num or self._get_current_account() == (
+            email, account_info.get("organizationUuid", "") or ""
+        ):
+            self.refuse_in_required_mode("remove of the active account")
 
         # Check before the confirmation prompt (better UX); the chokepoint in
         # _delete_account_files re-checks as a safety net for all paths.
@@ -8137,6 +8159,7 @@ class ClaudeAccountSwitcher:
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
+        self.refuse_in_required_mode("purge")
         self.refuse_if_keychain_unavailable()
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
@@ -8198,10 +8221,6 @@ class ClaudeAccountSwitcher:
         if confirm.lower() != "y":
             print(dimmed("Cancelled"))
             return
-
-        # Checked and released: what follows never touches the live stores.
-        with self._required_mode_section():
-            pass
 
         removed_items = []
 

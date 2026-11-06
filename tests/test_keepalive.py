@@ -1825,7 +1825,14 @@ class TestEveryPostGoesThroughTheHelper:
         "supersede_stashed_copies",
         "_bootstrap",
     })
-    GATES = frozenset({"_required_mode_gate", "_required_mode_section", "_gated_in_required_mode"})
+    GATES = frozenset({
+        "_required_mode_gate",
+        "_required_mode_section",
+        "_gated_in_required_mode",
+        # Refused outright in required mode, so nothing past this runs there.
+        "refuse_in_required_mode",
+        "_refuse_in_required_mode",
+    })
     # Not reachable with the gate, each for a reason of its own.
     OUTSIDE_THE_GATE = frozenset({
         "_adopt",  # the human tie-break, the one thing allowed past a disagreement
@@ -1887,16 +1894,20 @@ class TestEveryPostGoesThroughTheHelper:
             "_fetch_active_usage",
             "_resync_rotated_backup",
             "add_account",
-            "add_account_from_token",
             "remove_account",
+            "persist_backup_credentials",
+            "_pass",
+            # The refused commands: see TestRequiredModeRefusesTheRest.
+            "add_account_from_token",
             "swap_accounts",
             "move_account",
             "purge",
             "import_accounts",
-            "persist_backup_credentials",
             "setup_session",
             "_unclaimed_command",
-            "_pass",
+            "_swap_command",
+            "_move_command",
+            "_run_command",
         } <= gated
 
     def test_the_unreserved_oauth_paths_have_no_production_caller(self):
@@ -2127,9 +2138,12 @@ class TestLedgerRetention:
 
 
 class TestSuccessorFollowsTheAccount:
+    """`move` needs default mode: required mode refuses it, and holds its locks across
+    the POST. An existing ledger binds a default-mode POST all the same."""
+
     def _b_near(self, temp_home):
         s = macos_store(temp_home)
-        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        s._store.records_consumed = True
         near = creds("AT-0", "RT-0", expires_in_s=-60)
         s._write_account_credentials("2", "b@example.com", near)
         return s, near
@@ -2171,6 +2185,7 @@ class TestSuccessorFollowsTheAccount:
         assert rotating.posts == ["RT-0"]
 
         monkeypatch.setattr(macos_keychain, "set_password", real_set)
+        s = new_process()
         s.move_account("1", "7")
         report = run_keepalive(new_process())
         assert report["ok"] is True and report["activeSlot"] == 7
@@ -2224,7 +2239,7 @@ class TestIdentityIsCapturedWithTheCredential:
         self, temp_home, block_real_keychain, rotating, monkeypatch
     ):
         s = macos_store(temp_home)
-        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        s._store.records_consumed = True
         data = s._get_sequence_data()
         data["accounts"]["2"]["organizationUuid"] = "org-b"
         s._write_json(s.sequence_file, data)

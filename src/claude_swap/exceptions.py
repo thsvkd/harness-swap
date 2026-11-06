@@ -39,11 +39,9 @@ STORES_DISAGREE_MESSAGE = (
     "refreshed last."
 )
 COPIES_DISAGREE_MESSAGE = (
-    "A copy of this login (the slot's backup, a leftover .enc, a session or the stash) "
-    "holds a different token, or cannot be read, and no record shows it is older; "
-    "nothing was sent. Run hswap claude keepalive --adopt file|keychain, naming the "
-    "store whose writer refreshed last, or log in again with /login and run hswap "
-    "claude add."
+    "A copy of this login (the slot's backup, a leftover .enc or the stash) holds a "
+    "different token, or cannot be read, and no record shows it is older; nothing was "
+    "sent. Log in again with /login and run hswap claude add."
 )
 RELOGIN_REQUIRED_MESSAGE = (
     "This login's token is already spent, or another copy of it holds a different token "
@@ -78,6 +76,17 @@ class RequiredModeUnsupportedError(ClaudeSwitchError):
             f"required_mode_unsupported: {command} is not supported in keychain-required "
             "mode. Turn off credentials.requireKeychain temporarily to use it, or use "
             "/login and hswap claude add."
+        )
+
+
+class SessionProfilesExistError(RequiredModeUnsupportedError):
+    """Keychain-required mode does not cover session profiles, so it stops at any."""
+
+    def __init__(self, path: str):
+        ClaudeSwitchError.__init__(
+            self,
+            "required_mode_unsupported: session profiles exist (from hswap claude run); "
+            f"remove {path} or turn off credentials.requireKeychain.",
         )
 
 

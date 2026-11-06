@@ -26,10 +26,8 @@ from claude_swap.exceptions import (
     CopiesDisagreeError,
     CredentialReadError,
     KeychainUnavailableError,
-    ReloginRequiredError,
     RequiredModeUnsupportedError,
     StoresDisagreeError,
-    SwitchError,
 )
 from claude_swap.keepalive import run_keepalive
 from claude_swap.session import SessionManager
@@ -1491,55 +1489,6 @@ class TestRequiredModeGate:
 
     # Round 11, finding 2.
 
-    def _exited_session(self, s, copy):
-        session_dir = s._session_dir("2", "b@example.com")
-        session_dir.mkdir(parents=True, exist_ok=True)
-        path = session_dir / ".credentials.json"
-        path.write_text(copy, encoding="utf-8")
-        return path
-
-    @pytest.mark.parametrize("session_expires", [300, 600, 1200], ids=["earlier", "equal", "later"])
-    def test_an_exited_sessions_successor_stops_the_slot_post_whatever_its_expiry(
-        self, store, temp_home, block_real_keychain, endpoint, session_expires
-    ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
-        block_real_keychain.data[SLOT_2] = a
-        b = creds("AT-S", "RT-S", expires_in_s=session_expires)
-        path = self._exited_session(store, b)
-
-        outcome = store.consume_backup_grant("2", "b@example.com", a)
-        assert outcome.credentials is None and outcome.error == "relogin_required"
-        assert self._engine(store, [])._freshen_target("2", "b@example.com") == "invalid_grant"
-        assert endpoint.posts == []
-        assert path.read_text(encoding="utf-8") == b
-        assert store._read_account_credentials("2", "b@example.com") == a
-
-    def test_a_session_on_the_same_token_lets_the_post_through(
-        self, store, temp_home, block_real_keychain, endpoint
-    ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
-        block_real_keychain.data[SLOT_2] = a
-        self._exited_session(store, creds("AT-other", "RT-OLD", expires_in_s=300))
-        assert store.consume_backup_grant("2", "b@example.com", a).error is None
-        assert endpoint.posts == ["RT-OLD"]
-
-    def test_a_session_recorded_as_the_predecessor_lets_the_post_through(
-        self, store, temp_home, block_real_keychain, endpoint
-    ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        older = creds("AT-P", "RT-P", expires_in_s=9000)
-        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
-        block_real_keychain.data[SLOT_2] = a
-        self._exited_session(store, older)
-        consumed_grants.record(
-            oauth.credential_fingerprint(older), self.B_ID, consumed_grants.CONSUMED,
-            successor=oauth.credential_fingerprint(a),
-        )
-        assert store.consume_backup_grant("2", "b@example.com", a).error is None
-        assert endpoint.posts == ["RT-OLD"]
-
     @pytest.mark.parametrize("state", ["consumed", "reserved"])
     def test_a_token_on_the_ledger_is_refused_before_the_post(
         self, store, temp_home, block_real_keychain, endpoint, state
@@ -1583,18 +1532,6 @@ class TestRequiredModeGate:
         )
         assert store.consume_backup_grant("2", "b@example.com", a).error == "relogin_required"
         assert endpoint.posts == []
-
-    def test_switching_to_a_slot_a_session_has_moved_past_is_refused(
-        self, store, temp_home, block_real_keychain, endpoint, monkeypatch
-    ):
-        """Activating it would make the stores agree on a spent token."""
-        self._agreeing(store, temp_home, block_real_keychain)
-        path = self._exited_session(store, creds("AT-S", "RT-S", expires_in_s=7200))
-        before = snapshot(temp_home, block_real_keychain)
-        with pytest.raises(ReloginRequiredError):
-            store.switch_to("2", json_output=True)
-        assert snapshot(temp_home, block_real_keychain) == before
-        assert path.exists()
 
     def test_no_expiry_decides_which_slot_copy_is_read(self, store):
         store._write_account_credentials("2", "b@example.com", creds("AT-K", "RT-K", expires_in_s=100))
@@ -1724,19 +1661,7 @@ class TestRequiredModeGate:
         assert store._read_account_credentials("2", "b@example.com") == x
         assert len(store._store._list_unclaimed_credentials()) == 1
 
-    def test_a_live_session_on_another_token_refuses_the_switch_whatever_its_expiry(
-        self, store, temp_home, block_real_keychain, monkeypatch
-    ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        self._exited_session(store, creds("AT-S", "RT-S", expires_in_s=60))
-        monkeypatch.setattr(
-            "claude_swap.session.scan_live_sessions",
-            lambda path: ([SimpleNamespace(pid=4242)], 0),
-        )
-        with pytest.raises(SwitchError, match="rotated past"):
-            store.switch_to("2", json_output=True)
-
-    def test_adopt_clears_earlier_rivals_for_the_chosen_login(
+    def test_adopt_does_not_clear_earlier_rivals_for_a_known_login(
         self, store, temp_home, block_real_keychain, endpoint
     ):
         self._disagreeing(store, temp_home, block_real_keychain)
@@ -1747,13 +1672,9 @@ class TestRequiredModeGate:
             "fingerprint": oauth.credential_fingerprint(rival),
         })
         assert run_keepalive(ClaudeAccountSwitcher(), adopt="file")["ok"] is True
-        fresh = ClaudeAccountSwitcher()
-        fresh.platform = Platform.MACOS
-        fresh.switch_to("2", json_output=True)
-        left = fresh._read_account_credentials("1", "a@example.com")
-        assert oauth.extract_access_token(left) == "AT-B"
-        assert fresh.consume_backup_grant("1", "a@example.com", left).error is None
-        assert endpoint.posts == ["RT-B"]
+        assert consumed_grants.entry(oauth.credential_fingerprint(rival)) is None
+        assert run_keepalive(ClaudeAccountSwitcher(), ahead=9000)["error"]["type"] == "split_brain"
+        assert endpoint.posts == []
 
     # Healthy paths.
 
@@ -1807,11 +1728,14 @@ class TestRequiredModeGate:
             "email": "a@example.com", "organizationUuid": "",
             "fingerprint": oauth.credential_fingerprint(rival),
         })
-        a, _ = self._agreeing(store, temp_home, block_real_keychain)
+        self._agreeing(store, temp_home, block_real_keychain)
+        fresh = creds("AT-N", "RT-N", expires_in_s=28000)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        (temp_home / ".claude" / ".credentials.json").write_text(fresh, encoding="utf-8")
         store.add_account(assume_yes=True)
         store.switch_to("2", json_output=True)
-        assert store.consume_backup_grant("1", "a@example.com", a).error is None
-        assert endpoint.posts == ["RT-A"]
+        assert store.consume_backup_grant("1", "a@example.com", fresh).error is None
+        assert endpoint.posts == ["RT-N"]
 
     def test_default_mode_takes_no_gate_and_no_extra_lock(
         self, temp_home, block_real_keychain, endpoint
@@ -1846,7 +1770,7 @@ class _RequiredModeStore:
         return s
 
     def _seed(self, s, home, keychain):
-        """Every kind of store holds something: stores, slots, stash, ledger, session."""
+        """Every kind of store holds something: stores, slots, stash, ledger."""
         a = creds("AT-A", "RT-A", expires_in_s=28000)
         keychain.data[ACTIVE_ITEM] = a
         s._write_account_credentials("1", "a@example.com", a)
@@ -1859,9 +1783,6 @@ class _RequiredModeStore:
         consumed_grants.record(
             oauth.credential_fingerprint(creds("x", "RT-L")), self.A_ID, consumed_grants.CONSUMED
         )
-        session_dir = s._session_dir("2", "b@example.com")
-        session_dir.mkdir(parents=True, exist_ok=True)
-        (session_dir / ".credentials.json").write_text(creds("AT-2", "RT-2"), encoding="utf-8")
         return a, file_path, entry
 
 
@@ -2153,7 +2074,7 @@ class TestRulesUAndP(_RequiredModeStore):
 
     SLOT_1 = ("claude-swap", "account-1-a@example.com")
 
-    def _active(self, s, home, keychain, *, expires=600, slot=None, enc=None, session=None):
+    def _active(self, s, home, keychain, *, expires=600, slot=None, enc=None):
         x = creds("AT-X", "RT-X", expires_in_s=expires)
         keychain.data[ACTIVE_ITEM] = x
         keychain.data[self.SLOT_1] = slot or x
@@ -2161,13 +2082,7 @@ class TestRulesUAndP(_RequiredModeStore):
         file_path.write_text(x, encoding="utf-8")
         if enc:
             s._store._write_backup_enc("1", "a@example.com", enc)
-        session_path = None
-        if session:
-            session_dir = s._session_dir("1", "a@example.com")
-            session_dir.mkdir(parents=True, exist_ok=True)
-            session_path = session_dir / ".credentials.json"
-            session_path.write_text(session, encoding="utf-8")
-        return x, file_path, session_path
+        return x, file_path
 
     def _stashed(self, s):
         rows = s._store._list_unclaimed_credentials()
@@ -2178,21 +2093,13 @@ class TestRulesUAndP(_RequiredModeStore):
 
     # Round 13, finding 1.
 
-    def test_a_slot_differing_only_in_metadata_writes_nothing_before_rule_u(
+    def test_a_slot_differing_only_in_metadata_is_no_rival(
         self, store, temp_home, block_real_keychain, endpoint
     ):
-        """The write this used to do before the gate deleted the session's B."""
         slot = creds("AT-other", "RT-X", expires_in_s=600)
-        b = creds("AT-B", "RT-B", expires_in_s=7200)
-        _, _, session_path = self._active(
-            store, temp_home, block_real_keychain, slot=slot, session=b
-        )
-        before = snapshot(temp_home, block_real_keychain)
-        report = run_keepalive(ClaudeAccountSwitcher())
-        assert report["ok"] is False and report["error"]["type"] == "split_brain"
-        assert endpoint.posts == []
-        assert session_path.read_text(encoding="utf-8") == b
-        assert snapshot(temp_home, block_real_keychain) == before
+        self._active(store, temp_home, block_real_keychain, slot=slot)
+        assert run_keepalive(ClaudeAccountSwitcher())["action"] == "refreshed"
+        assert endpoint.posts == ["RT-X"]
 
     def test_a_slot_on_another_token_cannot_take_the_direct_branch(
         self, store, temp_home, block_real_keychain, endpoint
@@ -2208,7 +2115,7 @@ class TestRulesUAndP(_RequiredModeStore):
     def test_the_post_helper_itself_applies_rule_u(
         self, store, temp_home, block_real_keychain, endpoint
     ):
-        x, _, _ = self._active(store, temp_home, block_real_keychain, slot=creds("AT-S", "RT-S"))
+        x, _ = self._active(store, temp_home, block_real_keychain, slot=creds("AT-S", "RT-S"))
         outcome = store.post_refresh(self.A_ID, x, locks_held=True)
         assert outcome.error == "stores-disagree" and endpoint.posts == []
 
@@ -2219,7 +2126,7 @@ class TestRulesUAndP(_RequiredModeStore):
     ):
         slot = creds("AT-S", "RT-S", expires_in_s=9000)
         enc = creds("AT-E", "RT-E", expires_in_s=9000)
-        x, _, _ = self._active(
+        x, _ = self._active(
             store, temp_home, block_real_keychain, expires=7200, slot=slot, enc=enc
         )
         assert run_keepalive(ClaudeAccountSwitcher())["ok"] is True
@@ -2270,27 +2177,25 @@ class TestRulesUAndP(_RequiredModeStore):
         before = snapshot(temp_home, block_real_keychain)
         report = run_keepalive(ClaudeAccountSwitcher())
         assert report["error"]["type"] == "split_brain"
-        assert ".enc" in report["error"]["message"] and "--adopt" in report["error"]["message"]
+        assert ".enc" in report["error"]["message"] and "/login" in report["error"]["message"]
         assert endpoint.posts == []
         assert snapshot(temp_home, block_real_keychain) == before
 
-    def test_adopt_keeps_and_replaces_the_enc_and_the_next_due_run_posts_once(
+    def test_adopt_keeps_the_enc_but_a_known_login_stays_blocked(
         self, store, temp_home, block_real_keychain, endpoint
     ):
         enc = creds("AT-E", "RT-E", expires_in_s=100)
-        x, _, _ = self._active(store, temp_home, block_real_keychain, enc=enc)
+        self._active(store, temp_home, block_real_keychain, enc=enc)
         assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "split_brain"
 
         report = run_keepalive(ClaudeAccountSwitcher(), adopt="file")
         assert report["ok"] is True and report["action"] == "adopted"
-        assert endpoint.posts == []
         assert not self._enc(store).exists()
         assert enc in self._stashed(store)
+        assert consumed_grants.entry(oauth.credential_fingerprint(enc)) is None
 
-        for _ in range(3):
-            assert run_keepalive(ClaudeAccountSwitcher())["ok"] is True
-        assert endpoint.posts == ["RT-X"]
-        assert block_real_keychain.data[ACTIVE_ITEM] != x
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "split_brain"
+        assert endpoint.posts == []
 
     def test_adopt_stops_if_a_copy_cannot_be_kept(
         self, store, temp_home, block_real_keychain, endpoint, monkeypatch
@@ -2306,16 +2211,104 @@ class TestRulesUAndP(_RequiredModeStore):
         assert report["ok"] is False and report["error"]["type"] == "split_brain"
         assert snapshot(temp_home, block_real_keychain) == before
 
-    def test_a_new_login_clears_a_differing_enc_too(
+    def test_round_14_finding_2_a_re_add_with_no_new_login_changes_no_rival(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        """Recording this rival as older is what let the spent token through."""
+        enc = creds("AT-B", "RT-B", expires_in_s=100)
+        x, _ = self._active(store, temp_home, block_real_keychain, enc=enc)
+        enc_bytes = self._enc(store).read_bytes()
+        before = snapshot(temp_home, block_real_keychain)["keychain"]
+
+        store.add_account(assume_yes=True)
+
+        assert "not a new login" in capsys.readouterr().out
+        assert self._enc(store).read_bytes() == enc_bytes
+        assert self._stashed(store) == {}
+        assert consumed_grants.entry(oauth.credential_fingerprint(enc)) is None
+        assert snapshot(temp_home, block_real_keychain)["keychain"] == before
+
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "split_brain"
+        assert endpoint.posts == []
+        assert block_real_keychain.data[ACTIVE_ITEM] == x
+
+    def test_a_re_add_leaves_a_slot_on_another_token_alone(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        slot = creds("AT-S", "RT-S", expires_in_s=9000)
+        x, _ = self._active(store, temp_home, block_real_keychain, slot=slot)
+        consumed_grants.record(  # known to the ledger, so not a new login
+            oauth.credential_fingerprint(x), self.A_ID, consumed_grants.RESERVED
+        )
+        store.add_account(assume_yes=True)
+        assert block_real_keychain.data[self.SLOT_1] == slot
+        assert self._stashed(store) == {}
+
+    def test_after_a_real_login_add_clears_the_rivals_and_the_next_due_run_posts_once(
         self, store, temp_home, block_real_keychain, endpoint
     ):
         enc = creds("AT-E", "RT-E", expires_in_s=100)
-        self._active(store, temp_home, block_real_keychain, enc=enc)
+        slot = creds("AT-S", "RT-S", expires_in_s=9000)
+        _, file_path = self._active(store, temp_home, block_real_keychain, slot=slot, enc=enc)
+        fresh = creds("AT-N", "RT-N", expires_in_s=600)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        file_path.write_text(fresh, encoding="utf-8")
+
         store.add_account(assume_yes=True)
-        assert enc in self._stashed(store)
+
+        kept = self._stashed(store)
+        assert enc in kept and slot in kept
         assert not self._enc(store).exists()
+        assert block_real_keychain.data[self.SLOT_1] == fresh
+        for _ in range(3):
+            assert run_keepalive(ClaudeAccountSwitcher())["ok"] is True
+        assert endpoint.posts == ["RT-N"]
+
+    def test_a_login_only_in_the_keychain_counts_as_new_with_no_file(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        enc = creds("AT-E", "RT-E", expires_in_s=100)
+        _, file_path = self._active(store, temp_home, block_real_keychain, enc=enc)
+        fresh = creds("AT-N", "RT-N", expires_in_s=600)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        file_path.unlink()
+        store.add_account(assume_yes=True)
         assert run_keepalive(ClaudeAccountSwitcher())["action"] == "refreshed"
-        assert endpoint.posts == ["RT-X"]
+        assert endpoint.posts == ["RT-N"]
+
+    @pytest.mark.parametrize("known_in", ["slot", "enc", "stash", "ledger", "other-store", "unreadable-file"])
+    def test_what_stops_a_login_being_provably_new(
+        self, store, temp_home, block_real_keychain, monkeypatch, known_in
+    ):
+        fresh = creds("AT-N", "RT-N")
+        same = creds("AT-old", "RT-N")
+        fingerprint = oauth.credential_fingerprint(fresh)
+        _, file_path = self._active(store, temp_home, block_real_keychain)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        file_path.write_text(fresh, encoding="utf-8")
+        assert store.is_provably_new_login(fresh, "1", "a@example.com") is True
+        if known_in == "slot":
+            block_real_keychain.data[self.SLOT_1] = same
+        elif known_in == "enc":
+            store._store._write_backup_enc("1", "a@example.com", same)
+        elif known_in == "stash":
+            store._store._write_unclaimed_credential(same, {
+                "reason": "test", "fingerprint": fingerprint,
+            })
+        elif known_in == "ledger":
+            consumed_grants.record(fingerprint, self.A_ID, consumed_grants.CONSUMED)
+        elif known_in == "other-store":
+            file_path.write_text(creds("AT-F", "RT-F"), encoding="utf-8")
+        else:
+            real = Path.read_text
+
+            def denied(self, *a, **kw):
+                if self == file_path:
+                    raise PermissionError("denied")
+                return real(self, *a, **kw)
+
+            monkeypatch.setattr(Path, "read_text", denied)
+        assert store.is_provably_new_login(fresh, "1", "a@example.com") is False
 
     def test_an_enc_on_the_same_token_is_no_rival_and_needs_no_stash(
         self, store, temp_home, block_real_keychain, endpoint
@@ -2337,16 +2330,15 @@ class TestRulesUAndP(_RequiredModeStore):
 
     # Everything rule U lists.
 
-    @pytest.mark.parametrize("copy", ["keychain-slot", "enc", "session", "stash"])
+    @pytest.mark.parametrize("copy", ["keychain-slot", "enc", "stash"])
     def test_any_copy_recorded_as_older_lets_the_post_through(
         self, store, temp_home, block_real_keychain, endpoint, copy
     ):
         older = creds("AT-O", "RT-O", expires_in_s=9000)
-        x, _, _ = self._active(
+        x, _ = self._active(
             store, temp_home, block_real_keychain,
             slot=older if copy == "keychain-slot" else None,
             enc=older if copy == "enc" else None,
-            session=older if copy == "session" else None,
         )
         if copy == "stash":
             store._store._write_unclaimed_credential(older, {
@@ -2377,20 +2369,16 @@ class TestRulesUAndP(_RequiredModeStore):
         assert run_keepalive(ClaudeAccountSwitcher())["action"] == "refreshed"
         assert endpoint.posts == ["RT-X"]
 
-    @pytest.mark.parametrize("copy", ["enc", "session", "stash-manifest", "stash-entry"])
+    @pytest.mark.parametrize("copy", ["enc", "stash-manifest", "stash-entry"])
     def test_a_copy_that_cannot_be_read_blocks_the_post(
         self, store, temp_home, block_real_keychain, endpoint, monkeypatch, copy
     ):
-        x, _, _ = self._active(store, temp_home, block_real_keychain)
+        x, _ = self._active(store, temp_home, block_real_keychain)
         if copy == "enc":
             monkeypatch.setattr(
                 store._store.__class__, "_leftover_backup_enc",
                 lambda *a: (_ for _ in ()).throw(PermissionError("denied")),
             )
-        elif copy == "session":
-            store._session_dir("1", "a@example.com").mkdir(parents=True, exist_ok=True)
-            monkeypatch.setattr("claude_swap.session.read_session_credentials", lambda d: None)
-            monkeypatch.setattr("claude_swap.session._may_have_credential_material", lambda d: True)
         elif copy == "stash-manifest":
             monkeypatch.setattr(
                 store._store.__class__, "_read_stash_manifest_ex", lambda self: ({}, "unreadable")
@@ -2446,31 +2434,19 @@ class TestRulesUAndP(_RequiredModeStore):
         self._active(store, temp_home, block_real_keychain, expires=7200)
         kc = creds("AT-2", "RT-2")
         enc = creds("AT-2e", "RT-2e")
-        session = creds("AT-2s", "RT-2s")
         block_real_keychain.data[SLOT_2] = kc
         store._store._write_backup_enc("2", "b@example.com", enc)
-        session_dir = store._session_dir("2", "b@example.com")
-        session_dir.mkdir(parents=True, exist_ok=True)
-        (session_dir / ".credentials.json").write_text(session, encoding="utf-8")
         store.remove_account("2", assume_yes=True)
         assert SLOT_2 not in block_real_keychain.data
         kept = self._stashed(store)
-        assert all(value in kept for value in (kc, enc, session))
-
-    def test_a_write_to_a_slot_keeps_its_exited_sessions_copy(
-        self, store, temp_home, block_real_keychain
-    ):
-        b = creds("AT-B", "RT-B")
-        self._active(store, temp_home, block_real_keychain, expires=7200, session=b)
-        store._write_account_credentials("1", "a@example.com", creds("AT-N", "RT-N"))
-        assert b in self._stashed(store)
+        assert all(value in kept for value in (kc, enc))
 
     def test_a_stale_stash_row_no_longer_loses_a_newer_slot_copy(
         self, store, temp_home, block_real_keychain, endpoint
     ):
         """The known limit from round 6: the newer copy now lands in the stash."""
         newer = creds("AT-Z", "RT-Z", expires_in_s=9000)
-        x, _, _ = self._active(store, temp_home, block_real_keychain, expires=7200, slot=newer)
+        x, _ = self._active(store, temp_home, block_real_keychain, expires=7200, slot=newer)
         y = creds("AT-Y", "RT-Y", expires_in_s=9000)
         store.stash_consumed_successor(
             "1", self.A_ID, y, oauth.credential_fingerprint(x), "keepalive-live-write-failed"
@@ -2600,3 +2576,136 @@ class TestRulesUAndP(_RequiredModeStore):
         assert s._store._list_unclaimed_credentials() == {}
         assert not s._store._backup_enc_path("1", "a@example.com").exists()
         assert s.post_refresh(self.A_ID, x).credentials is not None
+
+
+class TestSessionProfilesStopRequiredMode(_RequiredModeStore):
+    """Codex round 14, finding 1. The Mac mini has none, and `run` is refused, so a
+    profile is outside what this mode covers."""
+
+    COMMANDS = pytest.mark.parametrize(
+        "argv",
+        [
+            ["keepalive", "--json"],
+            ["keepalive", "--adopt", "file", "--json"],
+            ["auto", "--once"],
+            ["switch", "2"],
+            ["add"],
+            ["remove", "2"],
+        ],
+        ids=lambda argv: "-".join(a for a in argv if a != "--json"),
+    )
+
+    def _profile(self, s, slot="1", email="a@example.com", copy=None):
+        session_dir = s._session_dir(slot, email)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            copy or creds("AT-S", "RT-S", expires_in_s=7200), encoding="utf-8"
+        )
+        return session_dir
+
+    def _due(self, s, home, keychain):
+        a = creds("AT-A", "RT-A", expires_in_s=600)
+        keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", creds("AT-2", "RT-2", expires_in_s=600))
+        file_path = home / ".claude" / ".credentials.json"
+        file_path.write_text(a, encoding="utf-8")
+        return a, file_path
+
+    @COMMANDS
+    def test_codex_scenario_every_command_refuses_with_no_writes_and_no_posts(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, monkeypatch, argv
+    ):
+        self._due(store, temp_home, block_real_keychain)
+        # The session's Keychain item holds the predecessor, its file the sole successor.
+        session_dir = self._profile(store, copy=creds("AT-B", "RT-B", expires_in_s=7200))
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        before = snapshot(temp_home, block_real_keychain)
+        code, out, err = _main(argv, capsys)
+        assert endpoint.posts == []
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert session_dir.exists()
+        text = out + err
+        assert "required_mode_unsupported" in text
+        if argv[0] != "auto":  # a tick reports its error through an event and its own code
+            assert code == 1
+        assert "credentials.requireKeychain" in text and "sessions" in text
+
+    def test_the_report_carries_the_type_and_no_home_path(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._due(store, temp_home, block_real_keychain)
+        self._profile(store)
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["ok"] is False and report["error"]["type"] == "required_mode_unsupported"
+        assert str(Path.home()) not in report["error"]["message"]
+
+    def test_keepalive_stops_at_a_profile_even_with_the_setting_off(
+        self, temp_home, block_real_keychain, endpoint
+    ):
+        """keepalive pins required mode on macOS."""
+        s = macos_store(temp_home)
+        self._due(s, temp_home, block_real_keychain)
+        self._profile(s)
+        assert run_keepalive(s)["error"]["type"] == "required_mode_unsupported"
+        assert endpoint.posts == []
+
+    def test_the_paths_that_never_raise_refuse_too(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        a, _ = self._due(store, temp_home, block_real_keychain)
+        slot_2 = store._read_account_credentials("2", "b@example.com")
+        self._profile(store, "2", "b@example.com")
+        before = snapshot(temp_home, block_real_keychain)
+        assert store.consume_backup_grant("2", "b@example.com", slot_2).error == "required_mode_unsupported"
+        engine = AutoSwitchEngine(store, AutoSwitchSettings(), lambda event: None)
+        assert engine._freshen_target("2", "b@example.com") == "required_mode_unsupported"
+        store._fetch_active_usage("1", "a@example.com", a, "")
+        store._resync_rotated_backup("1", "a@example.com", "", a)
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert endpoint.posts == []
+
+    @pytest.mark.parametrize("argv", [["list", "--json"], ["status", "--json"]], ids=" ".join)
+    def test_the_views_still_read(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, argv
+    ):
+        self._due(store, temp_home, block_real_keychain)
+        self._profile(store)
+        keychain = dict(block_real_keychain.data)
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_copy = file_path.read_text(encoding="utf-8")
+        code, _, _ = _main(argv, capsys)  # a view refreshes its usage cache, nothing else
+        assert code == 0 and endpoint.posts == []
+        assert block_real_keychain.data == keychain
+        assert file_path.read_text(encoding="utf-8") == file_copy
+
+    def test_an_unreadable_sessions_directory_refuses(self, store, monkeypatch):
+        (store.backup_dir / "sessions").mkdir(exist_ok=True)
+        monkeypatch.setattr(
+            Path, "iterdir", lambda self: (_ for _ in ()).throw(PermissionError("denied"))
+        )
+        with pytest.raises(RequiredModeUnsupportedError):
+            store.refuse_session_profiles()
+
+    @pytest.mark.parametrize("leftover", ["none", "empty-dir", "stale-marker"])
+    def test_no_profile_changes_nothing(
+        self, store, temp_home, block_real_keychain, endpoint, leftover
+    ):
+        self._due(store, temp_home, block_real_keychain)
+        sessions = store.backup_dir / "sessions"
+        if leftover != "none":
+            sessions.mkdir(exist_ok=True)
+        if leftover == "stale-marker":
+            (sessions / ".1-a.stale").write_text("", encoding="utf-8")
+        assert run_keepalive(ClaudeAccountSwitcher())["action"] == "refreshed"
+        assert endpoint.posts == ["RT-A"]
+
+    def test_default_mode_still_runs_with_a_profile(
+        self, temp_home, block_real_keychain, endpoint
+    ):
+        s = macos_store(temp_home)
+        self._due(s, temp_home, block_real_keychain)
+        self._profile(s, "2", "b@example.com", copy=s._read_account_credentials("2", "b@example.com"))
+        s.refuse_if_keychain_unavailable()
+        s.switch_to("2", json_output=True)
+        assert s._get_sequence_data()["activeAccountNumber"] == 2

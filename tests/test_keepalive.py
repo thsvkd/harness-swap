@@ -2839,23 +2839,6 @@ class TestEvidenceOnlyDecisionTable:
         assert block_real_keychain.data[ACTIVE_ITEM] == x
         assert rotating.posts == []
 
-    @pytest.mark.parametrize("profile_expires", [28000, 300], ids=["later", "earlier"])
-    def test_a_session_profile_with_another_token_stops_the_post_whatever_its_expiry(
-        self, store, temp_home, block_real_keychain, rotating, monkeypatch, profile_expires
-    ):
-        """A third store: the session may have spent this token, or hold an older one."""
-        x = creds("AT-X", "RT-X", expires_in_s=NEAR)
-        profile = creds("AT-P", "RT-P", expires_in_s=profile_expires)
-        store._write_account_credentials(*SLOT, x)
-        self._stores(temp_home, block_real_keychain, x, x)
-        monkeypatch.setattr("claude_swap.session.read_session_credentials", lambda sdir: profile)
-        monkeypatch.setattr("claude_swap.session.session_identity_drifted", lambda *a: False)
-        report = run_keepalive(new_process())
-        assert report["error"]["type"] == "split_brain"
-        assert rotating.posts == []
-        assert store._read_account_credentials(*SLOT) == x
-        assert block_real_keychain.data[ACTIVE_ITEM] == x
-
     def test_no_store_holding_a_login_never_restores_the_slot(
         self, store, temp_home, block_real_keychain, rotating
     ):
@@ -3081,8 +3064,15 @@ class TestAdopt:
     def test_file_goes_to_the_keychain_and_slot_then_refreshes_once_when_due(
         self, store, temp_home, block_real_keychain, rotating
     ):
-        a, b, file_path = self._split(store, temp_home, block_real_keychain)
-        slot_copy = store._read_account_credentials(*SLOT)
+        """The ordinary case: Claude Code refreshed in the file, the slot is on the same
+        token as the Keychain, and recording that loser settles the slot too."""
+        a = creds("AT-A", "RT-A", expires_in_s=20000)
+        b = creds("AT-B", "RT-B", expires_in_s=7000)
+        store._write_account_credentials(*SLOT, a)
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(b, encoding="utf-8")
+
         report = run_keepalive(new_process(), adopt="file")
         assert report["ok"] is True and report["action"] == "adopted"
         assert rotating.posts == []
@@ -3090,7 +3080,7 @@ class TestAdopt:
         assert file_path.read_text(encoding="utf-8") == b
         assert store._read_account_credentials(*SLOT) == b
         rows = store._store._list_unclaimed_credentials()
-        assert sorted(store._store._read_unclaimed_credential(i)[0] for i in rows) == sorted([a, slot_copy])
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
         on_disk = json.loads((store.backup_dir / "cache" / "keepalive.json").read_text(encoding="utf-8"))
         assert on_disk["action"] == "adopted" and on_disk["ok"] is True
 
@@ -3100,15 +3090,50 @@ class TestAdopt:
         run_keepalive(new_process())
         assert rotating.posts == ["RT-B"]
 
-    def test_the_slot_is_written_under_the_runs_locks_not_left_to_the_resync(
+    def test_a_slot_on_a_third_token_stays_a_rival_until_a_real_login(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        a, b, file_path = self._split(store, temp_home, block_real_keychain)
+        slot_copy = store._read_account_credentials(*SLOT)
+        report = run_keepalive(new_process(), adopt="file")
+        assert report["ok"] is True and report["action"] == "adopted"
+        assert store._read_account_credentials(*SLOT) == b
+        rows = store._store._list_unclaimed_credentials()
+        assert sorted(store._store._read_unclaimed_credential(i)[0] for i in rows) == sorted([a, slot_copy])
+
+        assert run_keepalive(new_process(), ahead=7100)["error"]["type"] == "split_brain"
+        assert rotating.posts == []
+
+        fresh = creds("AT-N", "RT-N", expires_in_s=NEAR)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        file_path.write_text(fresh, encoding="utf-8")
+        # `add` follows the setting, unlike keepalive, which pins required mode.
+        set_setting(store.backup_dir, "credentials.requireKeychain", "true")
+        new_process().add_account(assume_yes=True)
+        assert run_keepalive(new_process())["action"] == "refreshed"
+        assert rotating.posts == ["RT-N"]
+
+    def test_a_provably_new_login_clears_a_third_token(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        """The stores agree on a token nothing here has seen."""
+        store._write_account_credentials(*SLOT, creds("AT-S", "RT-S", expires_in_s=28000))
+        fresh = creds("AT-N", "RT-N", expires_in_s=NEAR)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        (temp_home / ".claude" / ".credentials.json").write_text(fresh, encoding="utf-8")
+        assert run_keepalive(new_process(), adopt="keychain")["action"] == "adopted"
+        assert run_keepalive(new_process())["action"] == "refreshed"
+        assert rotating.posts == ["RT-N"]
+
+    def test_another_accounts_loser_is_not_recorded_as_older(
         self, store, temp_home, block_real_keychain, rotating, monkeypatch
     ):
-        _, b, _ = self._split(store, temp_home, block_real_keychain)
+        a, _, _ = self._split(store, temp_home, block_real_keychain)
         monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_resync_rotated_backup", lambda *a, **kw: None
+            oauth, "fetch_oauth_profile", lambda token: OTHER_ACCOUNT if token == "AT-A" else OWN_ACCOUNT
         )
-        assert run_keepalive(new_process(), adopt="file")["action"] == "adopted"
-        assert store._read_account_credentials(*SLOT) == b
+        assert run_keepalive(new_process(), adopt="file")["ok"] is True
+        assert consumed_grants.entry(oauth.credential_fingerprint(a)) is None
 
     def test_keychain_goes_to_the_file_and_slot(
         self, store, temp_home, block_real_keychain, rotating

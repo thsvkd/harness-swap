@@ -43,6 +43,7 @@ from claude_swap.exceptions import (
     CopiesDisagreeError,
     KeychainUnavailableError,
     LockError,
+    RequiredModeUnsupportedError,
     StoresDisagreeError,
 )
 from claude_swap.locking import FileLock
@@ -86,7 +87,8 @@ _UNLINKED_STORES = (
     "The Keychain and the credentials file hold different logins and no record links "
     "them; nothing was changed. Run hswap claude keepalive --adopt file|keychain, "
     "naming the store whose writer refreshed last. If you cannot tell, log in again "
-    "with /login, adopt the store that login wrote, and run hswap claude add."
+    "with /login and run hswap claude add, removing the credentials file first if "
+    "that login left it behind."
 )
 _ADOPT_NEEDS_KEYCHAIN = "--adopt needs the macOS Keychain and a real run; nothing was changed."
 _LEDGER_UNREADABLE = "consumed-grant ledger unreadable"
@@ -146,6 +148,8 @@ def run_keepalive(
         _keep(switcher, report, ahead, ensure_file, dry_run, adopt)
     except _Stop as stop:
         report["error"] = {"type": stop.kind, "message": stop.message}
+    except RequiredModeUnsupportedError as e:
+        report["error"] = {"type": "required_mode_unsupported", "message": str(e)}
     except CopiesDisagreeError as e:
         report["error"] = {"type": "split_brain", "message": str(e)}
     except StoresDisagreeError:
@@ -193,6 +197,7 @@ def _keep(switcher, report, ahead, ensure_file, dry_run, adopt=None) -> None:
         if macos_keychain.keychain_reachable(platform="darwin") is False:
             raise _Stop("keychain_unavailable")
         store.pin_keychain()
+        switcher.refuse_session_profiles()
     store.records_consumed = True
     if adopt and (dry_run or not store._keychain_is_required()):
         raise _Stop("adopt_refused", _ADOPT_NEEDS_KEYCHAIN)
@@ -518,15 +523,26 @@ def _adopt(active, report, choice: str) -> str:
     _refuse_spent(chosen)
 
     fingerprint = oauth.credential_fingerprint(chosen)
+    identity = active.identity or ("", "")
+    # Decided before anything below adds to what the stash knows.
+    new_login = switcher.is_provably_new_login(chosen, active.slot, identity[0])
     for stale in (keychain, file_creds):
         if not holds_no_login(stale) and oauth.credential_fingerprint(stale) != fingerprint:
-            _stash_loser(active, stale, _belongs(active, stale, backup, probe=True))
-    # Stashed now rather than when the writes replace them, so they are behind it too.
-    held = switcher._stored_copies(active.slot, *active.identity) if active.slot else []
+            verdict = _belongs(active, stale, backup, probe=True)
+            _stash_loser(active, stale, verdict)
+            # The tie-break settles the two stores. Another account's copy says nothing.
+            if verdict is not False:
+                consumed_grants.record(
+                    oauth.credential_fingerprint(stale), identity, consumed_grants.CONSUMED,
+                    successor=fingerprint,
+                )
+    # Kept before the writes below replace them. They stay rivals unless this login is new.
+    held = switcher._stored_copies(active.slot, identity[0]) if active.slot else []
     for stale in held:
         if not holds_no_login(stale) and oauth.credential_fingerprint(stale) != fingerprint:
             _stash_loser(active, stale, True)
-    switcher.supersede_stashed_copies(active.identity or ("", ""), chosen)
+    if new_login:
+        switcher.supersede_stashed_copies(identity, chosen)
     final = _write_stores(active, report, keychain, file_creds, chosen, True, False)
     if active.slot:
         switcher._write_account_credentials(active.slot, active.identity[0], final)

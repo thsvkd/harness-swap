@@ -92,6 +92,8 @@ _SYSTEMIC_MESSAGES = {
                         "keychain or fix the file, then retry; "
                         "`cswap unclaimed` inspects it",
     "consume-busy": "another cswap surface holds the slot — retries next pass",
+    "required_mode_unsupported": "session profiles exist — remove them or turn off "
+                                 "credentials.requireKeychain",
     "stores-disagree": "the Keychain and the credentials file hold different logins — "
                        "run keepalive",
 }

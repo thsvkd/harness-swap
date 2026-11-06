@@ -43,6 +43,7 @@ from claude_swap.exceptions import (
     CopiesDisagreeError,
     KeychainUnavailableError,
     LockError,
+    ReloginRequiredError,
     RequiredModeUnsupportedError,
     StoresDisagreeError,
 )
@@ -149,6 +150,8 @@ def run_keepalive(
         report["error"] = {"type": stop.kind, "message": stop.message}
     except RequiredModeUnsupportedError as e:
         report["error"] = {"type": "required_mode_unsupported", "message": str(e)}
+    except ReloginRequiredError:
+        report["error"] = _error("relogin_required")
     except CopiesDisagreeError as e:
         report["error"] = {"type": "split_brain", "message": str(e)}
     except StoresDisagreeError:
@@ -308,7 +311,9 @@ def _prune_stash(active) -> None:
         return  # orphan files could be the only record: see _adopt_stashed_successor
     rows = store._list_unclaimed_credentials()
     pointed_at = {row.get("consumedFp") for row in rows.values()}
-    for entry_id in rows:
+    for entry_id, row in rows.items():
+        if row.get("purgedAt"):
+            continue  # evidence, and it holds nothing to protect
         value, unreadable = store._read_unclaimed_credential(entry_id)
         if unreadable or not value:
             continue
@@ -382,6 +387,8 @@ def _parked_successor(active, held: list[str], dry_run) -> tuple[str | None, lis
     manifest = switcher._store._read_stash_manifest()
     for entry_id, row in manifest.items():
         if is_ours(row) and row.get("consumedFp") in spent:
+            if row.get("purgedAt"):
+                raise _Stop("relogin_required")
             parked, _ = switcher._store._read_unclaimed_credential(entry_id)
             if parked:
                 chain, terminal = switcher.stash_chain_terminal(
@@ -486,7 +493,9 @@ def _reconcile(
     if not successor and backup and oauth.credential_fingerprint(backup) in successors:
         successor = backup
     if dry_run and not successor and successors & {
-        row.get("fingerprint") for row in switcher._store._read_stash_manifest().values()
+        row.get("fingerprint")
+        for row in switcher._store._read_stash_manifest().values()
+        if not row.get("purgedAt")
     }:
         report["action"] = "synced-keychain"  # the real run adopts it from the stash
         _report_expiry(report, login)

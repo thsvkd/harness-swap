@@ -27,6 +27,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
     KeychainUnavailableError,
+    ReloginRequiredError,
     RequiredModeUnsupportedError,
     StoresDisagreeError,
 )
@@ -3110,11 +3111,14 @@ class TestStashPurgeInRequiredMode(_RequiredModeStore):
             oauth.credential_fingerprint(old), self.A_ID, consumed_grants.CONSUMED,
             successor=oauth.credential_fingerprint(a),
         )
+        rows_before = dict(store._store._read_stash_manifest()[entry])
         code, out, _ = self._purge(entry, capsys)
         assert code == 0 and "Purged" in out
-        assert store._store._list_unclaimed_credentials() == {}
         assert not store._store._stash_entry_path(entry).exists()
         assert block_real_keychain.data[ACTIVE_ITEM] == a
+        row = store._store._read_stash_manifest()[entry]
+        assert row["purgedAt"]
+        assert {k: v for k, v in row.items() if k != "purgedAt"} == rows_before
 
     @pytest.mark.parametrize("held_in", ["keychain", "file", "this-slot", "another-slot"])
     def test_a_token_also_held_elsewhere_goes(
@@ -3271,3 +3275,298 @@ class TestStashPurgeInRequiredMode(_RequiredModeStore):
         entry = self._row(s, creds("AT-B", "RT-B"))
         assert self._purge(entry, capsys)[0] == 0
         assert s._store._list_unclaimed_credentials() == {}
+
+
+class TestPurgeKeepsATombstone(_RequiredModeStore):
+    """Codex round 18: a purged entry can be rule U's only witness against a stale
+    predecessor, so its bytes go and its evidence stays."""
+
+    def _stale_p_everywhere(self, s, home, keychain, *, expires=600):
+        p = creds("AT-P", "RT-P", expires_in_s=expires)
+        keychain.data[ACTIVE_ITEM] = p
+        keychain.data[("claude-swap", "account-1-a@example.com")] = p
+        (home / ".claude" / ".credentials.json").write_text(p, encoding="utf-8")
+        return p
+
+    def _stash(self, s, value, **extra):
+        return s._store._write_unclaimed_credential(value, {
+            "reason": "test", "configSlot": "1", "email": "a@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(value), **extra,
+        })
+
+    def test_codex_finding_1_a_consumed_witness_still_stops_the_stale_predecessor(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        """P rotated outside to S, S was then rejected, and stale P came back."""
+        self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        s_copy = creds("AT-S", "RT-S", expires_in_s=7200)
+        entry = self._stash(store, s_copy)
+        consumed_grants.record(
+            oauth.credential_fingerprint(s_copy), self.A_ID, consumed_grants.CONSUMED
+        )
+        assert _main(["unclaimed", "--purge", entry], capsys)[0] == 0
+        assert not store._store._stash_entry_path(entry).exists()
+
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["error"]["type"] == "split_brain"
+        assert endpoint.posts == []
+
+    def test_codex_finding_2_a_copy_in_another_accounts_slot_is_no_witness_here(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        """The purge sees S in slot 2, but this account's scan would not."""
+        self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        s_copy = creds("AT-S", "RT-S", expires_in_s=7200)
+        block_real_keychain.data[("claude-swap", "account-2-b@example.com")] = s_copy
+        entry = self._stash(store, s_copy)
+        assert _main(["unclaimed", "--purge", entry], capsys)[0] == 0
+
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["error"]["type"] == "split_brain"
+        assert endpoint.posts == []
+
+    def test_a_real_login_still_gets_past_a_tombstone(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        s_copy = creds("AT-S", "RT-S", expires_in_s=7200)
+        entry = self._stash(store, s_copy)
+        consumed_grants.record(
+            oauth.credential_fingerprint(s_copy), self.A_ID, consumed_grants.CONSUMED
+        )
+        _main(["unclaimed", "--purge", entry], capsys)
+        fresh = creds("AT-N", "RT-N", expires_in_s=600)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        (temp_home / ".claude" / ".credentials.json").write_text(fresh, encoding="utf-8")
+        store.add_account(assume_yes=True)
+        for _ in range(3):
+            assert run_keepalive(ClaudeAccountSwitcher())["ok"] is True
+        assert endpoint.posts == ["RT-N"]
+        assert entry in store._store._read_stash_manifest()
+
+    def _spent_stores_with_parked_tombstone(self, s, home, keychain):
+        x = self._stale_p_everywhere(s, home, keychain)
+        y = creds("AT-Y", "RT-Y", expires_in_s=7200)
+        x_fp = oauth.credential_fingerprint(x)
+        consumed_grants.record(oauth.credential_fingerprint(y), self.A_ID, consumed_grants.CONSUMED)
+        consumed_grants.record(x_fp, self.A_ID, consumed_grants.CONSUMED)
+        s.stash_consumed_successor("1", self.A_ID, y, x_fp, "keepalive-live-write-failed")
+        entry = next(iter(s._store._read_stash_manifest()))
+        s.purge_stash_entry(entry)
+        return x, y, entry
+
+    def test_a_tombstone_is_never_adopted_and_stays(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        x, _, entry = self._spent_stores_with_parked_tombstone(
+            store, temp_home, block_real_keychain
+        )
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["error"]["type"] == "relogin_required"
+        assert endpoint.posts == []
+        assert block_real_keychain.data[ACTIVE_ITEM] == x
+        assert entry in store._store._read_stash_manifest()
+
+    def test_the_consume_gate_reports_relogin_for_a_tombstone(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        x = creds("AT-X", "RT-X", expires_in_s=60)
+        y = creds("AT-Y", "RT-Y", expires_in_s=7200)
+        block_real_keychain.data[SLOT_2] = x
+        store.stash_consumed_successor(
+            "2", ("b@example.com", ""), y, oauth.credential_fingerprint(x), "keepalive-live-write-failed"
+        )
+        entry = next(iter(store._store._read_stash_manifest()))
+        consumed_grants.record(oauth.credential_fingerprint(y), ("b@example.com", ""), consumed_grants.CONSUMED)
+        store.purge_stash_entry(entry)
+        outcome = store.consume_backup_grant("2", "b@example.com", x)
+        assert outcome.credentials is None and outcome.error == "relogin_required"
+        assert endpoint.posts == []
+        assert entry in store._store._read_stash_manifest()
+
+    def test_a_chain_that_reaches_a_tombstone_stops(self, store):
+        x = creds("AT-X", "RT-X")
+        y = creds("AT-Y", "RT-Y")
+        z = creds("AT-Z", "RT-Z")
+        start = self._stash(store, y, consumedFp=oauth.credential_fingerprint(x))
+        last = self._stash(store, z, consumedFp=oauth.credential_fingerprint(y))
+        store._store._tombstone_unclaimed_credential(last, oauth.credential_fingerprint(z))
+        manifest = store._store._read_stash_manifest()
+        with pytest.raises(ReloginRequiredError):
+            store.stash_chain_terminal(
+                manifest, lambda row: True, start, y, oauth.credential_fingerprint(x)
+            )
+
+    def test_an_unmanaged_login_reports_relogin_for_a_tombstone(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "stranger@example.com", "accountUuid": "uuid-9"},
+        }), encoding="utf-8")
+        x = creds("AT-X", "RT-X", expires_in_s=7200)
+        y = creds("AT-Y", "RT-Y", expires_in_s=7200)
+        identity = ("stranger@example.com", "")
+        block_real_keychain.data[ACTIVE_ITEM] = x
+        store.stash_consumed_successor(
+            "unmanaged", identity, y, oauth.credential_fingerprint(x), "keepalive-live-write-failed"
+        )
+        entry = next(iter(store._store._read_stash_manifest()))
+        store._store._tombstone_unclaimed_credential(entry, oauth.credential_fingerprint(y))
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "relogin_required"
+        assert block_real_keychain.data[ACTIVE_ITEM] == x
+
+    def test_a_dry_run_does_not_promise_to_adopt_a_tombstone(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._spent_stores_with_parked_tombstone(store, temp_home, block_real_keychain)
+        report = run_keepalive(ClaudeAccountSwitcher(), dry_run=True)
+        assert report["error"]["type"] == "relogin_required"
+
+    def test_a_tombstone_is_not_a_preserved_copy(self, store, temp_home, block_real_keychain):
+        """Rule P writes the copy again rather than trust a row with no bytes."""
+        copy = creds("AT-C", "RT-C")
+        entry = self._stash(store, copy)
+        store._store._tombstone_unclaimed_credential(entry, oauth.credential_fingerprint(copy))
+        store._preserve_copy(copy, None, identity=self.A_ID)
+        rows = store._store._read_stash_manifest()
+        assert len(rows) == 2
+        kept = [i for i in rows if i != entry]
+        assert store._store._read_unclaimed_credential(kept[0])[0] == copy
+        assert entry in rows
+
+    def test_a_tombstone_still_makes_its_token_known(self, store, temp_home, block_real_keychain):
+        copy = creds("AT-C", "RT-C")
+        entry = self._stash(store, copy)
+        store._store._tombstone_unclaimed_credential(entry, oauth.credential_fingerprint(copy))
+        block_real_keychain.data[ACTIVE_ITEM] = copy
+        assert store.is_provably_new_login(copy, "1", "a@example.com") is False
+
+    def test_keepalive_never_prunes_or_retires_a_tombstone(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._stale_p_everywhere(store, temp_home, block_real_keychain, expires=7200)
+        unrelated = creds("AT-U", "RT-U")
+        unrelated_row = self._stash(store, unrelated, reason="consume-gate-cas-conflict",
+                                    consumedFp="sha256:other")
+        store._store._tombstone_unclaimed_credential(
+            unrelated_row, oauth.credential_fingerprint(unrelated)
+        )
+        for _ in range(3):
+            run_keepalive(ClaudeAccountSwitcher())
+        assert unrelated_row in store._store._read_stash_manifest()
+
+    def test_a_corrupt_manifest_blocks_rule_u_with_no_entry_files_left(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch
+    ):
+        """A tombstone has no file to show for itself, so no row may read as no rival."""
+        p = self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        monkeypatch.setattr(
+            store._store.__class__, "_read_stash_manifest_ex", lambda self: ({}, "corrupt")
+        )
+        with pytest.raises(CopiesDisagreeError):
+            store._require_unanimity(p, self.A_ID)
+
+    def test_a_purge_that_cannot_write_the_row_keeps_the_bytes(
+        self, store, temp_home, block_real_keychain, monkeypatch, capsys
+    ):
+        copy = creds("AT-C", "RT-C")
+        self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        entry = self._stash(store, copy)
+        consumed_grants.record(oauth.credential_fingerprint(copy), self.A_ID, consumed_grants.CONSUMED)
+        monkeypatch.setattr(
+            store._store, "_mutate_stash_manifest",
+            lambda mutate: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        with pytest.raises(OSError):
+            store._store._tombstone_unclaimed_credential(entry, oauth.credential_fingerprint(copy))
+        assert store._store._stash_entry_path(entry).exists()
+
+    def test_a_failed_delete_names_no_path_and_a_retry_finishes_it(
+        self, store, temp_home, block_real_keychain, monkeypatch, capsys
+    ):
+        copy = creds("AT-C", "RT-C")
+        self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        entry = self._stash(store, copy)
+        consumed_grants.record(oauth.credential_fingerprint(copy), self.A_ID, consumed_grants.CONSUMED)
+        path = store._store._stash_entry_path(entry)
+        real_unlink = Path.unlink
+
+        def denied(self, *a, **kw):
+            if self == path:
+                raise PermissionError(13, "denied", "/Users/x/secret")
+            return real_unlink(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "unlink", denied)
+        code, _, err = _main(["unclaimed", "--purge", entry], capsys)
+        assert code == 1 and "/Users/x/secret" not in err and "PermissionError" in err
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+        # Other checks no longer apply: this entry already passed them.
+        assert _main(["unclaimed", "--purge", entry], capsys)[0] == 0
+        assert not path.exists()
+
+    def test_a_tombstone_for_the_stores_token_needs_a_login_even_off_the_ledger(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        """The row says this token was replaced, and the replacement's bytes are gone."""
+        x = self._stale_p_everywhere(store, temp_home, block_real_keychain, expires=7200)
+        y = creds("AT-Y", "RT-Y", expires_in_s=7200)
+        entry = self._stash(store, y, consumedFp=oauth.credential_fingerprint(x))
+        store._store._tombstone_unclaimed_credential(entry, oauth.credential_fingerprint(y))
+        assert consumed_grants.entry(oauth.credential_fingerprint(x)) is None
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "relogin_required"
+        assert endpoint.posts == []
+
+    def test_a_tombstone_whose_delete_failed_is_not_pruned_when_its_login_lapses(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._stale_p_everywhere(store, temp_home, block_real_keychain, expires=7200)
+        data = json.loads(creds("AT-L", "RT-L"))
+        data["claudeAiOauth"]["refreshTokenExpiresAt"] = 1_000_000_000_000  # long past
+        lapsed = json.dumps(data)
+        entry = self._stash(store, lapsed)
+        store._store._mutate_stash_manifest(
+            lambda rows: rows[entry].update(purgedAt="2026-01-01T00:00:00Z")
+        )
+        run_keepalive(ClaudeAccountSwitcher())
+        assert entry in store._store._read_stash_manifest()
+
+    def test_a_retry_finishes_a_failed_delete_whatever_has_changed_since(self, store, capsys):
+        copy = creds("AT-C", "RT-C")
+        entry = self._stash(store, copy)
+        store._store._mutate_stash_manifest(
+            lambda rows: rows[entry].update(purgedAt="2026-01-01T00:00:00Z")
+        )
+        # This would now refuse a first purge, but the entry has already passed.
+        self._stash(store, creds("AT-N", "RT-N"), consumedFp=oauth.credential_fingerprint(copy))
+        store.purge_stash_entry(entry)
+        assert not store._store._stash_entry_path(entry).exists()
+
+    def test_an_orphan_entry_keeps_its_fingerprint_as_evidence(
+        self, store, temp_home, block_real_keychain
+    ):
+        """No manifest row, only bytes: what those bytes were must not go with them."""
+        copy = creds("AT-C", "RT-C")
+        fingerprint = oauth.credential_fingerprint(copy)
+        entry = self._stash(store, copy)
+        store._store._mutate_stash_manifest(lambda rows: rows.pop(entry))
+        consumed_grants.record(fingerprint, self.A_ID, consumed_grants.CONSUMED)
+        store.purge_stash_entry(entry)
+        assert store._store._read_stash_manifest()[entry]["fingerprint"] == fingerprint
+        assert not store._store._stash_entry_path(entry).exists()
+
+    def test_the_list_says_it_was_purged(self, store, temp_home, block_real_keychain, capsys):
+        copy = creds("AT-C", "RT-C")
+        entry = self._stash(store, copy)
+        store._store._tombstone_unclaimed_credential(entry, oauth.credential_fingerprint(copy))
+        code, out, _ = _main(["unclaimed"], capsys)
+        assert code == 0 and entry in out and "purged" in out
+
+    def test_healthy_refresh_is_unchanged(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._stale_p_everywhere(store, temp_home, block_real_keychain)
+        for _ in range(3):
+            assert run_keepalive(ClaudeAccountSwitcher())["ok"] is True
+        assert endpoint.posts == ["RT-P"]
+        assert store._store._read_stash_manifest() == {}

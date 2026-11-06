@@ -2128,6 +2128,28 @@ class CredentialStore:
             )
             return "", False
 
+    def _tombstone_unclaimed_credential(self, entry_id: str, fingerprint: str) -> None:
+        """Keychain-required mode's purge: the bytes go, the row stays as evidence that
+        this refresh token existed. The row first, so a failure cannot lose the evidence;
+        a failed delete leaves a tombstone with bytes, which nothing reads and a retry
+        finishes."""
+        from datetime import UTC, datetime
+
+        purged_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def mark(entries: dict) -> None:
+            entries.setdefault(entry_id, {"createdAt": None}).update(
+                fingerprint=fingerprint, purgedAt=purged_at
+            )
+
+        self._mutate_stash_manifest(mark)
+        try:
+            self._stash_entry_path(entry_id).unlink(missing_ok=True)
+        except OSError as e:
+            raise CredentialWriteError(
+                f"Could not delete this entry's bytes ({type(e).__name__})."
+            ) from None
+
     def _remove_unclaimed_credential(self, entry_id: str) -> None:
         """Delete a stash entry (bytes + manifest row) after it was adopted."""
         try:

@@ -1960,6 +1960,117 @@ class TestRequiredModeRefusesTheRest(_RequiredModeStore):
         store.add_account(assume_yes=True)
         assert store._read_account_credentials("1", "a@example.com") == b
 
+    # Codex round 16: the removal's checks run before it holds the locks.
+
+    def _landing_before_the_locks(self, s, monkeypatch, land):
+        """Run ``land`` after the checks, just as the removal reaches for the locks."""
+        real = s._required_mode_section
+
+        def hooked():
+            land()
+            return real()
+
+        monkeypatch.setattr(s, "_required_mode_section", hooked)
+
+    def test_a_switch_into_the_slot_before_the_locks_stops_the_removal(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch
+    ):
+        self._seed(store, temp_home, block_real_keychain)
+        seen = {}
+
+        def switch_lands():
+            other = ClaudeAccountSwitcher()
+            other.platform = Platform.MACOS
+            other.switch_to("2", json_output=True)
+            seen["roster"] = other.sequence_file.read_bytes()
+            seen["all"] = snapshot(temp_home, block_real_keychain)
+
+        self._landing_before_the_locks(store, monkeypatch, switch_lands)
+        with pytest.raises(RequiredModeUnsupportedError):
+            store.remove_account("2", assume_yes=True)
+        assert seen, "the switch never landed"
+        assert store.sequence_file.read_bytes() == seen["roster"]
+        assert snapshot(temp_home, block_real_keychain) == seen["all"]
+        assert store._read_account_credentials("2", "b@example.com")
+        assert store._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_a_login_into_the_slot_before_the_locks_stops_the_removal(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        """The roster can lag the login, and either says it is active."""
+        self._seed(store, temp_home, block_real_keychain)
+        seen = {}
+
+        def login_lands():
+            (temp_home / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
+            }), encoding="utf-8")
+            slot_2 = store._read_account_credentials("2", "b@example.com")
+            block_real_keychain.data[ACTIVE_ITEM] = slot_2
+            (temp_home / ".claude" / ".credentials.json").write_text(slot_2, encoding="utf-8")
+            seen["all"] = snapshot(temp_home, block_real_keychain)
+
+        self._landing_before_the_locks(store, monkeypatch, login_lands)
+        with pytest.raises(RequiredModeUnsupportedError):
+            store.remove_account("2", assume_yes=True)
+        assert snapshot(temp_home, block_real_keychain) == seen["all"]
+
+    def test_a_roster_naming_the_slot_active_before_the_locks_stops_the_removal(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        self._seed(store, temp_home, block_real_keychain)
+        seen = {}
+
+        def roster_lands():
+            data = store._get_sequence_data()
+            data["activeAccountNumber"] = 2
+            store._write_json(store.sequence_file, data)
+            seen["all"] = snapshot(temp_home, block_real_keychain)
+
+        self._landing_before_the_locks(store, monkeypatch, roster_lands)
+        with pytest.raises(RequiredModeUnsupportedError):
+            store.remove_account("2", assume_yes=True)
+        assert snapshot(temp_home, block_real_keychain) == seen["all"]
+
+    @pytest.mark.parametrize("change", ["gone", "email", "organization", "uuid"])
+    def test_a_slot_that_changed_before_the_locks_stops_the_removal(
+        self, store, temp_home, block_real_keychain, monkeypatch, change
+    ):
+        self._seed(store, temp_home, block_real_keychain)
+        seen = {}
+
+        def roster_changes():
+            data = store._get_sequence_data()
+            if change == "gone":
+                del data["accounts"]["2"]
+            else:
+                field = {"email": "email", "organization": "organizationUuid", "uuid": "uuid"}[change]
+                data["accounts"]["2"][field] = "other"
+            store._write_json(store.sequence_file, data)
+            seen["all"] = snapshot(temp_home, block_real_keychain)
+
+        self._landing_before_the_locks(store, monkeypatch, roster_changes)
+        with pytest.raises(ClaudeSwitchError):
+            store.remove_account("2", assume_yes=True)
+        assert snapshot(temp_home, block_real_keychain) == seen["all"]
+
+    def test_a_removal_commits_the_roster_as_it_is_now(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        """A change that does not touch the slot goes through, and is not undone."""
+        self._seed(store, temp_home, block_real_keychain)
+
+        def alias_lands():
+            data = store._get_sequence_data()
+            data["accounts"]["1"]["alias"] = "work"
+            store._write_json(store.sequence_file, data)
+
+        self._landing_before_the_locks(store, monkeypatch, alias_lands)
+        store.remove_account("2", assume_yes=True)
+        data = store._get_sequence_data()
+        assert "2" not in data["accounts"]
+        assert data["accounts"]["1"]["alias"] == "work"
+
     # Default mode, Linux and Windows.
 
     def test_default_mode_runs_them(self, temp_home, block_real_keychain, capsys):

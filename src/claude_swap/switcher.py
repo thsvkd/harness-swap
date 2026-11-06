@@ -4857,6 +4857,23 @@ class ClaudeAccountSwitcher:
                 return
 
         with self._required_mode_section():
+            # Required mode: a switch can land between the checks above and these locks,
+            # so check again and commit what the roster says now, not the earlier read.
+            if self._store._keychain_is_required():
+                data = self._get_sequence_data() or {}
+                now = data.get("accounts", {}).get(account_num)
+                fields = ("email", "organizationUuid", "uuid")
+                if not now or any(now.get(f) != account_info.get(f) for f in fields):
+                    raise AccountNotFoundError(
+                        f"Account-{account_num} changed while it was being removed; "
+                        "nothing was removed."
+                    )
+                if str(data.get("activeAccountNumber")) == account_num or (
+                    self._get_current_account()
+                    == (email, now.get("organizationUuid", "") or "")
+                ):
+                    self.refuse_in_required_mode("remove of the active account")
+
             # Remove backup files
             self._delete_account_files(account_num, email)
 

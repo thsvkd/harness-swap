@@ -532,7 +532,7 @@ hswap claude migrate-store --to file --keep file             # or --keep keychai
 
 The slots' own `claude-swap` Keychain items stay where they are, and file mode never reads them, so they fall behind the `.enc` files. Once the store is `file`, `migrate-store` goes by the `.enc` too.
 
-Restart every running Claude Code afterwards: one that saw the Keychain item before the migration can refresh and then fail to store the result (see above). The backups stay in the login keychain, refresh tokens included, and `purge` does not remove them. Delete one with `security delete-generic-password -s claude-swap -a <account>` when you no longer need it.
+Restart every running Claude Code afterwards: one that saw the Keychain item before the migration can refresh and then fail to store the result (see above). The backups stay in the login keychain; see [Cleaning up Keychain backups](#cleaning-up-keychain-backups).
 
 This step records no lineage, and it puts no Keychain copy in the stash as a rival. You are the tie-break and the kept login is canonical, as with `keepalive --adopt`. What lost is safe in the backups, where rule U does not look. A stash entry for the account that was already there is not touched and stays a rival, so if `keepalive` reports `split_brain` afterwards, run `/login` and `hswap claude add`.
 
@@ -567,11 +567,23 @@ hswap claude config unset credentials.store
 hswap claude migrate-store --restore-keychain claude-code-credentials.backup-<UTC time>
 ```
 
-The restore writes the backup back as `Claude Code-credentials` with a read-back, and first backs up any item already there. It does not delete the backup. It takes only a `claude-code-credentials.backup-*` name.
+The restore writes the backup back as `Claude Code-credentials` with a read-back. It does not delete the backup. It takes only a `claude-code-credentials.backup-*` name.
+
+If any `Claude Code-credentials` or `Claude Code-credentials-*` item exists, the restore stops with `relogin_required` and writes nothing, whatever token the item holds. An item there may be the successor of the backup, so there is nothing to restore: adopt it with `hswap claude migrate-store --to file --keep keychain` instead.
 
 A backup is frozen at the migration, and Claude Code rotates the file without telling the ledger, so a backup that differs from the file may be its spent predecessor. The restore therefore works only when the backup holds the same refresh token as the file, or when there is no file and neither the active slot's `.enc` nor a stash entry of the account holds a different one. Otherwise it stops with `relogin_required` and changes nothing, as it does for a token the ledger lists as spent. It also refuses another account's backup (`unmanaged`). With the setting left on, the restored item makes every command stop with `keychain_item_present`.
 
-If the restore refuses, or if `keepalive` then reports `split_brain`, finish in the screen session with `/login` and `hswap claude add`. `--adopt` does not settle this: it keeps the losing copies as rivals.
+If the restore refuses for any other reason, or if `keepalive` then reports `split_brain`, finish in the screen session with `/login` and `hswap claude add`. `--adopt` does not settle this: it keeps the losing copies as rivals.
+
+### Cleaning up Keychain backups
+
+`migrate-store` leaves `claude-swap` items named `claude-code-credentials.backup-*` and `slot-N-*.backup-*` in the login keychain. They hold refresh tokens, and `purge` does not remove them. Delete them once file mode has run healthy for 7 days, or 31 days after the backup, whichever comes first. Do it from a context where the keychain is unlocked:
+
+```bash
+security delete-generic-password -s claude-swap -a <name>
+```
+
+Never delete one you might still restore.
 
 ## Uninstall
 

@@ -62,6 +62,10 @@ _RESTORE_UNPROVEN = (
     "The backup may be a spent predecessor of the current login, so it was not restored and "
     "nothing was changed. Use /login in the screen session instead."
 )
+_RESTORE_ITEM_EXISTS = (
+    "A Claude Code login already exists in the Keychain, so nothing was restored or changed. "
+    "Use hswap claude migrate-store --to file --keep keychain to adopt it instead."
+)
 _UNSUPPORTED_STORE = (
     "CLAUDE_CONFIG_DIR or CLAUDE_SECURESTORAGE_CONFIG_DIR names a credential store "
     "migrate-store does not manage; run it from a normal shell."
@@ -298,15 +302,14 @@ def _restore_is_safe(switcher, active, value: str) -> bool:
 
 
 def run_restore_keychain(switcher, backup_account: str) -> dict:
-    """The rollback: a backup goes back as the Claude Code item and stays where it is. An
-    item already there is backed up first, since it may be a newer login. Backups stop at
-    the migration, so one can be spent by now, and Claude Code would POST it from there."""
+    """The rollback: a backup goes back as the Claude Code item and stays where it is. Only
+    with no item there: an unlocked Claude Code may have rotated into one, leaving the backup
+    its spent predecessor. Backups stop at the migration, and Claude Code would POST it."""
     report = {
         "schemaVersion": 1,
         "ok": False,
         "restored": backup_account,
         "fingerprint": None,
-        "backups": [],
         "error": None,
     }
 
@@ -323,15 +326,15 @@ def run_restore_keychain(switcher, backup_account: str) -> dict:
             if value is None:
                 raise _Stop("backup_not_found", "No such backup in the login keychain.")
             report["fingerprint"] = _refresh_fingerprint(value)
+            # The lookup by service alone also finds an item the dump's account did not name.
+            if _keychain_items() or macos_keychain.credential_item_present():
+                raise _Stop("relogin_required", _RESTORE_ITEM_EXISTS)
             _refuse_spent(value)
             active = _read_active(switcher)
             if _belongs(active, value, _read_slot(active), probe=True) is False:
                 raise _Stop("unmanaged", "That backup is another account's; nothing was changed.")
             if not _restore_is_safe(switcher, active, value):
                 raise _Stop("relogin_required", _RESTORE_UNPROVEN)
-            current = macos_keychain.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account)
-            if current and current != value:
-                _back_up(CREDENTIALS_BACKUP, current, report)
             macos_keychain.set_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account, value)
 
     return _report_failure(report, work)

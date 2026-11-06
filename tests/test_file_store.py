@@ -1312,14 +1312,57 @@ class TestRestoreKeychain:
         assert ["-i"] in split.security.calls
         assert not any("RT-K" in " ".join(call) for call in split.security.calls)
 
-    def test_an_item_already_there_is_kept_first(self, split):
+    def _assert_item_refuses(self, env, name):
+        before = dict(env.security.items)
+        env.security.calls.clear()
+        report = run_restore_keychain(ClaudeAccountSwitcher(), name)
+        assert report["ok"] is False and report["error"]["type"] == "relogin_required"
+        assert "already exists in the Keychain" in report["error"]["message"]
+        assert "migrate-store --to file --keep keychain" in report["error"]["message"]
+        assert env.security.items == before
+        assert ["-i"] not in env.security.calls  # zero writes
+
+    @pytest.mark.parametrize("token", ["RT-K", "RT-N"], ids=["same-rt", "different-rt"])
+    def test_an_existing_item_refuses(self, split, token):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        split.security.items[ACTIVE_ITEM] = creds("AT-N", token)
+        self._assert_item_refuses(split, backup_of(split, split.keychain_login))
+
+    def test_a_prefix_item_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        split.security.items[(f"{SERVICE}-abcd1234", ACCOUNT)] = creds("AT-P", "RT-P")
+        self._assert_item_refuses(split, backup_of(split, split.keychain_login))
+
+    def test_an_item_under_another_account_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        split.security.items[(SERVICE, "someone-else")] = creds("AT-O", "RT-O")
+        self._assert_item_refuses(split, backup_of(split, split.keychain_login))
+
+    def test_a_successor_in_the_keychain_with_the_file_gone_refuses(self, split):
+        # An unlocked Claude Code rotated into the Keychain and deleted the file, while the
+        # slot still matches the frozen backup.
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        split.file.unlink()
+        split.security.items[ACTIVE_ITEM] = creds("AT-K2", "RT-K2")
+        assert split.read_enc(SLOT_1) == split.keychain_login
+        self._assert_item_refuses(split, backup_of(split, split.keychain_login))
+
+    @pytest.mark.parametrize("failure", [36, subprocess.TimeoutExpired("security", 5)], ids=["rc36", "timeout"])
+    def test_a_failed_item_check_writes_nothing(self, split, failure):
         run_migrate_store(ClaudeAccountSwitcher(), "keychain")
         name = backup_of(split, split.keychain_login)
-        newer = creds("AT-N", "RT-N")
-        split.security.items[ACTIVE_ITEM] = newer
-        restored = run_restore_keychain(ClaudeAccountSwitcher(), name)
-        assert restored["ok"] is True
-        assert split.security.items[("claude-swap", restored["backups"][0])] == newer
+        before = dict(split.security.items)
+        split.security.calls.clear()
+        split.security.check_failure = failure
+        report = run_restore_keychain(ClaudeAccountSwitcher(), name)
+        assert report["ok"] is False
+        assert split.security.items == before and ["-i"] not in split.security.calls
+
+    def test_a_second_restore_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        assert run_restore_keychain(ClaudeAccountSwitcher(), name)["ok"] is True
+        self._assert_item_refuses(split, name)
 
     def test_a_restored_item_trips_the_guard_until_the_setting_is_off(self, split):
         run_migrate_store(ClaudeAccountSwitcher(), "keychain")

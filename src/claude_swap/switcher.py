@@ -34,7 +34,7 @@ from claude_swap.exceptions import (
     RequiredModeUnsupportedError,
     SessionError,
     SessionProfilesExistError,
-    StashEntryInUseError,
+    StashManifestCorruptError,
     STORES_DISAGREE_MESSAGE,
     StoresDisagreeError,
     SwitchError,
@@ -238,6 +238,7 @@ ERROR_NOTES = {
     "required_mode_unsupported": (
         "session profiles exist — remove them or turn off credentials.requireKeychain"
     ),
+    "stash_manifest_corrupt": "the stash manifest cannot be read — inspect or restore it",
 }
 
 SENTINEL_NOTES = {
@@ -699,6 +700,18 @@ class ClaudeAccountSwitcher:
         if self.keychain_gate_closed(fresh=True):
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
         self.refuse_session_profiles()
+        self.refuse_unreadable_stash_manifest()
+
+    def refuse_unreadable_stash_manifest(self) -> None:
+        """Required mode: the stash's rows are evidence for rule U, so with them unreadable
+        nothing writes or sends, and only a person repairs the file."""
+        if (
+            self._store._keychain_is_required()
+            and self._store._read_stash_manifest_ex()[1] != "ok"
+        ):
+            raise StashManifestCorruptError(
+                str(self._store._stash_manifest_path()).replace(str(Path.home()), "~", 1)
+            )
 
     def refuse_session_profiles(self) -> None:
         """Required mode covers the two stores, the slots and the stash, and stops at any
@@ -787,6 +800,7 @@ class ClaudeAccountSwitcher:
         if not self._store._keychain_is_required():
             return
         self.refuse_session_profiles()
+        self.refuse_unreadable_stash_manifest()
         keychain, failed = self._store._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
         if failed:
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
@@ -870,9 +884,7 @@ class ClaudeAccountSwitcher:
             if creds.strip() and not holds_no_login(creds)
         }
         manifest, verdict = self._store._read_stash_manifest_ex()
-        if verdict == "unreadable" or (
-            verdict == "corrupt" and self._store._stash_entry_files_exist()
-        ):
+        if verdict != "ok":
             raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
         for entry_id, row in manifest.items():
             if (row.get("email"), row.get("organizationUuid", "") or "") != (email, org_uuid or ""):
@@ -1045,69 +1057,6 @@ class ClaudeAccountSwitcher:
         return all(
             not copy or oauth.credential_fingerprint(copy) == fingerprint for copy in held
         )
-
-    def refuse_stash_purge(self, entry_id: str) -> None:
-        """Required mode, with the locks held: an entry goes by hand only if nothing still
-        needs it. What it may hold is the only copy of a live token, and removing it would
-        also take away the rival that keeps a spent token from being sent."""
-        if not self._store._keychain_is_required():
-            return
-        store = self._store
-        manifest, verdict = store._read_stash_manifest_ex()
-        value, unreadable = store._read_unclaimed_credential(entry_id)
-        if verdict != "ok" or unreadable:
-            raise StashEntryInUseError(
-                "The stash cannot be read in full, so nothing shows this entry is unneeded; "
-                "nothing was removed."
-            )
-        fingerprint = manifest.get(entry_id, {}).get("fingerprint") or (
-            oauth.credential_fingerprint(value)
-        )
-        if not fingerprint:
-            return  # no bytes and no record of what they were
-        if any(
-            row.get("consumedFp") == fingerprint
-            for other, row in manifest.items()
-            if other != entry_id
-        ):
-            raise StashEntryInUseError(
-                "Another stash entry names this one as the token it replaced; nothing was removed."
-            )
-        recorded = consumed_grants.entry(fingerprint)
-        if (
-            recorded is not None and recorded["state"] != consumed_grants.CONSUMED
-        ) or consumed_grants.is_successor_of_unresolved(fingerprint):
-            raise StashEntryInUseError(
-                "This entry's token has a refresh with an unknown outcome on record; nothing "
-                "was removed."
-            )
-        if recorded is None and fingerprint not in self._held_outside_the_stash():
-            raise StashEntryInUseError(
-                "This entry may hold the only copy of a live token; nothing was removed. Log "
-                "in again with /login and run hswap claude add first."
-            )
-
-    def _held_outside_the_stash(self) -> set[str | None]:
-        """The refresh tokens in the two stores and every slot's backup. Raises
-        StashEntryInUseError when one cannot be read."""
-        keychain, failed = self._store._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
-        if failed:
-            raise StashEntryInUseError("The Keychain cannot be read; nothing was removed.")
-        try:
-            file_creds = get_credentials_path().read_text(encoding="utf-8")
-        except FileNotFoundError:
-            file_creds = ""
-        except (OSError, UnicodeDecodeError):
-            raise StashEntryInUseError(
-                "The credentials file cannot be read; nothing was removed."
-            ) from None
-        held = {oauth.credential_fingerprint(keychain or ""), oauth.credential_fingerprint(file_creds)}
-        for num, account in (self._get_sequence_data() or {}).get("accounts", {}).items():
-            copy, unreadable = self._read_account_credentials_ex(num, account.get("email", ""))
-            if unreadable:
-                raise StashEntryInUseError("A slot cannot be read; nothing was removed.")
-            held.add(oauth.credential_fingerprint(copy))
-        return held
 
     def supersede_stashed_copies(self, identity: tuple[str, str], login: str) -> None:
         """A provably new login: every copy stashed for the account is behind it."""
@@ -3007,6 +2956,8 @@ class ClaudeAccountSwitcher:
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
         except RequiredModeUnsupportedError:
             return oauth.RefreshOutcome(None, "required_mode_unsupported")
+        except StashManifestCorruptError:
+            return oauth.RefreshOutcome(None, "stash_manifest_corrupt")
         except StoresDisagreeError:
             return oauth.RefreshOutcome(None, "stores-disagree")
         except ReloginRequiredError:
@@ -5569,7 +5520,7 @@ class ClaudeAccountSwitcher:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
                         return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        except (StoresDisagreeError, RequiredModeUnsupportedError):
+        except (StoresDisagreeError, RequiredModeUnsupportedError, StashManifestCorruptError):
             return _defer(force_refresh)
         except LockError:
             # A live holder — Claude Code mid-refresh (ClaudeCodeLockTimeout)
@@ -5732,7 +5683,9 @@ class ClaudeAccountSwitcher:
                     "credential (rotation completed outside a collect pass).",
                     account_num,
                 )
-        except (LockError, StoresDisagreeError, RequiredModeUnsupportedError):
+        except (
+            LockError, StoresDisagreeError, RequiredModeUnsupportedError, StashManifestCorruptError
+        ):
             return  # holder is mid-operation; the next pass retries
         except Exception:
             self._logger.warning(

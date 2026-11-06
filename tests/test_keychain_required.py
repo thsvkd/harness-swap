@@ -1835,8 +1835,9 @@ class TestRequiredModeRefusesTheRest(_RequiredModeStore):
             ["move", "2", "5"],
             ["swap", "1", "2"],
             ["purge"],
+            ["unclaimed", "--purge", "ENTRY"],
         ],
-        ids=lambda argv: argv[0],
+        ids=lambda argv: " ".join(argv[:2]) if argv[0] == "unclaimed" else argv[0],
     )
 
     def _argv(self, argv, home, entry):
@@ -3076,198 +3077,205 @@ class TestNoPathInAnError(_RequiredModeStore):
             assert "ClaudeSwitchError" in out + err
 
 
-class TestStashPurgeInRequiredMode(_RequiredModeStore):
-    """Security review 5: an explicit single entry can go, unless something needs it."""
+class TestStashIsNotPurgedInRequiredMode(_RequiredModeStore):
+    """Codex round 19. Every way of purging found a new way to lose evidence, and it was
+    only ever a convenience, so a purge needs the mode off."""
 
-    def _agreeing(self, s, home, keychain):
-        a = creds("AT-A", "RT-A", expires_in_s=7200)
+    def _stale_p(self, s, home, keychain):
+        p = creds("AT-P", "RT-P", expires_in_s=600)
+        keychain.data[ACTIVE_ITEM] = p
+        keychain.data[("claude-swap", "account-1-a@example.com")] = p
+        (home / ".claude" / ".credentials.json").write_text(p, encoding="utf-8")
+        return p
+
+    def _stash(self, s, value):
+        return s._store._write_unclaimed_credential(value, {
+            "reason": "test", "configSlot": "1", "email": "a@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(value),
+        })
+
+    @pytest.mark.parametrize("scenario", ["consumed-witness", "copy-in-another-slot"])
+    def test_codex_round_18_is_out_of_reach_since_the_witness_cannot_be_purged(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, scenario
+    ):
+        self._stale_p(store, temp_home, block_real_keychain)
+        s_copy = creds("AT-S", "RT-S", expires_in_s=7200)
+        entry = self._stash(store, s_copy)
+        if scenario == "consumed-witness":
+            consumed_grants.record(
+                oauth.credential_fingerprint(s_copy), self.A_ID, consumed_grants.CONSUMED
+            )
+        else:
+            block_real_keychain.data[SLOT_2] = s_copy
+        before = snapshot(temp_home, block_real_keychain)
+        code, _, err = _main(["unclaimed", "--purge", entry], capsys)
+        assert code == 1 and "required_mode_unsupported" in err
+        assert snapshot(temp_home, block_real_keychain) == before
+
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "split_brain"
+        assert endpoint.posts == []
+
+    def test_the_list_still_works(self, store, temp_home, block_real_keychain, capsys):
+        entry = self._stash(store, creds("AT-S", "RT-S"))
+        code, out, _ = _main(["unclaimed"], capsys)
+        assert code == 0 and entry in out
+
+    def test_with_no_id_it_stays_a_usage_error(self, store, capsys):
+        assert _main(["unclaimed", "--purge"], capsys)[0] == 2
+
+    def test_default_mode_purges_as_before(self, temp_home, block_real_keychain, capsys):
+        s = macos_store(temp_home)
+        entry = self._stash(s, creds("AT-B", "RT-B"))
+        assert _main(["unclaimed", "--purge", entry], capsys)[0] == 0
+        assert s._store._list_unclaimed_credentials() == {}
+
+
+class TestAnUnreadableStashManifestStopsRequiredMode(_RequiredModeStore):
+    """Codex round 19, finding 2. The rows are rule U's evidence, and a fresh manifest
+    would forget them while looking healthy."""
+
+    COMMANDS = pytest.mark.parametrize(
+        "argv",
+        [
+            ["keepalive", "--json"],
+            ["keepalive", "--adopt", "file", "--json"],
+            ["auto", "--once"],
+            ["switch", "2"],
+            ["add"],
+            ["remove", "2"],
+        ],
+        ids=lambda argv: "-".join(a for a in argv if a != "--json"),
+    )
+
+    def _due(self, s, home, keychain):
+        a = creds("AT-A", "RT-A", expires_in_s=600)
         keychain.data[ACTIVE_ITEM] = a
         s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", creds("AT-2", "RT-2", expires_in_s=600))
         (home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
         return a
 
-    def _row(self, s, value, **extra):
-        return s._store._write_unclaimed_credential(value, {
-            "reason": "test", "configSlot": "1", "email": "a@example.com", "organizationUuid": "",
-            "fingerprint": oauth.credential_fingerprint(value), **extra,
-        })
+    def _corrupt(self, s):
+        path = s._store._stash_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not a manifest", encoding="utf-8")
+        return path
 
-    def _purge(self, entry, capsys):
-        return _main(["unclaimed", "--purge", entry], capsys)
+    def _no_aside(self, s):
+        return [p for p in s.credentials_dir.iterdir() if ".corrupt-" in p.name] == []
 
-    def _assert_refused(self, s, home, keychain, entry, capsys, needle):
-        before = snapshot(home, keychain)
-        code, _, err = self._purge(entry, capsys)
-        assert code == 1 and needle in err
-        assert snapshot(home, keychain) == before
-        assert entry in s._store._list_unclaimed_credentials()
-
-    def test_a_recorded_predecessor_goes(self, store, temp_home, block_real_keychain, capsys):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        old = creds("AT-O", "RT-O")
-        entry = self._row(store, old)
-        consumed_grants.record(
-            oauth.credential_fingerprint(old), self.A_ID, consumed_grants.CONSUMED,
-            successor=oauth.credential_fingerprint(a),
-        )
-        code, out, _ = self._purge(entry, capsys)
-        assert code == 0 and "Purged" in out
-        assert store._store._list_unclaimed_credentials() == {}
-        assert not store._store._stash_entry_path(entry).exists()
-        assert block_real_keychain.data[ACTIVE_ITEM] == a
-
-    @pytest.mark.parametrize("held_in", ["keychain", "file", "this-slot", "another-slot"])
-    def test_a_token_also_held_elsewhere_goes(
-        self, store, temp_home, block_real_keychain, capsys, held_in
+    @COMMANDS
+    def test_every_command_refuses_and_changes_nothing(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, monkeypatch, argv
     ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        same = creds("AT-other", "RT-A" if held_in != "another-slot" else "RT-2")
-        if held_in == "another-slot":
-            block_real_keychain.data[SLOT_2] = creds("AT-2", "RT-2")
-        elif held_in == "keychain":
-            (temp_home / ".claude" / ".credentials.json").unlink()
-            block_real_keychain.data[("claude-swap", "account-1-a@example.com")] = creds("AT-S", "RT-S")
-        elif held_in == "file":
-            block_real_keychain.data.pop(ACTIVE_ITEM)
-            block_real_keychain.data[("claude-swap", "account-1-a@example.com")] = creds("AT-S", "RT-S")
-        else:
-            (temp_home / ".claude" / ".credentials.json").unlink()
-            block_real_keychain.data.pop(ACTIVE_ITEM)
-        entry = self._row(store, same)
-        assert self._purge(entry, capsys)[0] == 0
-
-    def test_an_entry_another_entry_points_at_stays(
-        self, store, temp_home, block_real_keychain, capsys
-    ):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        # Even with its own token spent and held, the chain still passes through it.
-        entry = self._row(store, a)
-        self._row(store, creds("AT-N", "RT-N"), consumedFp=oauth.credential_fingerprint(a))
-        self._assert_refused(store, temp_home, block_real_keychain, entry, capsys, "names this one")
-
-    def test_a_reserved_token_stays(self, store, temp_home, block_real_keychain, capsys):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, a)
-        consumed_grants.record(oauth.credential_fingerprint(a), self.A_ID, consumed_grants.RESERVED)
-        self._assert_refused(store, temp_home, block_real_keychain, entry, capsys, "unknown outcome")
-
-    def test_the_successor_of_an_unresolved_row_stays(
-        self, store, temp_home, block_real_keychain, capsys
-    ):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, a)
-        consumed_grants.record(
-            oauth.credential_fingerprint(creds("x", "RT-P")), self.A_ID, consumed_grants.RESERVED,
-            successor=oauth.credential_fingerprint(a),
-        )
-        self._assert_refused(store, temp_home, block_real_keychain, entry, capsys, "unknown outcome")
-
-    def test_the_successor_of_a_settled_row_goes(
-        self, store, temp_home, block_real_keychain, capsys
-    ):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, a)
-        consumed_grants.record(
-            oauth.credential_fingerprint(creds("x", "RT-P")), self.A_ID, consumed_grants.CONSUMED,
-            successor=oauth.credential_fingerprint(a),
-        )
-        assert self._purge(entry, capsys)[0] == 0
-
-    def test_a_possible_sole_successor_stays_and_says_what_to_do(
-        self, store, temp_home, block_real_keychain, capsys
-    ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, creds("AT-B", "RT-B"))
+        self._due(store, temp_home, block_real_keychain)
+        path = self._corrupt(store)
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
         before = snapshot(temp_home, block_real_keychain)
-        code, _, err = self._purge(entry, capsys)
-        assert code == 1
-        for needle in ("only copy", "/login", "hswap claude add"):
-            assert needle in err
+        code, out, err = _main(argv, capsys)
+        assert "stash_manifest_corrupt" in out + err
+        if argv[0] != "auto":  # a tick reports its error through an event and its own code
+            assert code == 1
+        assert endpoint.posts == []
         assert snapshot(temp_home, block_real_keychain) == before
+        assert path.read_text(encoding="utf-8") == "not a manifest"
+        assert self._no_aside(store)
 
-    def test_after_a_real_login_the_old_rival_can_go(
-        self, store, temp_home, block_real_keychain, capsys
+    def test_an_unreadable_manifest_refuses_the_same_way(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch
     ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, creds("AT-B", "RT-B"))
-        fresh = creds("AT-N", "RT-N", expires_in_s=7200)
-        block_real_keychain.data[ACTIVE_ITEM] = fresh
-        (temp_home / ".claude" / ".credentials.json").write_text(fresh, encoding="utf-8")
-        store.add_account(assume_yes=True)
-        assert self._purge(entry, capsys)[0] == 0
+        self._due(store, temp_home, block_real_keychain)
+        monkeypatch.setattr(
+            store._store.__class__, "_read_stash_manifest_ex", lambda self: ({}, "unreadable")
+        )
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "stash_manifest_corrupt"
+        assert endpoint.posts == []
 
-    def test_an_entry_with_no_bytes_but_a_record_is_checked_like_any_other(
-        self, store, temp_home, block_real_keychain, capsys
+    def test_the_report_names_the_file_with_no_home_path(
+        self, store, temp_home, block_real_keychain, endpoint
     ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, creds("AT-B", "RT-B"))
-        store._store._stash_entry_path(entry).unlink()
-        code, _, err = self._purge(entry, capsys)
-        assert code == 1 and "only copy" in err
+        self._due(store, temp_home, block_real_keychain)
+        self._corrupt(store)
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["ok"] is False
+        message = report["error"]["message"]
+        assert ".unclaimed-manifest.json" in message and "~" in message
+        assert str(Path.home()) not in message
 
-    def test_an_entry_with_nothing_to_identify_it_goes(
-        self, store, temp_home, block_real_keychain, capsys
+    def test_keepalive_stops_with_the_setting_off_too(
+        self, temp_home, block_real_keychain, endpoint
     ):
-        self._agreeing(store, temp_home, block_real_keychain)
-        entry = store._store._write_unclaimed_credential(creds("AT-B", "RT-B"), {"reason": "test"})
-        store._store._stash_entry_path(entry).unlink()
-        assert self._purge(entry, capsys)[0] == 0
-
-    @pytest.mark.parametrize("failure", ["manifest", "entry", "slot"])
-    def test_what_cannot_be_read_stops_the_purge(
-        self, store, temp_home, block_real_keychain, capsys, monkeypatch, failure
-    ):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        # A token the stores hold, which would go if nothing stood in the way.
-        entry = self._row(store, creds("AT-O", "RT-O") if failure == "slot" else a)
-        cls = store._store.__class__
-        if failure == "manifest":
-            real = cls._read_stash_manifest_ex
-            monkeypatch.setattr(cls, "_read_stash_manifest_ex", lambda self: (real(self)[0], "corrupt"))
-        elif failure == "entry":
-            monkeypatch.setattr(cls, "_read_unclaimed_credential", lambda self, i: ("", True))
-        else:
-            monkeypatch.setattr(
-                ClaudeAccountSwitcher, "_read_account_credentials_ex", lambda self, *a, **kw: ("", True)
-            )
-        code, _, _ = self._purge(entry, capsys)
-        monkeypatch.undo()
-        assert code == 1
-        assert entry in store._store._list_unclaimed_credentials()
-
-    def test_it_runs_under_the_locks_and_the_gate(
-        self, store, temp_home, block_real_keychain, capsys, monkeypatch
-    ):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, a)
-        (temp_home / ".claude" / ".credentials.json").write_text(creds("AT-F", "RT-F"), encoding="utf-8")
-        before = snapshot(temp_home, block_real_keychain)
-        code, _, err = self._purge(entry, capsys)
-        assert code == 1 and "different logins" in err
-        assert snapshot(temp_home, block_real_keychain) == before
-
-    def test_a_session_profile_stops_it(self, store, temp_home, block_real_keychain, capsys):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, a)
-        store._session_dir("1", "a@example.com").mkdir(parents=True)
-        code, _, err = self._purge(entry, capsys)
-        assert code == 1 and "required_mode_unsupported" in err
-        assert entry in store._store._list_unclaimed_credentials()
-
-    def test_no_id_stays_a_usage_error_and_the_bulk_purge_stays_refused(
-        self, store, temp_home, block_real_keychain, capsys
-    ):
-        a = self._agreeing(store, temp_home, block_real_keychain)
-        entry = self._row(store, a)
-        assert _main(["unclaimed", "--purge"], capsys)[0] == 2
-        code, _, err = _main(["purge"], capsys)
-        assert code == 1 and "required_mode_unsupported" in err
-        assert entry in store._store._list_unclaimed_credentials()
-
-    def test_default_mode_purges_anything_as_before(
-        self, temp_home, block_real_keychain, capsys
-    ):
+        """keepalive pins required mode on macOS."""
         s = macos_store(temp_home)
-        entry = self._row(s, creds("AT-B", "RT-B"))
-        assert self._purge(entry, capsys)[0] == 0
-        assert s._store._list_unclaimed_credentials() == {}
+        self._due(s, temp_home, block_real_keychain)
+        self._corrupt(s)
+        assert run_keepalive(s)["error"]["type"] == "stash_manifest_corrupt"
+        assert endpoint.posts == []
+
+    def test_the_paths_that_never_raise_refuse_too(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        a = self._due(store, temp_home, block_real_keychain)
+        slot_2 = store._read_account_credentials("2", "b@example.com")
+        path = self._corrupt(store)
+        outcome = store.consume_backup_grant("2", "b@example.com", slot_2)
+        assert outcome.error == "stash_manifest_corrupt"
+        engine = AutoSwitchEngine(store, AutoSwitchSettings(), lambda event: None)
+        assert engine._freshen_target("2", "b@example.com") == "stash_manifest_corrupt"
+        store._fetch_active_usage("1", "a@example.com", a, "")
+        store._resync_rotated_backup("1", "a@example.com", "", a)
+        assert endpoint.posts == []
+        assert path.read_text(encoding="utf-8") == "not a manifest"
+        assert self._no_aside(store)
+
+    @pytest.mark.parametrize("verdict", ["corrupt", "unreadable"])
+    def test_a_stash_write_never_replaces_the_file(self, store, monkeypatch, verdict):
+        path = self._corrupt(store)
+        if verdict == "unreadable":
+            monkeypatch.setattr(
+                store._store.__class__, "_read_stash_manifest_ex", lambda self: ({}, "unreadable")
+            )
+        with pytest.raises(ClaudeSwitchError):
+            store._store._write_unclaimed_credential(creds("AT-X", "RT-X"), {"reason": "test"})
+        assert path.read_text(encoding="utf-8") == "not a manifest"
+        assert self._no_aside(store)
+
+    def test_rule_u_blocks_if_it_turns_bad_mid_run(self, store, temp_home, block_real_keychain):
+        a = self._due(store, temp_home, block_real_keychain)
+        self._corrupt(store)
+        with pytest.raises(CopiesDisagreeError):
+            store._require_unanimity(a, self.A_ID)
+
+    def test_the_views_still_read(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        self._due(store, temp_home, block_real_keychain)
+        path = self._corrupt(store)
+        code, _, _ = _main(["list", "--json"], capsys)
+        assert code == 0 and endpoint.posts == []
+        assert path.read_text(encoding="utf-8") == "not a manifest"
+
+    def test_restoring_the_file_is_all_it_takes(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._due(store, temp_home, block_real_keychain)
+        path = self._corrupt(store)
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "stash_manifest_corrupt"
+        path.unlink()
+        assert run_keepalive(ClaudeAccountSwitcher())["action"] == "refreshed"
+        assert endpoint.posts == ["RT-A"]
+
+    def test_default_mode_still_sets_a_bad_file_aside(self, temp_home, block_real_keychain):
+        s = macos_store(temp_home)
+        self._corrupt(s)
+        s._store._write_unclaimed_credential(creds("AT-X", "RT-X"), {"reason": "test"})
+        assert not self._no_aside(s)
+
+    def test_healthy_refresh_is_unchanged(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._due(store, temp_home, block_real_keychain)
+        for _ in range(3):
+            assert run_keepalive(ClaudeAccountSwitcher())["ok"] is True
+        assert endpoint.posts == ["RT-A"]
+        assert store._store._list_unclaimed_credentials() == {}

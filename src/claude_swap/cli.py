@@ -425,6 +425,8 @@ def _unclaimed_command(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     try:
+        if args.purge:
+            _refuse_in_required_mode("unclaimed --purge")
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         entries = switcher.list_unclaimed_credentials()
@@ -433,9 +435,7 @@ def _unclaimed_command(argv: list[str]) -> None:
             if args.purge not in entries:
                 error(f"Error: no unclaimed entry {args.purge}")
                 sys.exit(1)
-            with switcher._required_mode_section():
-                switcher.refuse_stash_purge(args.purge)
-                switcher._store._remove_unclaimed_credential(args.purge)
+            switcher._store._remove_unclaimed_credential(args.purge)
             print(f"{accent('Purged')} {args.purge}")
             return
 

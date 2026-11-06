@@ -90,10 +90,16 @@ class SessionProfilesExistError(RequiredModeUnsupportedError):
         )
 
 
-class StashEntryInUseError(CredentialError):
-    """Keychain-required mode: this stash entry may still be needed, so it stays."""
+class StashManifestCorruptError(CredentialError):
+    """Keychain-required mode: the stash's rows are evidence, and they cannot be read."""
 
-    json_type = "stash_entry_in_use"
+    json_type = "stash_manifest_corrupt"
+
+    def __init__(self, path: str):
+        super().__init__(
+            f"stash_manifest_corrupt: the stash manifest cannot be read; nothing was changed. "
+            f"Inspect or restore {path}, then run this again."
+        )
 
 
 class ConfigError(ClaudeSwitchError):

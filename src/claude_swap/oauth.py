@@ -726,6 +726,7 @@ def fetch_usage(access_token: str) -> dict | None:
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
     "stores-disagree", "relogin_required", "required_mode_unsupported",
+    "stash_manifest_corrupt",
 )
 
 

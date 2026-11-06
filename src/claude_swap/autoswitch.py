@@ -94,6 +94,7 @@ _SYSTEMIC_MESSAGES = {
     "consume-busy": "another cswap surface holds the slot — retries next pass",
     "required_mode_unsupported": "session profiles exist — remove them or turn off "
                                  "credentials.requireKeychain",
+    "stash_manifest_corrupt": "the stash manifest cannot be read — inspect or restore it",
     "stores-disagree": "the Keychain and the credentials file hold different logins — "
                        "run keepalive",
 }

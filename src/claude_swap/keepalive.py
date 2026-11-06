@@ -44,6 +44,7 @@ from claude_swap.exceptions import (
     KeychainUnavailableError,
     LockError,
     RequiredModeUnsupportedError,
+    StashManifestCorruptError,
     StoresDisagreeError,
 )
 from claude_swap.locking import FileLock
@@ -149,6 +150,8 @@ def run_keepalive(
         report["error"] = {"type": stop.kind, "message": stop.message}
     except RequiredModeUnsupportedError as e:
         report["error"] = {"type": "required_mode_unsupported", "message": str(e)}
+    except StashManifestCorruptError as e:
+        report["error"] = {"type": "stash_manifest_corrupt", "message": str(e)}
     except CopiesDisagreeError as e:
         report["error"] = {"type": "split_brain", "message": str(e)}
     except StoresDisagreeError:
@@ -197,6 +200,7 @@ def _keep(switcher, report, ahead, ensure_file, dry_run, adopt=None) -> None:
             raise _Stop("keychain_unavailable")
         store.pin_keychain()
         switcher.refuse_session_profiles()
+        switcher.refuse_unreadable_stash_manifest()
     store.records_consumed = True
     if adopt and (dry_run or not store._keychain_is_required()):
         raise _Stop("adopt_refused", _ADOPT_NEEDS_KEYCHAIN)

@@ -34,6 +34,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
     KeychainUnavailableError,
+    StashManifestCorruptError,
 )
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.models import Platform
@@ -2032,6 +2033,12 @@ class CredentialStore:
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         with FileLock(self._stash_manifest_path().with_suffix(".lock")):
             entries, verdict = self._read_stash_manifest_ex()
+            # Required mode: these rows are evidence, so a bad file is a person's to
+            # inspect, never set aside for a fresh one that has forgotten them.
+            if verdict != "ok" and self._keychain_is_required():
+                raise StashManifestCorruptError(
+                    str(self._stash_manifest_path()).replace(str(Path.home()), "~", 1)
+                )
             if verdict == "unreadable":
                 # Reading an unreadable-but-VALID manifest as `{}` does not
                 # merely miss rows. ``_write_stash_manifest`` below finds the

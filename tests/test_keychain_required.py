@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -966,3 +967,196 @@ class TestSelftestCommand:
     def test_unsupported_elsewhere_exits_zero(self, capsys, flags, expected):
         code, out, _ = self._run(capsys, *flags, platform=Platform.LINUX)
         assert code == 0 and out == expected
+
+
+class _TokenAndUsage:
+    """Fake network: counts refresh POSTs, and refuses usage reads as Claude's server
+    refuses a revoked token, which is what sends the fetch path to refresh."""
+
+    def __init__(self):
+        self.posts = []
+
+    def __call__(self, request, timeout=None):
+        if request.data is None:
+            raise urllib.error.HTTPError(request.full_url, 401, "no", {}, io.BytesIO(b"{}"))
+        self.posts.append(json.loads(request.data)["refresh_token"])
+        n = len(self.posts)
+        return io.BytesIO(json.dumps({
+            "access_token": f"AT-{n}", "refresh_token": f"RT-{n}", "expires_in": 28800,
+        }).encode())
+
+
+class TestRequiredModeReadsTheFileBeforeAnActivePost:
+    IDENTITY = ("a@example.com", "")
+
+    @pytest.fixture
+    def endpoint(self, monkeypatch):
+        fake = _TokenAndUsage()
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", fake)
+        return fake
+
+    @pytest.fixture
+    def store(self, temp_home, block_real_keychain, endpoint):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        set_setting(s.backup_dir, "updates.check", "false")
+        return s
+
+    def _a_in_keychain_and_slot(self, s, keychain, expires_in_s):
+        a = creds("AT-A", "RT-A", expires_in_s=expires_in_s)
+        keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials("1", "a@example.com", a)
+        return a
+
+    @pytest.mark.parametrize(
+        "expires_in_s", [-60, 3600], ids=["expired", "unexpired-but-refused-by-the-server"]
+    )
+    def test_codex_scenario_auto_does_not_post_the_keychain_predecessor(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch, capsys, expires_in_s
+    ):
+        """Claude Code refreshed A -> B in the file. keepalive sees B, but its Keychain
+        write fails, and then `auto --once` runs on Keychain A."""
+        a = self._a_in_keychain_and_slot(store, block_real_keychain, expires_in_s)
+        b = creds("AT-B", "RT-B", expires_in_s=28000)
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(b, encoding="utf-8")
+        ledger_before = consumed_grants.in_use()
+
+        real_set = block_real_keychain.set_password
+        monkeypatch.setattr(macos_keychain, "set_password", _failing_set(None))
+        report = run_keepalive(store)
+        assert report["ok"] is False and report["error"]["type"] == "keychain_unavailable"
+        monkeypatch.setattr(macos_keychain, "set_password", real_set)
+
+        _main(["auto", "--once", "--json"], capsys)
+
+        assert endpoint.posts == []
+        fingerprint = oauth.credential_fingerprint(a)
+        assert not ledger_before and consumed_grants.entry(fingerprint) is None
+        assert file_path.read_text(encoding="utf-8") == b
+        assert block_real_keychain.data[ACTIVE_ITEM] == a
+
+    def test_keepalive_then_reconciles_with_no_post_of_the_predecessor(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch, capsys
+    ):
+        self._a_in_keychain_and_slot(store, block_real_keychain, -60)
+        b = creds("AT-B", "RT-B", expires_in_s=28000)
+        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
+        _main(["auto", "--once", "--json"], capsys)
+        assert endpoint.posts == []
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["ok"] is True and report["action"] == "synced-keychain"
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+        assert endpoint.posts == []
+
+    @pytest.mark.parametrize("via", ["auto", "keepalive"])
+    def test_healthy_path_refreshes_exactly_once(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, via
+    ):
+        a = creds("AT-A", "RT-A", expires_in_s=-60 if via == "auto" else 600)
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        store._write_account_credentials("1", "a@example.com", a)
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(a, encoding="utf-8")
+        if via == "auto":
+            _main(["auto", "--once", "--json"], capsys)
+        else:
+            assert run_keepalive(store)["action"] == "refreshed"
+        assert endpoint.posts == ["RT-A"]
+        for stored in (block_real_keychain.data[ACTIVE_ITEM], file_path.read_text(encoding="utf-8")):
+            assert oauth.extract_access_token(stored) == "AT-1"
+
+    def _post(self, s, credentials, *, identity=None, locks_held=True):
+        return s.post_refresh(identity or self.IDENTITY, credentials, locks_held=locks_held)
+
+    @pytest.mark.parametrize(
+        "file_content",
+        [
+            creds("AT-F", "RT-F", expires_in_s=28000),
+            creds("AT-F", "RT-F", expires_in_s=100),  # a later expiry here proves nothing
+            "not json",
+        ],
+        ids=["file-newer", "file-older", "file-garbled"],
+    )
+    def test_a_differing_or_garbled_file_means_no_post(self, store, temp_home, endpoint, file_content):
+        (temp_home / ".claude" / ".credentials.json").write_text(file_content, encoding="utf-8")
+        outcome = self._post(store, creds("AT-K", "RT-K", expires_in_s=7200))
+        assert outcome.credentials is None and outcome.error == "transient"
+        assert endpoint.posts == []
+        assert consumed_grants.entry(oauth.credential_fingerprint(creds("x", "RT-K"))) is None
+
+    def test_an_unreadable_file_means_no_post(self, store, temp_home, endpoint, monkeypatch):
+        path = temp_home / ".claude" / ".credentials.json"
+        path.write_text(creds("AT-F", "RT-F"), encoding="utf-8")
+        real = Path.read_text
+
+        def denied(self, *a, **kw):
+            if self == path:
+                raise PermissionError("denied")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+        assert self._post(store, creds("AT-K", "RT-K")).error == "transient"
+        assert endpoint.posts == []
+
+    def test_an_unknown_active_identity_means_no_post(self, store, temp_home, endpoint):
+        (temp_home / ".claude.json").write_text("{}", encoding="utf-8")
+        assert self._post(store, creds("AT-K", "RT-K")).error == "transient"
+        assert endpoint.posts == []
+
+    def test_the_active_login_needs_claude_codes_locks(self, store, endpoint):
+        assert self._post(store, creds("AT-K", "RT-K"), locks_held=False).error == "transient"
+        assert endpoint.posts == []
+
+    def test_consume_gate_defers_the_active_login(self, store, block_real_keychain, endpoint):
+        a = self._a_in_keychain_and_slot(store, block_real_keychain, -60)
+        assert store.consume_backup_grant("1", "a@example.com", a).error == "transient"
+        assert endpoint.posts == []
+
+    @pytest.mark.parametrize(
+        "file_content", [None, "   \n", "same"], ids=["no-file", "blank-file", "same-token"]
+    )
+    def test_nothing_in_the_file_to_contradict_it_posts(self, store, temp_home, endpoint, file_content):
+        candidate = creds("AT-K", "RT-K", expires_in_s=7200)
+        if file_content is not None:
+            (temp_home / ".claude" / ".credentials.json").write_text(
+                creds("AT-other", "RT-K", expires_in_s=100) if file_content == "same" else file_content,
+                encoding="utf-8",
+            )
+        assert self._post(store, candidate).error is None
+        assert endpoint.posts == ["RT-K"]
+
+    def test_a_file_copy_spent_here_does_not_block_a_newer_token(self, store, temp_home, endpoint):
+        spent = creds("AT-F", "RT-F", expires_in_s=100)
+        (temp_home / ".claude" / ".credentials.json").write_text(spent, encoding="utf-8")
+        consumed_grants.record(
+            oauth.credential_fingerprint(spent), self.IDENTITY, consumed_grants.CONSUMED
+        )
+        assert self._post(store, creds("AT-K", "RT-K", expires_in_s=7200)).error is None
+        assert endpoint.posts == ["RT-K"]
+
+    def test_a_newer_file_copy_spent_here_still_blocks_an_older_token(self, store, temp_home, endpoint):
+        spent = creds("AT-F", "RT-F", expires_in_s=28000)
+        (temp_home / ".claude" / ".credentials.json").write_text(spent, encoding="utf-8")
+        consumed_grants.record(
+            oauth.credential_fingerprint(spent), self.IDENTITY, consumed_grants.CONSUMED
+        )
+        assert self._post(store, creds("AT-K", "RT-K", expires_in_s=7200)).error == "transient"
+        assert endpoint.posts == []
+
+    def test_another_accounts_refresh_ignores_the_file(self, store, temp_home, endpoint):
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            creds("AT-F", "RT-F", expires_in_s=28000), encoding="utf-8"
+        )
+        stale = creds("AT-b", "RT-b", expires_in_s=-60)
+        store._write_account_credentials("2", "b@example.com", stale)
+        outcome = store.consume_backup_grant("2", "b@example.com", stale)
+        assert outcome.error is None and endpoint.posts == ["RT-b"]
+
+    def test_default_mode_is_unchanged(self, temp_home, block_real_keychain, endpoint):
+        s = macos_store(temp_home)
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            creds("AT-F", "RT-F", expires_in_s=28000), encoding="utf-8"
+        )
+        assert self._post(s, creds("AT-K", "RT-K"), locks_held=False).error is None
+        assert endpoint.posts == ["RT-K"]

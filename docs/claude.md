@@ -425,7 +425,7 @@ A locked login keychain in the GUI session counts as unreachable, and the check 
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>{ hswap claude keepalive --json --ensure-file; hswap claude auto --once --json; } >> ~/Library/Logs/hswap-keepalive.log 2>&amp;1</string>
+    <string>{ hswap claude keepalive --json --ensure-file &amp;&amp; hswap claude auto --once --json; } >> ~/Library/Logs/hswap-keepalive.log 2>&amp;1</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>300</integer>
@@ -436,6 +436,8 @@ A locked login keychain in the GUI session counts as unreachable, and the check 
 ```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.hswap-keepalive.plist
 ```
+
+`auto` runs only after `keepalive` succeeded. A process that only sees the file may have refreshed the login there, and until `keepalive` has reconciled the two stores, the Keychain may hold a refresh token that is already spent. In keychain-required mode, a refresh of the active login outside `keepalive` also checks for this itself: it needs Claude Code's locks, and it defers without sending anything if the file cannot be read or holds a different token, unless that token is one hswap itself already spent. A refresh of another account's stored login is not affected.
 
 `--ensure-file` is for processes that only see the file: it keeps a copy there for them, 0600, on the same generation as the Keychain. Leave it out if nothing on the machine needs the file. The job needs a logged-in session with an unlocked login keychain; a machine booted to the login window has neither, and `keepalive` then reports `keychain_unavailable` until someone logs in.
 

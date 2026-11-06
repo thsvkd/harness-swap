@@ -28,7 +28,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import consumed_grants, oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -51,6 +51,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    _credential_object,
     credential_generation,
     looks_like_api_key,
     merge_shared_credential_fields,
@@ -659,16 +660,65 @@ class ClaudeAccountSwitcher:
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
 
     def post_refresh(
-        self, identity: tuple[str, str], credentials: str, **kwargs
+        self,
+        identity: tuple[str, str],
+        credentials: str,
+        *,
+        locks_held: bool = False,
+        **kwargs,
     ) -> "oauth.RefreshOutcome":
         """Every engine POST of a refresh token, for the account ``identity``
         (email, organization): no POST whose successor could not be stored, and
-        the token is reserved on the ledger before it leaves."""
+        the token is reserved on the ledger before it leaves.
+
+        ``locks_held``: the caller holds Claude Code's credential locks.
+        """
         if self.keychain_gate_closed(fresh=True):
+            return oauth.RefreshOutcome(None, "transient")
+        if self._store._keychain_is_required() and not self._active_post_is_safe(
+            identity, credentials, locks_held
+        ):
+            self._logger.info("Refresh deferred: the credentials file disagrees or is unknown.")
             return oauth.RefreshOutcome(None, "transient")
         if self._store.records_consumed_grants():
             kwargs["ledger_identity"] = identity
         return oauth.try_refresh_oauth_credentials(credentials, **kwargs)
+
+    def _active_post_is_safe(
+        self, identity: tuple[str, str], credentials: str, locks_held: bool
+    ) -> bool:
+        """A process that sees only the file may have spent this token there, which no
+        ledger here records. Another account's token has nothing to fear from the file.
+        """
+        active = self._get_current_account()
+        if active is None:
+            return False
+        if identity != active:
+            return True
+        return locks_held and self._file_permits_post(credentials)
+
+    def _file_permits_post(self, credentials: str) -> bool:
+        """The file holds no other login of this account that could be newer. A later
+        expiry is no proof of that, so a differing copy only passes when the ledger
+        shows it spent here and this one is newer."""
+        try:
+            file_creds = get_credentials_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return True
+        except (OSError, UnicodeDecodeError):
+            return False
+        if not file_creds.strip():
+            return True
+        fingerprint = oauth.credential_fingerprint(file_creds)
+        if fingerprint == oauth.credential_fingerprint(credentials):
+            return True
+        if _credential_object(file_creds) is None:
+            return False
+        try:
+            spent_here = consumed_grants.entry(fingerprint) is not None
+        except consumed_grants.LedgerUnreadable:
+            return False
+        return spent_here and credential_generation(credentials) > credential_generation(file_creds)
 
     def stash_consumed_successor(
         self,
@@ -2584,6 +2634,7 @@ class ClaudeAccountSwitcher:
         result = self.post_refresh(
             identity,
             refresh_input,
+            locks_held=global_lock_held,
             **({"timeout_s": 6.0} if global_lock_held else {}),
         )
         if result.error is not None or not result.credentials:
@@ -4905,7 +4956,10 @@ class ClaudeAccountSwitcher:
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
                         result = self.post_refresh(
-                            (email, org_uuid or ""), refresh_input, timeout_s=6.0
+                            (email, org_uuid or ""),
+                            refresh_input,
+                            locks_held=True,
+                            timeout_s=6.0,
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"

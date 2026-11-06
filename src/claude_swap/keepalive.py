@@ -610,7 +610,7 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
         # Unmanaged, or a rotation the slot has not caught up with. Posting the
         # live store's own grant is what Claude Code itself would do.
         outcome = switcher.post_refresh(
-            active.identity or ("", ""), current, timeout_s=_POST_TIMEOUT_S
+            active.identity or ("", ""), current, locks_held=True, timeout_s=_POST_TIMEOUT_S
         )
 
     if not outcome.credentials:

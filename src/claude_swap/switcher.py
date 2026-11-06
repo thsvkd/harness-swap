@@ -869,9 +869,10 @@ class ClaudeAccountSwitcher:
             for creds in copies
             if creds.strip() and not holds_no_login(creds)
         }
-        # Any failure, even with no entry files: a tombstone has none to show for itself.
         manifest, verdict = self._store._read_stash_manifest_ex()
-        if verdict != "ok":
+        if verdict == "unreadable" or (
+            verdict == "corrupt" and self._store._stash_entry_files_exist()
+        ):
             raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
         for entry_id, row in manifest.items():
             if (row.get("email"), row.get("organizationUuid", "") or "") != (email, org_uuid or ""):
@@ -1045,15 +1046,13 @@ class ClaudeAccountSwitcher:
             not copy or oauth.credential_fingerprint(copy) == fingerprint for copy in held
         )
 
-    def purge_stash_entry(self, entry_id: str) -> None:
-        """`unclaimed --purge`. Required mode, with the locks held, never removes evidence:
-        an entry can be the only witness that keeps a stale predecessor from being sent, so
-        its bytes go and its row stays as a tombstone, which rule U still counts as a
-        rival. What may be the only copy of a live token stays whole."""
-        store = self._store
-        if not store._keychain_is_required():
-            store._remove_unclaimed_credential(entry_id)
+    def refuse_stash_purge(self, entry_id: str) -> None:
+        """Required mode, with the locks held: an entry goes by hand only if nothing still
+        needs it. What it may hold is the only copy of a live token, and removing it would
+        also take away the rival that keeps a spent token from being sent."""
+        if not self._store._keychain_is_required():
             return
+        store = self._store
         manifest, verdict = store._read_stash_manifest_ex()
         value, unreadable = store._read_unclaimed_credential(entry_id)
         if verdict != "ok" or unreadable:
@@ -1061,18 +1060,11 @@ class ClaudeAccountSwitcher:
                 "The stash cannot be read in full, so nothing shows this entry is unneeded; "
                 "nothing was removed."
             )
-        row = manifest.get(entry_id, {})
-        fingerprint = row.get("fingerprint") or oauth.credential_fingerprint(value)
+        fingerprint = manifest.get(entry_id, {}).get("fingerprint") or (
+            oauth.credential_fingerprint(value)
+        )
         if not fingerprint:
-            store._remove_unclaimed_credential(entry_id)  # no bytes, no record of what they were
-            return
-        if not row.get("purgedAt"):  # a tombstone passed these; this finishes its delete
-            self._refuse_stash_purge(entry_id, fingerprint, manifest)
-        store._tombstone_unclaimed_credential(entry_id, fingerprint)
-
-    def _refuse_stash_purge(self, entry_id: str, fingerprint: str, manifest: dict) -> None:
-        # A tombstone here would keep the link but break the walk to the entry after it,
-        # which needs these bytes, and could strand that entry's live token.
+            return  # no bytes and no record of what they were
         if any(
             row.get("consumedFp") == fingerprint
             for other, row in manifest.items()
@@ -3315,13 +3307,8 @@ class ClaudeAccountSwitcher:
                 return (meta["email"], meta.get("organizationUuid", "")) == (email, own_org)
             return meta.get("configSlot") == account_num
 
-        tombstoned = False
         for entry_id, meta in manifest.items():
             if not is_ours(meta):
-                continue
-            if meta.get("purgedAt"):
-                # Evidence with no bytes: never adopted, and never retired as a dead row.
-                tombstoned = tombstoned or meta.get("consumedFp") == cur_fp
                 continue
             if meta.get("consumedFp") != cur_fp:
                 if meta.get("reason") == "consume-gate-cas-conflict":
@@ -3429,8 +3416,6 @@ class ClaudeAccountSwitcher:
                 "is unreadable; deferring adoption rather than discarding "
                 "its generation"
             )
-        if tombstoned:
-            raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
         return None
 
     def stash_chain_terminal(
@@ -3455,8 +3440,6 @@ class ClaudeAccountSwitcher:
                     or not is_ours(meta)
                 ):
                     continue
-                if meta.get("purgedAt"):
-                    raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
                 value, unreadable = self._store._read_unclaimed_credential(link_id)
                 if unreadable:
                     raise CredentialReadError(f"stash entry {link_id} is unreadable")
@@ -5586,7 +5569,7 @@ class ClaudeAccountSwitcher:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
                         return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        except (StoresDisagreeError, RequiredModeUnsupportedError, ReloginRequiredError):
+        except (StoresDisagreeError, RequiredModeUnsupportedError):
             return _defer(force_refresh)
         except LockError:
             # A live holder — Claude Code mid-refresh (ClaudeCodeLockTimeout)

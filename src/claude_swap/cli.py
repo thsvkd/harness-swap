@@ -434,7 +434,8 @@ def _unclaimed_command(argv: list[str]) -> None:
                 error(f"Error: no unclaimed entry {args.purge}")
                 sys.exit(1)
             with switcher._required_mode_section():
-                switcher.purge_stash_entry(args.purge)
+                switcher.refuse_stash_purge(args.purge)
+                switcher._store._remove_unclaimed_credential(args.purge)
             print(f"{accent('Purged')} {args.purge}")
             return
 
@@ -444,8 +445,7 @@ def _unclaimed_command(argv: list[str]) -> None:
         for entry_id, meta in sorted(entries.items()):
             slot = meta.get("configSlot") or "?"
             reason = meta.get("reason") or "orphaned (no manifest row)"
-            purged = "  (purged: bytes deleted, kept as a record)" if meta.get("purgedAt") else ""
-            print(f"{entry_id}  slot {slot}  {reason}{purged}")
+            print(f"{entry_id}  slot {slot}  {reason}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

@@ -84,6 +84,14 @@ def entry(fingerprint: str | None) -> dict | None:
     return _read(_path()).get(fingerprint)
 
 
+def is_successor_of_unresolved(fingerprint: str | None) -> bool:
+    """A row not yet settled as consumed names this token as what came next."""
+    return any(
+        row["state"] != CONSUMED and row.get("successorFp") == fingerprint
+        for row in _read(_path()).values()
+    )
+
+
 def _rewrite(mutate) -> None:
     path = _path()
     try:

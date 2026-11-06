@@ -25,6 +25,7 @@ from claude_swap.exceptions import (
     ClaudeSwitchError,
     CopiesDisagreeError,
     CredentialReadError,
+    CredentialWriteError,
     KeychainUnavailableError,
     RequiredModeUnsupportedError,
     StoresDisagreeError,
@@ -1834,9 +1835,8 @@ class TestRequiredModeRefusesTheRest(_RequiredModeStore):
             ["move", "2", "5"],
             ["swap", "1", "2"],
             ["purge"],
-            ["unclaimed", "--purge", "ENTRY"],
         ],
-        ids=lambda argv: " ".join(argv[:2]) if argv[0] == "unclaimed" else argv[0],
+        ids=lambda argv: argv[0],
     )
 
     def _argv(self, argv, home, entry):
@@ -2997,3 +2997,277 @@ class TestRuleLWhoMayWriteLineage(_RequiredModeStore):
         row = consumed_grants.entry(oauth.credential_fingerprint(near))
         assert row["state"] == consumed_grants.CONSUMED
         assert row["successorFp"] == oauth.credential_fingerprint(block_real_keychain.data[ACTIVE_ITEM])
+
+
+class TestNoPathInAnError(_RequiredModeStore):
+    """Security review 5: an OSError's text names a path, and keepalive's message reaches
+    keepalive.json and the Telegram alert."""
+
+    SECRET_PATH = "/Users/x/.claude/.credentials.json"
+
+    def _refuses_with_a_path(self, monkeypatch, target: Path | None = None):
+        real = Path.read_text
+
+        def denied(path, *a, **kw):
+            if target is None or path == target:
+                raise PermissionError(13, "Permission denied", self.SECRET_PATH)
+            return real(path, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+
+    def _seed_agreeing(self, s, home, keychain):
+        a = creds("AT-A", "RT-A", expires_in_s=600)
+        keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials("1", "a@example.com", a)
+        file_path = home / ".claude" / ".credentials.json"
+        file_path.write_text(a, encoding="utf-8")
+        return a, file_path
+
+    @pytest.mark.parametrize("how", ["run", "cli", "adopt"])
+    def test_a_file_that_cannot_be_read_leaves_no_path_in_the_report(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, monkeypatch, how
+    ):
+        _, file_path = self._seed_agreeing(store, temp_home, block_real_keychain)
+        self._refuses_with_a_path(monkeypatch, file_path)
+        if how == "run":
+            output = json.dumps(run_keepalive(ClaudeAccountSwitcher()))
+        else:
+            argv = ["keepalive", "--json"] + (["--adopt", "keychain"] if how == "adopt" else [])
+            _, out, err = _main(argv, capsys)
+            output = out + err
+        monkeypatch.undo()
+        on_disk = (store.backup_dir / "cache" / "keepalive.json").read_text(encoding="utf-8")
+        for text in (output, on_disk):
+            assert self.SECRET_PATH not in text
+            assert str(temp_home) not in text
+
+    def test_the_replacement_helpers_name_only_the_error_type(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        _, file_path = self._seed_agreeing(store, temp_home, block_real_keychain)
+        self._refuses_with_a_path(monkeypatch, file_path)
+        with pytest.raises(CredentialWriteError) as caught:
+            store._store._write_active_credentials_file(creds("AT-N", "RT-N"))
+        assert self.SECRET_PATH not in str(caught.value) and "PermissionError" in str(caught.value)
+        assert caught.value.__cause__ is None and caught.value.__suppress_context__ is True
+
+    def test_an_enc_that_cannot_be_read_names_only_the_error_type(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        self._seed_agreeing(store, temp_home, block_real_keychain)
+        store._store._write_backup_enc("1", "a@example.com", creds("AT-E", "RT-E"))
+        self._refuses_with_a_path(monkeypatch, store._store._backup_enc_path("1", "a@example.com"))
+        with pytest.raises(CredentialWriteError) as caught:
+            store._store._write_account_credentials("1", "a@example.com", creds("AT-N", "RT-N"))
+        assert self.SECRET_PATH not in str(caught.value)
+        assert caught.value.__cause__ is None and caught.value.__suppress_context__ is True
+
+    def test_a_keepalive_that_cannot_start_names_only_the_error_type(
+        self, store, temp_home, block_real_keychain, capsys, monkeypatch
+    ):
+        def startup_fails(**kwargs):
+            raise ClaudeSwitchError(f"collision at {self.SECRET_PATH}")
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", startup_fails)
+        for argv in (["keepalive", "--json"], ["keepalive"]):
+            code, out, err = _main(argv, capsys)
+            assert code == 1
+            assert self.SECRET_PATH not in out + err
+            assert "ClaudeSwitchError" in out + err
+
+
+class TestStashPurgeInRequiredMode(_RequiredModeStore):
+    """Security review 5: an explicit single entry can go, unless something needs it."""
+
+    def _agreeing(self, s, home, keychain):
+        a = creds("AT-A", "RT-A", expires_in_s=7200)
+        keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials("1", "a@example.com", a)
+        (home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
+        return a
+
+    def _row(self, s, value, **extra):
+        return s._store._write_unclaimed_credential(value, {
+            "reason": "test", "configSlot": "1", "email": "a@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(value), **extra,
+        })
+
+    def _purge(self, entry, capsys):
+        return _main(["unclaimed", "--purge", entry], capsys)
+
+    def _assert_refused(self, s, home, keychain, entry, capsys, needle):
+        before = snapshot(home, keychain)
+        code, _, err = self._purge(entry, capsys)
+        assert code == 1 and needle in err
+        assert snapshot(home, keychain) == before
+        assert entry in s._store._list_unclaimed_credentials()
+
+    def test_a_recorded_predecessor_goes(self, store, temp_home, block_real_keychain, capsys):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        old = creds("AT-O", "RT-O")
+        entry = self._row(store, old)
+        consumed_grants.record(
+            oauth.credential_fingerprint(old), self.A_ID, consumed_grants.CONSUMED,
+            successor=oauth.credential_fingerprint(a),
+        )
+        code, out, _ = self._purge(entry, capsys)
+        assert code == 0 and "Purged" in out
+        assert store._store._list_unclaimed_credentials() == {}
+        assert not store._store._stash_entry_path(entry).exists()
+        assert block_real_keychain.data[ACTIVE_ITEM] == a
+
+    @pytest.mark.parametrize("held_in", ["keychain", "file", "this-slot", "another-slot"])
+    def test_a_token_also_held_elsewhere_goes(
+        self, store, temp_home, block_real_keychain, capsys, held_in
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        same = creds("AT-other", "RT-A" if held_in != "another-slot" else "RT-2")
+        if held_in == "another-slot":
+            block_real_keychain.data[SLOT_2] = creds("AT-2", "RT-2")
+        elif held_in == "keychain":
+            (temp_home / ".claude" / ".credentials.json").unlink()
+            block_real_keychain.data[("claude-swap", "account-1-a@example.com")] = creds("AT-S", "RT-S")
+        elif held_in == "file":
+            block_real_keychain.data.pop(ACTIVE_ITEM)
+            block_real_keychain.data[("claude-swap", "account-1-a@example.com")] = creds("AT-S", "RT-S")
+        else:
+            (temp_home / ".claude" / ".credentials.json").unlink()
+            block_real_keychain.data.pop(ACTIVE_ITEM)
+        entry = self._row(store, same)
+        assert self._purge(entry, capsys)[0] == 0
+
+    def test_an_entry_another_entry_points_at_stays(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        # Even with its own token spent and held, the chain still passes through it.
+        entry = self._row(store, a)
+        self._row(store, creds("AT-N", "RT-N"), consumedFp=oauth.credential_fingerprint(a))
+        self._assert_refused(store, temp_home, block_real_keychain, entry, capsys, "names this one")
+
+    def test_a_reserved_token_stays(self, store, temp_home, block_real_keychain, capsys):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, a)
+        consumed_grants.record(oauth.credential_fingerprint(a), self.A_ID, consumed_grants.RESERVED)
+        self._assert_refused(store, temp_home, block_real_keychain, entry, capsys, "unknown outcome")
+
+    def test_the_successor_of_an_unresolved_row_stays(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, a)
+        consumed_grants.record(
+            oauth.credential_fingerprint(creds("x", "RT-P")), self.A_ID, consumed_grants.RESERVED,
+            successor=oauth.credential_fingerprint(a),
+        )
+        self._assert_refused(store, temp_home, block_real_keychain, entry, capsys, "unknown outcome")
+
+    def test_the_successor_of_a_settled_row_goes(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, a)
+        consumed_grants.record(
+            oauth.credential_fingerprint(creds("x", "RT-P")), self.A_ID, consumed_grants.CONSUMED,
+            successor=oauth.credential_fingerprint(a),
+        )
+        assert self._purge(entry, capsys)[0] == 0
+
+    def test_a_possible_sole_successor_stays_and_says_what_to_do(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, creds("AT-B", "RT-B"))
+        before = snapshot(temp_home, block_real_keychain)
+        code, _, err = self._purge(entry, capsys)
+        assert code == 1
+        for needle in ("only copy", "/login", "hswap claude add"):
+            assert needle in err
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_after_a_real_login_the_old_rival_can_go(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, creds("AT-B", "RT-B"))
+        fresh = creds("AT-N", "RT-N", expires_in_s=7200)
+        block_real_keychain.data[ACTIVE_ITEM] = fresh
+        (temp_home / ".claude" / ".credentials.json").write_text(fresh, encoding="utf-8")
+        store.add_account(assume_yes=True)
+        assert self._purge(entry, capsys)[0] == 0
+
+    def test_an_entry_with_no_bytes_but_a_record_is_checked_like_any_other(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, creds("AT-B", "RT-B"))
+        store._store._stash_entry_path(entry).unlink()
+        code, _, err = self._purge(entry, capsys)
+        assert code == 1 and "only copy" in err
+
+    def test_an_entry_with_nothing_to_identify_it_goes(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        entry = store._store._write_unclaimed_credential(creds("AT-B", "RT-B"), {"reason": "test"})
+        store._store._stash_entry_path(entry).unlink()
+        assert self._purge(entry, capsys)[0] == 0
+
+    @pytest.mark.parametrize("failure", ["manifest", "entry", "slot"])
+    def test_what_cannot_be_read_stops_the_purge(
+        self, store, temp_home, block_real_keychain, capsys, monkeypatch, failure
+    ):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        # A token the stores hold, which would go if nothing stood in the way.
+        entry = self._row(store, creds("AT-O", "RT-O") if failure == "slot" else a)
+        cls = store._store.__class__
+        if failure == "manifest":
+            real = cls._read_stash_manifest_ex
+            monkeypatch.setattr(cls, "_read_stash_manifest_ex", lambda self: (real(self)[0], "corrupt"))
+        elif failure == "entry":
+            monkeypatch.setattr(cls, "_read_unclaimed_credential", lambda self, i: ("", True))
+        else:
+            monkeypatch.setattr(
+                ClaudeAccountSwitcher, "_read_account_credentials_ex", lambda self, *a, **kw: ("", True)
+            )
+        code, _, _ = self._purge(entry, capsys)
+        monkeypatch.undo()
+        assert code == 1
+        assert entry in store._store._list_unclaimed_credentials()
+
+    def test_it_runs_under_the_locks_and_the_gate(
+        self, store, temp_home, block_real_keychain, capsys, monkeypatch
+    ):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, a)
+        (temp_home / ".claude" / ".credentials.json").write_text(creds("AT-F", "RT-F"), encoding="utf-8")
+        before = snapshot(temp_home, block_real_keychain)
+        code, _, err = self._purge(entry, capsys)
+        assert code == 1 and "different logins" in err
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_a_session_profile_stops_it(self, store, temp_home, block_real_keychain, capsys):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, a)
+        store._session_dir("1", "a@example.com").mkdir(parents=True)
+        code, _, err = self._purge(entry, capsys)
+        assert code == 1 and "required_mode_unsupported" in err
+        assert entry in store._store._list_unclaimed_credentials()
+
+    def test_no_id_stays_a_usage_error_and_the_bulk_purge_stays_refused(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        a = self._agreeing(store, temp_home, block_real_keychain)
+        entry = self._row(store, a)
+        assert _main(["unclaimed", "--purge"], capsys)[0] == 2
+        code, _, err = _main(["purge"], capsys)
+        assert code == 1 and "required_mode_unsupported" in err
+        assert entry in store._store._list_unclaimed_credentials()
+
+    def test_default_mode_purges_anything_as_before(
+        self, temp_home, block_real_keychain, capsys
+    ):
+        s = macos_store(temp_home)
+        entry = self._row(s, creds("AT-B", "RT-B"))
+        assert self._purge(entry, capsys)[0] == 0
+        assert s._store._list_unclaimed_credentials() == {}

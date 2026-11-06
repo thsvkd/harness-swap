@@ -90,6 +90,12 @@ class SessionProfilesExistError(RequiredModeUnsupportedError):
         )
 
 
+class StashEntryInUseError(CredentialError):
+    """Keychain-required mode: this stash entry may still be needed, so it stays."""
+
+    json_type = "stash_entry_in_use"
+
+
 class ConfigError(ClaudeSwitchError):
     """Error related to configuration operations."""
 

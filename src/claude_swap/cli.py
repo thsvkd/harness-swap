@@ -425,8 +425,6 @@ def _unclaimed_command(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     try:
-        if args.purge:
-            _refuse_in_required_mode("unclaimed --purge")
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         entries = switcher.list_unclaimed_credentials()
@@ -435,7 +433,9 @@ def _unclaimed_command(argv: list[str]) -> None:
             if args.purge not in entries:
                 error(f"Error: no unclaimed entry {args.purge}")
                 sys.exit(1)
-            switcher._store._remove_unclaimed_credential(args.purge)
+            with switcher._required_mode_section():
+                switcher.refuse_stash_purge(args.purge)
+                switcher._store._remove_unclaimed_credential(args.purge)
             print(f"{accent('Purged')} {args.purge}")
             return
 
@@ -1073,10 +1073,14 @@ def _keepalive_command(argv: list[str]) -> None:
             adopt=args.adopt,
         )
     except ClaudeSwitchError as e:
+        # Its text can name a path, and a watcher sends this message on.
+        message = f"keepalive could not start ({type(e).__name__}); run hswap claude list for details."
         if args.json:
-            print(json.dumps(error_envelope(e), indent=2))
+            envelope = error_envelope(e)
+            envelope["error"]["message"] = message
+            print(json.dumps(envelope, indent=2))
         else:
-            error(f"Error: {e}")
+            error(f"Error: {message}")
         sys.exit(1)
     if args.json:
         print(json.dumps(report, indent=2))

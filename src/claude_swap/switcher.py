@@ -34,6 +34,7 @@ from claude_swap.exceptions import (
     RequiredModeUnsupportedError,
     SessionError,
     SessionProfilesExistError,
+    StashEntryInUseError,
     STORES_DISAGREE_MESSAGE,
     StoresDisagreeError,
     SwitchError,
@@ -793,8 +794,8 @@ class ClaudeAccountSwitcher:
             file_creds = get_credentials_path().read_text(encoding="utf-8")
         except FileNotFoundError:
             file_creds = ""
-        except (OSError, UnicodeDecodeError) as e:
-            raise StoresDisagreeError(STORES_DISAGREE_MESSAGE) from e
+        except (OSError, UnicodeDecodeError):
+            raise StoresDisagreeError(STORES_DISAGREE_MESSAGE) from None
         file_creds = file_creds if file_creds.strip() else ""
         live = {
             oauth.credential_fingerprint(creds)
@@ -861,8 +862,8 @@ class ClaudeAccountSwitcher:
                 copies.extend([keychain or "", get_credentials_path().read_text(encoding="utf-8")])
             except FileNotFoundError:
                 pass
-            except (OSError, UnicodeDecodeError) as e:
-                raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE) from e
+            except (OSError, UnicodeDecodeError):
+                raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE) from None
         found = {
             oauth.credential_fingerprint(creds)
             for creds in copies
@@ -894,8 +895,8 @@ class ClaudeAccountSwitcher:
             raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
         try:
             return [copy, self._store._leftover_backup_enc(num, email)]
-        except OSError as e:
-            raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE) from e
+        except OSError:
+            raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE) from None
 
     def is_provably_new_login(
         self, login: str, num: str | None, email: str, *, stores_must_agree: bool = True
@@ -1044,6 +1045,69 @@ class ClaudeAccountSwitcher:
         return all(
             not copy or oauth.credential_fingerprint(copy) == fingerprint for copy in held
         )
+
+    def refuse_stash_purge(self, entry_id: str) -> None:
+        """Required mode, with the locks held: an entry goes by hand only if nothing still
+        needs it. What it may hold is the only copy of a live token, and removing it would
+        also take away the rival that keeps a spent token from being sent."""
+        if not self._store._keychain_is_required():
+            return
+        store = self._store
+        manifest, verdict = store._read_stash_manifest_ex()
+        value, unreadable = store._read_unclaimed_credential(entry_id)
+        if verdict != "ok" or unreadable:
+            raise StashEntryInUseError(
+                "The stash cannot be read in full, so nothing shows this entry is unneeded; "
+                "nothing was removed."
+            )
+        fingerprint = manifest.get(entry_id, {}).get("fingerprint") or (
+            oauth.credential_fingerprint(value)
+        )
+        if not fingerprint:
+            return  # no bytes and no record of what they were
+        if any(
+            row.get("consumedFp") == fingerprint
+            for other, row in manifest.items()
+            if other != entry_id
+        ):
+            raise StashEntryInUseError(
+                "Another stash entry names this one as the token it replaced; nothing was removed."
+            )
+        recorded = consumed_grants.entry(fingerprint)
+        if (
+            recorded is not None and recorded["state"] != consumed_grants.CONSUMED
+        ) or consumed_grants.is_successor_of_unresolved(fingerprint):
+            raise StashEntryInUseError(
+                "This entry's token has a refresh with an unknown outcome on record; nothing "
+                "was removed."
+            )
+        if recorded is None and fingerprint not in self._held_outside_the_stash():
+            raise StashEntryInUseError(
+                "This entry may hold the only copy of a live token; nothing was removed. Log "
+                "in again with /login and run hswap claude add first."
+            )
+
+    def _held_outside_the_stash(self) -> set[str | None]:
+        """The refresh tokens in the two stores and every slot's backup. Raises
+        StashEntryInUseError when one cannot be read."""
+        keychain, failed = self._store._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        if failed:
+            raise StashEntryInUseError("The Keychain cannot be read; nothing was removed.")
+        try:
+            file_creds = get_credentials_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            file_creds = ""
+        except (OSError, UnicodeDecodeError):
+            raise StashEntryInUseError(
+                "The credentials file cannot be read; nothing was removed."
+            ) from None
+        held = {oauth.credential_fingerprint(keychain or ""), oauth.credential_fingerprint(file_creds)}
+        for num, account in (self._get_sequence_data() or {}).get("accounts", {}).items():
+            copy, unreadable = self._read_account_credentials_ex(num, account.get("email", ""))
+            if unreadable:
+                raise StashEntryInUseError("A slot cannot be read; nothing was removed.")
+            held.add(oauth.credential_fingerprint(copy))
+        return held
 
     def supersede_stashed_copies(self, identity: tuple[str, str], login: str) -> None:
         """A provably new login: every copy stashed for the account is behind it."""

@@ -882,7 +882,9 @@ class CredentialStore:
         except FileNotFoundError:
             return
         except (OSError, UnicodeDecodeError) as e:
-            raise CredentialWriteError(f"Cannot read the file it would replace: {e}") from e
+            raise CredentialWriteError(
+                f"Cannot read the file it would replace ({type(e).__name__})."
+            ) from None
         self.preserve_copy(copy, replacement, slot_keeps_it=True)
 
     def _preserve_active_keychain(self, replacement: str | None) -> None:
@@ -901,11 +903,15 @@ class CredentialStore:
         try:
             enc_copy = self._leftover_backup_enc(account_num, email)
         except OSError as e:
-            raise CredentialWriteError(f"Cannot read the .enc it would replace: {e}") from e
+            raise CredentialWriteError(
+                f"Cannot read the .enc it would replace ({type(e).__name__})."
+            ) from None
         try:
             copy = self._kc_read_backup(account_num, email)
         except macos_keychain.KEYCHAIN_ERRORS as e:
-            raise CredentialWriteError("Cannot read the backup it would replace") from e
+            raise CredentialWriteError(
+                f"Cannot read the backup it would replace ({type(e).__name__})."
+            ) from None
         for held in (copy, enc_copy):
             if held:
                 self.preserve_copy(held, replacement, account_num=account_num, email=email)

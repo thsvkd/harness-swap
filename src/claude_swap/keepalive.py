@@ -41,6 +41,8 @@ from claude_swap.credentials import (
 from claude_swap.exceptions import (
     ClaudeSwitchError,
     CopiesDisagreeError,
+    KEYCHAIN_ITEM_PRESENT_MESSAGE,
+    KeychainItemPresentError,
     KeychainUnavailableError,
     LockError,
     RequiredModeUnsupportedError,
@@ -82,6 +84,7 @@ _MESSAGES = {
     "no_credentials": "No active Claude login found.",
     "locked": "Credential locks stayed held; the next run retries.",
     "unmanaged": "The active login matches no managed account; add it to back it up.",
+    "keychain_item_present": KEYCHAIN_ITEM_PRESENT_MESSAGE,
 }
 _FILE_NOT_UPDATED = "file store could not be updated"
 _UNLINKED_STORES = (
@@ -141,6 +144,8 @@ def run_keepalive(
         "accessExpiresAt": None,
         "loginExpiresAt": None,
         "error": None,
+        "store": _store_label(switcher._store),
+        "keychainItemPresent": False,
     }
     if dry_run:
         report["dryRun"] = True
@@ -148,6 +153,8 @@ def run_keepalive(
         _keep(switcher, report, ahead, ensure_file, dry_run, adopt)
     except _Stop as stop:
         report["error"] = {"type": stop.kind, "message": stop.message}
+    except KeychainItemPresentError:
+        report["error"] = _error("keychain_item_present")
     except RequiredModeUnsupportedError as e:
         report["error"] = {"type": "required_mode_unsupported", "message": str(e)}
     except StashManifestCorruptError as e:
@@ -166,11 +173,19 @@ def run_keepalive(
         _logger.warning("keepalive failed: %s", type(e).__name__)  # the text may hold a path
         report["error"] = _error("refresh_failed")
     report["ok"] = report["error"] is None
+    if report["error"] and report["error"]["type"] == "keychain_item_present":
+        report["keychainItemPresent"] = True  # a failed check counts too
     try:
         atomic_write_json(switcher.backup_dir / "cache" / REPORT_FILENAME, report)
     except OSError as e:
         _logger.warning("could not write %s: %s", REPORT_FILENAME, type(e).__name__)
     return report
+
+
+def _store_label(store) -> str:
+    if store._file_store():
+        return "file"
+    return "keychain" if store._keychain_is_required() else "auto"
 
 
 def _error(kind: str) -> dict:
@@ -196,9 +211,13 @@ def _keep(switcher, report, ahead, ensure_file, dry_run, adopt=None) -> None:
     if "CLAUDE_CONFIG_DIR" in os.environ or "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
         raise _Stop("refresh_failed", _UNSUPPORTED_STORE)
     if macos:
-        if macos_keychain.keychain_reachable(platform="darwin") is False:
-            raise _Stop("keychain_unavailable")
-        store.pin_keychain()
+        if store._file_store():
+            if adopt or ensure_file:
+                raise RequiredModeUnsupportedError("keepalive --adopt or --ensure-file", file_store=True)
+        else:
+            if macos_keychain.keychain_reachable(platform="darwin") is False:
+                raise _Stop("keychain_unavailable")
+            store.pin_keychain()
         switcher.refuse_session_profiles()
         switcher.refuse_unreadable_stash_manifest()
     store.records_consumed = True
@@ -249,7 +268,8 @@ def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict
     switcher = active.switcher
     switcher._required_mode_gate(reconciling=True)
     store = switcher._store
-    keychain, file_creds = _read_stores(store, switcher.platform == Platform.MACOS)
+    keychain, file_creds = _read_stores(store, store._has_keychain())
+    report["keychainItemPresent"] = bool(keychain)
     if not dry_run:
         _prune_stash(active)
     if not keychain and not file_creds:
@@ -283,7 +303,7 @@ def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict
 def _retire_parked(active, entries: list[str], parked: str) -> None:
     """The stash holds the only sure copy until a store provably does."""
     store = active.switcher._store
-    if entries and not _store_holds(store, active.switcher.platform == Platform.MACOS, parked):
+    if entries and not _store_holds(store, store._has_keychain(), parked):
         raise _Stop("refresh_failed", _FILE_NOT_UPDATED)
     for entry_id in entries:
         active.switcher._retire_stash_entry(entry_id, _UNMANAGED)
@@ -616,7 +636,7 @@ def _write_stores(active, report, keychain, file_creds, login, ensure_file, dry_
     """Bring both stores to this login; returns what they now hold."""
     switcher = active.switcher
     store = switcher._store
-    macos = switcher.platform == Platform.MACOS
+    macos = store._has_keychain()
     # The engine's composition with the Keychain as the live store: it wins the
     # machine-shared fields (mcpOAuth, ...), the login comes from the winner.
     current = keychain or file_creds
@@ -755,6 +775,8 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
             raise _Stop("split_brain", _UNLINKED_STORES)
         if outcome.error == "ledger-unreadable":
             raise _Stop("refresh_failed", _LEDGER_UNREADABLE)
+        if outcome.error == "keychain_item_present":
+            raise _Stop("keychain_item_present")
         if outcome.fate == oauth.GRANT_UNCERTAIN:
             raise _Stop("relogin_required", _UNCERTAIN_REFRESH)
         if outcome.error in PERMANENT_AUTH_ERRORS:

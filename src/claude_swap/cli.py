@@ -10,7 +10,11 @@ import re
 import sys
 
 from claude_swap import __version__, macos_keychain, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError, RequiredModeUnsupportedError
+from claude_swap.exceptions import (
+    ClaudeSwitchError,
+    ConfigConflictError,
+    RequiredModeUnsupportedError,
+)
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
@@ -32,7 +36,9 @@ from claude_swap.settings import (
     load_run_settings,
     load_ui_settings,
     load_update_settings,
-    require_keychain,
+    credentials_store,
+    store_conflict,
+    strict_mode,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -277,8 +283,26 @@ def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
 def _refuse_in_required_mode(command: str) -> None:
     """The first thing an unsupported command does, ahead even of the switcher's own
     startup work. The switcher has the same check for the UIs, which call it directly."""
-    if Platform.detect() == Platform.MACOS and require_keychain(paths.get_backup_root()):
-        raise RequiredModeUnsupportedError(command)
+    root = paths.get_backup_root()
+    if Platform.detect() == Platform.MACOS and strict_mode(root):
+        raise RequiredModeUnsupportedError(command, file_store=credentials_store(root) == "file")
+
+
+def _refuse_config_conflict(argv: list[str]) -> None:
+    """Before any command's first side effect. `config` is exempt: it is the repair."""
+    if (
+        argv[:1] == ["config"]
+        or {"-h", "--help", "--version"} & set(argv)
+        or Platform.detect() != Platform.MACOS
+        or not store_conflict(paths.get_backup_root())
+    ):
+        return
+    conflict = ConfigConflictError()
+    if "--json" in argv:
+        print(json.dumps(error_envelope(conflict)))
+    else:
+        error(f"Error: {conflict}")
+    sys.exit(1)
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -999,6 +1023,11 @@ def _keychain_selftest_command(argv: list[str]) -> None:
 
     if Platform.detect() != Platform.MACOS:
         finish({"unsupported": True}, "unsupported", 0)
+    if credentials_store(paths.get_backup_root()) == "file":
+        failure(
+            "required_mode_unsupported",
+            str(RequiredModeUnsupportedError("keychain-selftest", file_store=True)),
+        )
     if macos_keychain.keychain_reachable(platform="darwin") is False:
         failure("keychain_unavailable", KEYCHAIN_UNAVAILABLE_MESSAGE)
     if not macos_keychain.selftest():
@@ -1175,7 +1204,7 @@ Examples:
         parser.error("--json can only be used with list or get")
 
     try:
-        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        switcher = ClaudeAccountSwitcher(debug=args.debug, check_config=False)
         if sys.platform != "win32":
             if os.geteuid() == 0 and not switcher._is_running_in_container():
                 error("Error: Do not run this script as root (unless running in a container)")
@@ -1339,6 +1368,7 @@ def main() -> None:
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
 
+    _refuse_config_conflict(argv)
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
         _run_command(argv[1:])

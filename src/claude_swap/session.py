@@ -57,10 +57,10 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.paths import get_default_global_config_path
+from claude_swap.paths import get_backup_root, get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
-from claude_swap.settings import atomic_write_json
+from claude_swap.settings import atomic_write_json, credentials_store
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -252,6 +252,11 @@ def _keychain_account_name() -> str:
     return macos_keychain.keychain_account_name()
 
 
+def _has_keychain() -> bool:
+    """A file-store machine never touches a Keychain item, a session's included."""
+    return Platform.detect() == Platform.MACOS and credentials_store(get_backup_root()) != "file"
+
+
 def delete_macos_keychain_entry(session_dir: Path) -> None:
     """Best-effort delete of a session profile's hashed keychain entry.
 
@@ -259,7 +264,7 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
     the plaintext file, so a stale entry would shadow a fresh seed) and on
     profile removal (once the dir is gone the hashed name is unrecoverable).
     """
-    if Platform.detect() != Platform.MACOS:
+    if not _has_keychain():
         return
     try:
         macos_keychain.delete_password(
@@ -303,7 +308,7 @@ def _may_have_credential_material(session_dir: Path) -> bool:
             return True
     except (OSError, ValueError):
         pass  # no readable seed — the keychain may still hold the material
-    if Platform.detect() != Platform.MACOS:
+    if not _has_keychain():
         return False
     for service in _keychain_services(str(session_dir)):
         try:
@@ -426,7 +431,7 @@ def read_config_dir_credentials(
     directory = Path(config_dir)
     if not directory.is_dir():
         return None
-    if Platform.detect() == Platform.MACOS:
+    if _has_keychain():
         for service in _keychain_services(config_dir, keychain_service):
             try:
                 creds = _keychain_entry(service, strict_keychain)

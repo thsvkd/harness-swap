@@ -44,7 +44,7 @@ from claude_swap.paths import (
     get_default_claude_config_home,
     get_global_config_path,
 )
-from claude_swap.settings import require_keychain
+from claude_swap.settings import credentials_store, require_keychain, strict_mode
 
 _logger = logging.getLogger("claude-swap")
 
@@ -124,7 +124,7 @@ SECURITY_SERVICE = "claude-swap"
 
 # Service name of Claude Code's *active* OAuth credential in the macOS Keychain
 # (read by Claude Code itself; we read/write it when switching accounts).
-CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+CLAUDE_CODE_KEYCHAIN_SERVICE = macos_keychain.CREDENTIAL_SERVICE
 
 # Service name of Claude Code's *active* managed API key (``/login`` with an
 # ``sk-ant-…`` key) in the macOS Keychain. Distinct from the OAuth service above
@@ -453,12 +453,29 @@ class CredentialStore:
             self._host.credentials_dir.parent
         )
 
+    def _file_store(self) -> bool:
+        """File store mode (macOS): the file and `.enc` backups are the only stores."""
+        return self._host.platform == Platform.MACOS and (
+            credentials_store(self._host.credentials_dir.parent) == "file"
+        )
+
+    def _has_keychain(self) -> bool:
+        """Whether credentials can live in a Keychain here at all."""
+        return self._host.platform == Platform.MACOS and not self._file_store()
+
+    def _strict_mode(self) -> bool:
+        """The protections of keychain-required mode, which the file store shares: the
+        locked gate, rules U, P and L, the ledger and the refused commands."""
+        if self._host.platform != Platform.MACOS:
+            return False
+        return self.keychain_required or strict_mode(self._host.credentials_dir.parent)
+
     def records_consumed_grants(self) -> bool:
         # An existing ledger binds every POST, or a default-mode `auto` could
         # spend a token behind keepalive's back.
         return (
             self.records_consumed
-            or self._keychain_is_required()
+            or self._strict_mode()
             or consumed_grants.in_use()
         )
 
@@ -531,7 +548,7 @@ class CredentialStore:
         A pinned file mode with no deadline (0.0) stays sticky — see
         :meth:`_pin_file_mode` for why a write fallback must never re-probe.
         """
-        if self._host.platform != Platform.MACOS:
+        if not self._has_keychain():
             return False
         if (
             self._keychain_usable_cache is False
@@ -603,7 +620,7 @@ class CredentialStore:
         A pinned file mode is unaffected: its deadline is 0.0, so
         ``_use_keychain`` never re-probes it.
         """
-        if self._host.platform != Platform.MACOS:
+        if not self._has_keychain():
             return False
         if self._use_keychain():          # may clear a lapsed cooldown
             return False
@@ -678,6 +695,8 @@ class CredentialStore:
         raising) reports ``failed=False`` and is not retried. The retry rides out
         a transient lock/contention — it does not paper over an internal race.
         """
+        if self._file_store():
+            return None, False  # the guard is what speaks for this item
         last_error: Exception | None = None
         for attempt in range(_ACTIVE_READ_ATTEMPTS):
             try:
@@ -876,7 +895,7 @@ class CredentialStore:
         atomic_write_text(cred_dir / ".credentials.json", credentials)
 
     def _preserve_active_file(self, replacement: str | None) -> None:
-        if self.preserve_copy is None or not self._keychain_is_required():
+        if self.preserve_copy is None or not self._strict_mode():
             return
         try:
             copy = get_credentials_path().read_text(encoding="utf-8")
@@ -899,7 +918,7 @@ class CredentialStore:
 
     def _preserve_slot(self, account_num: str, email: str, replacement: str | None) -> None:
         """Every copy a slot holds: its Keychain backup and a leftover `.enc`."""
-        if self.preserve_copy is None or not self._keychain_is_required():
+        if self.preserve_copy is None or not self._strict_mode():
             return
         try:
             enc_copy = self._leftover_backup_enc(account_num, email)
@@ -930,7 +949,7 @@ class CredentialStore:
         a return is proof — which is the fact ``_pin_file_mode`` needs and used
         to discard. Off macOS there is no Keychain item, hence ``True``.
         """
-        if self._host.platform != Platform.MACOS:
+        if not self._has_keychain():
             return True
         try:
             macos_keychain.delete_password(
@@ -1024,7 +1043,7 @@ class CredentialStore:
 
         # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
         self._clear_oauth_credential()
-        if self._host.platform == Platform.MACOS and not wrote_to_keychain:
+        if self._has_keychain() and not wrote_to_keychain:
             # Same stale-Keychain resurrection guard as the OAuth path: the key
             # fell back to plaintext ``primaryApiKey`` while a stale "Claude Code"
             # Keychain item may remain, and managed-key reads check the Keychain
@@ -1060,7 +1079,7 @@ class CredentialStore:
         per token while it lies, and a caller/log reader must be able to
         tell "nothing to clear" from "could not check".
         """
-        if self._host.platform == Platform.MACOS:
+        if self._has_keychain():
             try:
                 macos_keychain.delete_password(
                     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
@@ -1154,7 +1173,7 @@ class CredentialStore:
         except Exception as e:
             raise CredentialWriteError(f"Failed to write credentials: {e}")
         cleared = self._delete_active_keychain_entry()
-        if self._host.platform == Platform.MACOS:
+        if self._has_keychain():
             # The delete above is best-effort; a stale Keychain item may remain.
             # Pin file mode so a later read-timeout cooldown can't re-probe onto
             # that residual and resurrect the wrong account (see _pin_file_mode).
@@ -1281,6 +1300,8 @@ class CredentialStore:
         — the fetch path re-reads (``_consume_backup_grant_locked`` adopts a
         moved generation rather than consuming a stale snapshot).
         """
+        if self._file_store():
+            return ""
         key = (str(account_num), email)
         if cached:
             generation = self._registry_generation()
@@ -1468,7 +1489,7 @@ class CredentialStore:
                     if decoded:
                         return decoded
                     # Empty/whitespace .enc is not a real backup → try the Keychain.
-        if self._host.platform == Platform.MACOS:
+        if self._has_keychain():
             try:
                 return self._kc_read_backup(account_num, email, cached=cached)
             except KeychainBackedOff:
@@ -1631,7 +1652,7 @@ class CredentialStore:
         except Exception as e:
             self._host._logger.warning(f"Failed to write credentials file: {e}")
             raise
-        if self._host.platform == Platform.MACOS:
+        if self._has_keychain():
             self._delete_backup_keychain_quiet(account_num, email)
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
@@ -1654,7 +1675,7 @@ class CredentialStore:
                     enc_file.unlink()
             except Exception as e:
                 self._host._logger.warning(f"Failed to delete credentials file: {e}")
-            if self._host.platform == Platform.MACOS:
+            if self._has_keychain():
                 self._delete_backup_keychain_quiet(num, email)
             self.delete_previous_backup(num, email)
 
@@ -1687,7 +1708,7 @@ class CredentialStore:
         # (missing_ok), permission/I/O errors must abort the commit.
         try:
             self._backup_enc_path(account_num, email).unlink(missing_ok=True)
-            if self._host.platform == Platform.MACOS:
+            if self._has_keychain():
                 self._kc_delete_backup(account_num, email)
         except (OSError, *macos_keychain.KEYCHAIN_ERRORS) as e:
             raise CredentialError(
@@ -1723,7 +1744,7 @@ class CredentialStore:
                 prev_file.unlink()
         except Exception as e:
             self._host._logger.warning(f"Failed to delete .prev file: {e}")
-        if self._host.platform == Platform.MACOS:
+        if self._has_keychain():
             try:
                 self._kc_delete_backup_prev(account_num, email)
             except Exception as e:
@@ -1831,7 +1852,7 @@ class CredentialStore:
                     return decoded
             except Exception as e:
                 self._host._logger.warning(f"Failed to read .prev file: {e}")
-        if self._host.platform == Platform.MACOS:
+        if self._has_keychain():
             try:
                 return self._kc_call(
                     macos_keychain.get_password,
@@ -2035,7 +2056,7 @@ class CredentialStore:
             entries, verdict = self._read_stash_manifest_ex()
             # Required mode: these rows are evidence, so a bad file is a person's to
             # inspect, never set aside for a fresh one that has forgotten them.
-            if verdict != "ok" and self._keychain_is_required():
+            if verdict != "ok" and self._strict_mode():
                 raise StashManifestCorruptError(
                     str(self._stash_manifest_path()).replace(str(Path.home()), "~", 1)
                 )

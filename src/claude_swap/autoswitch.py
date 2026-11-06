@@ -95,6 +95,8 @@ _SYSTEMIC_MESSAGES = {
     "required_mode_unsupported": "session profiles exist — remove them or turn off "
                                  "credentials.requireKeychain",
     "stash_manifest_corrupt": "the stash manifest cannot be read — inspect or restore it",
+    "keychain_item_present": "the login keychain holds a Claude Code credential item — "
+                             "run migrate-store",
     "stores-disagree": "the Keychain and the credentials file hold different logins — "
                        "run keepalive",
 }

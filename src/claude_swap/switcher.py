@@ -25,7 +25,9 @@ from claude_swap.exceptions import (
     COPIES_DISAGREE_MESSAGE,
     CopiesDisagreeError,
     CredentialWriteError,
+    KeychainItemPresentError,
     KeychainUnavailableError,
+    ConfigConflictError,
     ConfigError,
     CredentialReadError,
     LockError,
@@ -116,6 +118,7 @@ from claude_swap.settings import (
     parse_model_names,
     require_keychain,
     settings_path,
+    store_conflict,
 )
 from claude_swap.usage_store import (
     FetchRecord,
@@ -239,6 +242,9 @@ ERROR_NOTES = {
         "session profiles exist — remove them or turn off credentials.requireKeychain"
     ),
     "stash_manifest_corrupt": "the stash manifest cannot be read — inspect or restore it",
+    "keychain_item_present": (
+        "the login keychain holds a Claude Code credential item — run migrate-store"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -369,10 +375,14 @@ def _gated_in_required_mode(method):
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, *, check_config: bool = True):
+        """``check_config`` False: only `config`, which is how a conflict gets repaired."""
         self.home = Path.home()
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
+        config_conflict = self.platform == Platform.MACOS and store_conflict(self.backup_dir)
+        if config_conflict and check_config:
+            raise ConfigConflictError()
 
         # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
         # before any logger or directory setup writes to the new location.
@@ -451,7 +461,7 @@ class ClaudeAccountSwitcher:
         # aborts construction. No-op on fresh installs / once recorded.
         from claude_swap.migrations import run_migrations
 
-        if not self.keychain_gate_closed():
+        if not config_conflict and not self.keychain_gate_closed():
             run_migrations(self)
 
     def _is_running_in_container(self) -> bool:
@@ -701,22 +711,31 @@ class ClaudeAccountSwitcher:
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
         self.refuse_session_profiles()
         self.refuse_unreadable_stash_manifest()
+        self.refuse_keychain_item_present()
 
-    def refuse_unreadable_stash_manifest(self) -> None:
+    def refuse_keychain_item_present(self) -> None:
+        """File store: a Claude Code that ran with the keychain unlocked may have written
+        the successor of the file's token there, so the file's token may be spent."""
+        if self._store._file_store() and macos_keychain.credential_item_present():
+            raise KeychainItemPresentError()
+
+    def refuse_unreadable_stash_manifest(self, *, force: bool = False) -> None:
         """Required mode: the stash's rows are evidence for rule U, so with them unreadable
-        nothing writes or sends, and only a person repairs the file."""
+        nothing writes or sends, and only a person repairs the file. ``force``: a command
+        entering this mode, whatever the setting says now."""
         if (
-            self._store._keychain_is_required()
+            (force or self._store._strict_mode())
             and self._store._read_stash_manifest_ex()[1] != "ok"
         ):
             raise StashManifestCorruptError(
                 str(self._store._stash_manifest_path()).replace(str(Path.home()), "~", 1)
             )
 
-    def refuse_session_profiles(self) -> None:
+    def refuse_session_profiles(self, *, force: bool = False) -> None:
         """Required mode covers the two stores, the slots and the stash, and stops at any
-        session profile: a session's Keychain item and file can each hold a successor."""
-        if not self._store._keychain_is_required():
+        session profile: a session's Keychain item and file can each hold a successor.
+        ``force``: a command entering this mode, whatever the setting says now."""
+        if not force and not self._store._strict_mode():
             return
         sessions = self.backup_dir / "sessions"
         try:
@@ -726,7 +745,10 @@ class ClaudeAccountSwitcher:
         except OSError:
             found = True
         if found:
-            raise SessionProfilesExistError(str(sessions).replace(str(Path.home()), "~", 1))
+            raise SessionProfilesExistError(
+                str(sessions).replace(str(Path.home()), "~", 1),
+                file_store=self._store._file_store(),
+            )
 
     def post_refresh(
         self,
@@ -744,7 +766,9 @@ class ClaudeAccountSwitcher:
         """
         if self.keychain_gate_closed(fresh=True):
             return oauth.RefreshOutcome(None, "transient")
-        if self._store._keychain_is_required():
+        if self._store._file_store() and macos_keychain.credential_item_present():
+            return oauth.RefreshOutcome(None, "keychain_item_present")
+        if self._store._strict_mode():
             active = self._get_current_account()
             if active is None or (identity == active and not locks_held):
                 self._logger.info("Refresh deferred: the active login needs the locks.")
@@ -762,17 +786,17 @@ class ClaudeAccountSwitcher:
     def refuse_in_required_mode(self, command: str) -> None:
         """Keychain-required mode supports what the keepalive workflow uses, and every
         other command is refused here, before it does anything."""
-        if self._store._keychain_is_required():
-            raise RequiredModeUnsupportedError(command)
+        if self._store._strict_mode():
+            raise RequiredModeUnsupportedError(command, file_store=self._store._file_store())
 
     def _required_mode_locks(self):
         """Claude Code's refresh locks, which the gate needs held. Default mode: none."""
-        return claude_credentials_lock() if self._store._keychain_is_required() else nullcontext()
+        return claude_credentials_lock() if self._store._strict_mode() else nullcontext()
 
     @contextmanager
     def _required_mode_section(self) -> Iterator[None]:
         """The slot lock, Claude Code's locks, then the gate. Default mode: nothing."""
-        if not self._store._keychain_is_required():
+        if not self._store._strict_mode():
             yield
             return
         with FileLock(self.lock_file), claude_credentials_lock():
@@ -797,10 +821,11 @@ class ClaudeAccountSwitcher:
         at an expiry or a write time: a refresh can issue a shorter lifetime and a clock
         can step back. Raises StoresDisagreeError or ReloginRequiredError.
         """
-        if not self._store._keychain_is_required():
+        if not self._store._strict_mode():
             return
         self.refuse_session_profiles()
         self.refuse_unreadable_stash_manifest()
+        self.refuse_keychain_item_present()
         keychain, failed = self._store._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
         if failed:
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
@@ -846,7 +871,7 @@ class ClaudeAccountSwitcher:
         """Rule U: the active login's token goes only if every copy we can see holds it
         or is a recorded predecessor of it. With the locks held, right before the
         reservation. Raises CopiesDisagreeError."""
-        if not self._store._keychain_is_required():
+        if not self._store._strict_mode():
             return
         data = self._get_sequence_data() or {}
         num = self._find_account_slot(data, *identity) if data else None
@@ -956,7 +981,7 @@ class ClaudeAccountSwitcher:
         holds it, a record shows it was spent for the replacement, the stash holds it, or
         (``slot_keeps_it``, a live store on a switch) a slot does. Raises when the copy
         cannot be kept, which must stop the replacement."""
-        if not self._store._keychain_is_required() or holds_no_login(copy):
+        if not self._store._strict_mode() or holds_no_login(copy):
             return
         if identity is None:
             if email is not None:
@@ -1042,7 +1067,7 @@ class ClaudeAccountSwitcher:
         """`add` in required mode. A provably new login stands in front of everything the
         account holds. Any other re-add proves nothing, so it touches no copy of another
         token and records nothing: it must not manufacture lineage for a later refresh."""
-        if not self._store._keychain_is_required():
+        if not self._store._strict_mode():
             return True
         identity = (email, org_uuid or "")
         held = self._stored_copies(account_num, email)
@@ -2811,7 +2836,7 @@ class ClaudeAccountSwitcher:
         # Required mode: no gap between the gate and the POST for a switch to land in.
         # Under the locks the account can have become the active one, and this path
         # writes only the slot, so the stores would keep the spent token.
-        if self._store._keychain_is_required() and not global_lock_held:
+        if self._store._strict_mode() and not global_lock_held:
             try:
                 with FileLock(self.lock_file), claude_credentials_lock():
                     org_uuid = self.account_identity(account_num)["organizationUuid"] or ""
@@ -2919,7 +2944,7 @@ class ClaudeAccountSwitcher:
                 identity = (email, org_uuid)
                 self._required_mode_gate(refresh_input, (account_num, email, org_uuid))
                 if (
-                    not self._store._keychain_is_required()
+                    not self._store._strict_mode()
                     and not self._live_session_pids(account_num, email)
                 ):
                     sdir = session_dir_for(self.backup_dir, account_num, email)
@@ -2958,6 +2983,8 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "required_mode_unsupported")
         except StashManifestCorruptError:
             return oauth.RefreshOutcome(None, "stash_manifest_corrupt")
+        except KeychainItemPresentError:
+            return oauth.RefreshOutcome(None, "keychain_item_present")
         except StoresDisagreeError:
             return oauth.RefreshOutcome(None, "stores-disagree")
         except ReloginRequiredError:
@@ -3403,7 +3430,7 @@ class ClaudeAccountSwitcher:
                 oauth.credential_fingerprint(value) in seen for _, value in links
             ):
                 raise CredentialReadError("stash successors form a cycle or too long a chain")
-            if len(links) > 1 and self._store._keychain_is_required():
+            if len(links) > 1 and self._store._strict_mode():
                 raise CredentialReadError("two recorded successors of one token")
             link_id, creds = max(links, key=lambda link: credential_generation(link[1]))
             chain.append(link_id)
@@ -3610,7 +3637,7 @@ class ClaudeAccountSwitcher:
         )
 
         # Required mode stops at any session profile, and orders nothing by expiry.
-        if self._store._keychain_is_required():
+        if self._store._strict_mode():
             return None
         session_dir = self._session_dir(account_num, email)
         if is_session_stale(session_dir):
@@ -3678,7 +3705,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import profile_is_quiescent, read_session_identity
 
         # Required mode stops at any session profile.
-        if self._store._keychain_is_required():
+        if self._store._strict_mode():
             return False
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
@@ -4874,7 +4901,7 @@ class ClaudeAccountSwitcher:
         with self._required_mode_section():
             # Required mode: a switch can land between the checks above and these locks,
             # so check again and commit what the roster says now, not the earlier read.
-            if self._store._keychain_is_required():
+            if self._store._strict_mode():
                 data = self._get_sequence_data() or {}
                 now = data.get("accounts", {}).get(account_num)
                 fields = ("email", "organizationUuid", "uuid")
@@ -5190,7 +5217,7 @@ class ClaudeAccountSwitcher:
                 #   backup.
                 if not self._live_identity_matches(email, org_uuid):
                     return _defer(force_refresh)
-                required = self._store._keychain_is_required()
+                required = self._store._strict_mode()
                 self._required_mode_gate()
                 # A successor an earlier pass could not persist: nothing below
                 # may POST past it, the generation it supersedes is spent.

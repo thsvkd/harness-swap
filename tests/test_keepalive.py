@@ -566,7 +566,7 @@ class TestReport:
         assert json.loads(path.read_text(encoding="utf-8")) == report
         assert list(report) == [
             "schemaVersion", "checkedAt", "ok", "action", "note", "activeSlot",
-            "accessExpiresAt", "loginExpiresAt", "error",
+            "accessExpiresAt", "loginExpiresAt", "error", "store", "keychainItemPresent",
         ]
         assert report["schemaVersion"] == 1 and isinstance(report["checkedAt"], float)
         if os.name == "posix":

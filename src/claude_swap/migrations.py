@@ -295,7 +295,7 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     may prompt once. This branch is dormant while ``keyring`` is a dependency; it
     exists so a future ``keyring`` removal can't strand a long-absent user.
     """
-    if switcher.platform != Platform.MACOS:
+    if not switcher._store._has_keychain():
         return False
     if not switcher.sequence_file.exists():
         return False  # No managed accounts yet — let a later restore migrate.

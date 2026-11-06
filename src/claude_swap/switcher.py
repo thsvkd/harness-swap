@@ -28,7 +28,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import consumed_grants, oauth, pace
+from claude_swap import oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -2909,8 +2909,6 @@ class ClaudeAccountSwitcher:
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
             chain, creds = self.stash_chain_terminal(manifest, is_ours, entry_id, creds, cur_fp)
-            if self._slot_outranks_stash(account_num, email, cur_fp, creds):
-                continue
             self._write_account_credentials(account_num, email, creds)
             # The stash holds the only sure copy until the slot provably does.
             if self._store._read_account_credentials(account_num, email) != creds:
@@ -2939,30 +2937,6 @@ class ClaudeAccountSwitcher:
                 "its generation"
             )
         return None
-
-    def _slot_outranks_stash(
-        self, account_num: str, email: str, matched_fp: str, successor: str
-    ) -> bool:
-        """A live store matched this entry, but the slot already moved past it: it holds
-        an unspent login no older than the successor, and adopting would overwrite it.
-
-        An older slot copy does not count, even off the ledger. That is a slot a rotation
-        behind, whose token was spent by whoever rotated it, and the successor is the
-        only way forward. The ledger only knows the POSTs it saw.
-        """
-        stored, unreadable = self._read_account_credentials_ex(account_num, email)
-        if unreadable:
-            raise CredentialReadError(f"account {account_num}'s stored credential is unreadable")
-        fingerprint = oauth.credential_fingerprint(stored)
-        return bool(
-            stored
-            # Matched through the slot itself: the entry says that very token is spent.
-            and fingerprint != matched_fp
-            and fingerprint != oauth.credential_fingerprint(successor)
-            and (oauth.extract_oauth_data(stored) or {}).get("refreshToken")
-            and consumed_grants.entry(fingerprint) is None
-            and credential_generation(stored) >= credential_generation(successor)
-        )
 
     def stash_chain_terminal(
         self, manifest: dict, is_ours, entry_id: str, creds: str, start_fp: str | None

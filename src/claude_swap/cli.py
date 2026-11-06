@@ -1038,6 +1038,84 @@ def _keychain_selftest_command(argv: list[str]) -> None:
     finish({"ok": True}, "Keychain round trip ok", 0)
 
 
+def _migrate_store_command(argv: list[str]) -> None:
+    """Handle `cswap migrate-store --to file --keep {file,keychain} [--dry-run] [--json]`
+    and `cswap migrate-store --restore-keychain ACCOUNT [--json]`. Pre-dispatched like
+    `keepalive`."""
+    from claude_swap.migrate_store import run_migrate_store, run_restore_keychain
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} migrate-store",
+        description=(
+            "Move this Mac to the file credential store: keep one login in the credentials "
+            "file, back up every Claude Code Keychain item inside the login keychain, and "
+            "delete the originals. Needs the login keychain readable, so run it from the GUI "
+            "session or after `security unlock-keychain` in the same shell. macOS only. "
+            "Exit code 0 when ok, 1 otherwise."
+        ),
+    )
+    parser.add_argument("--to", choices=("file",), help="The store to move to")
+    parser.add_argument(
+        "--keep",
+        choices=("file", "keychain"),
+        help="Which login survives: the store whose writer refreshed last",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Report the plan and write nothing"
+    )
+    parser.add_argument(
+        "--restore-keychain",
+        metavar="BACKUP_ACCOUNT",
+        help="Rollback: write this backup back as the Claude Code Keychain item",
+    )
+    parser.add_argument("--json", action="store_true", help="Print the report as JSON on stdout")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.restore_keychain:
+        if args.to or args.keep or args.dry_run:
+            parser.error("--restore-keychain cannot be combined with --to, --keep or --dry-run")
+    elif not (args.to and args.keep):
+        parser.error("--to file and --keep file|keychain are required")
+
+    def finish(report: dict, text: str) -> None:
+        if args.json:
+            print(json.dumps(report, indent=2))
+        elif report["ok"]:
+            print(text)
+        else:
+            error(f"Error: {report['error']['message']}")
+        sys.exit(0 if report["ok"] else 1)
+
+    if Platform.detect() != Platform.MACOS:
+        finish(
+            {
+                "schemaVersion": 1,
+                "ok": False,
+                "error": {"type": "unsupported", "message": "migrate-store is macOS only."},
+            },
+            "",
+        )
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    if args.restore_keychain:
+        finish(
+            run_restore_keychain(switcher, args.restore_keychain),
+            "Restored the Keychain item; the backup stays. To go back to the Keychain for "
+            "good, also run: config unset credentials.store",
+        )
+    report = run_migrate_store(switcher, args.keep, dry_run=args.dry_run)
+    if args.dry_run:
+        finish(report, "\n".join(report.get("plan", [])))
+    finish(report, f"Migrated: the {args.keep} login is kept and credentials.store is file.")
+
+
 def _keepalive_command(argv: list[str]) -> None:
     """Handle `cswap keepalive [--ahead SECONDS] [--ensure-file] [--dry-run]
     [--adopt {file,keychain}] [--json]`.
@@ -1382,6 +1460,9 @@ def main() -> None:
     if argv and argv[0] == "keychain-selftest":
         _keychain_selftest_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "migrate-store":
+        _migrate_store_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1455,6 +1536,7 @@ Commands:
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s keepalive                  sync and refresh the active login ahead of expiry
   %(prog)s keychain-selftest          check a credential survives a Keychain write
+  %(prog)s migrate-store              move a macOS login to the file credential store
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

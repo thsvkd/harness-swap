@@ -51,6 +51,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    credential_generation,
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -118,6 +119,7 @@ KEYRING_SERVICE = "claude-code"
 # How long a display path may reuse the keychain preflight (three `security`
 # spawns); a dashboard repaints every few seconds. Writers always re-ask.
 KEYCHAIN_GATE_TTL_S = 30.0
+STASH_CHAIN_MAX = 16
 # (storage concerns); re-exported above for migrations.py and the test suite.
 
 # Setup-tokens are inference-only server-side; wider scopes trigger 403s
@@ -2817,13 +2819,16 @@ class ClaudeAccountSwitcher:
                 "lists them, `--purge` drops one)"
             )
         own_org = self.account_identity(account_num)["organizationUuid"]
-        for entry_id, meta in manifest.items():
+
+        def is_ours(meta: dict) -> bool:
             # By account: the slot this row was parked under may have moved. Only
             # rows from before the identity was recorded still go by the number.
             if "email" in meta:
-                if (meta["email"], meta.get("organizationUuid", "")) != (email, own_org):
-                    continue
-            elif meta.get("configSlot") != account_num:
+                return (meta["email"], meta.get("organizationUuid", "")) == (email, own_org)
+            return meta.get("configSlot") == account_num
+
+        for entry_id, meta in manifest.items():
+            if not is_ours(meta):
                 continue
             if meta.get("consumedFp") != cur_fp:
                 if meta.get("reason") == "consume-gate-cas-conflict":
@@ -2903,6 +2908,7 @@ class ClaudeAccountSwitcher:
             # cannot raise past its own store write. Open-coding the split
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
+            chain, creds = self.stash_chain_terminal(manifest, is_ours, entry_id, creds, cur_fp)
             self._write_account_credentials(account_num, email, creds)
             # The stash holds the only sure copy until the slot provably does.
             if self._store._read_account_credentials(account_num, email) != creds:
@@ -2911,7 +2917,8 @@ class ClaudeAccountSwitcher:
             # advanced, so a raise would report a failed refresh for a
             # credential the store holds. A stale row is retried next pass or
             # dropped with `cswap unclaimed --purge`.
-            self._retire_stash_entry(entry_id, account_num)
+            for link in chain:
+                self._retire_stash_entry(link, account_num)
             self._logger.info(
                 "Adopted account %s's stashed successor (%s): the stored "
                 "generation was already consumed by the gate pass that "
@@ -2930,6 +2937,44 @@ class ClaudeAccountSwitcher:
                 "its generation"
             )
         return None
+
+    def stash_chain_terminal(
+        self, manifest: dict, is_ours, entry_id: str, creds: str, start_fp: str | None
+    ) -> tuple[list[str], str]:
+        """Follow ``consumedFp`` from a matched entry to the newest successor, since an
+        intermediate one is spent and must not reach a store. Returns the entries
+        walked and the terminal credential. A cycle, a chain past
+        ``STASH_CHAIN_MAX`` or an unreadable link raises ``CredentialReadError``, which
+        defers: nothing is written or POSTed and every entry stays.
+        """
+        chain = [entry_id]
+        seen = {start_fp, oauth.credential_fingerprint(creds)}
+        while True:
+            fingerprint = oauth.credential_fingerprint(creds)
+            links = []
+            for link_id, meta in manifest.items():
+                if (
+                    link_id in chain
+                    or meta.get("consumedFp") != fingerprint
+                    or meta.get("reason") == "consume-gate-cas-conflict"
+                    or not is_ours(meta)
+                ):
+                    continue
+                value, unreadable = self._store._read_unclaimed_credential(link_id)
+                if unreadable:
+                    raise CredentialReadError(f"stash entry {link_id} is unreadable")
+                # The same refresh token again: a server that did not rotate.
+                if value and oauth.credential_fingerprint(value) != fingerprint:
+                    links.append((link_id, value))
+            if not links:
+                return chain, creds
+            if len(chain) >= STASH_CHAIN_MAX or any(
+                oauth.credential_fingerprint(value) in seen for _, value in links
+            ):
+                raise CredentialReadError("stash successors form a cycle or too long a chain")
+            link_id, creds = max(links, key=lambda link: credential_generation(link[1]))
+            chain.append(link_id)
+            seen.add(oauth.credential_fingerprint(creds))
 
     def _record_active_verdict(self, active) -> None:
         """Record THIS thread's active-read verdict (see `_active_verdict_tls`)."""

@@ -219,6 +219,7 @@ class TestCallSites:
         assert [cmd[:2] for cmd in routed] == [
             ["/usr/bin/security", "find-generic-password"],
             ["/usr/bin/security", "find-generic-password"],
+            ["/usr/bin/security", "find-generic-password"],  # the previous value
             ["/usr/bin/security", "-i"],  # the oversized value never spawns
             ["/usr/bin/security", "delete-generic-password"],
         ]

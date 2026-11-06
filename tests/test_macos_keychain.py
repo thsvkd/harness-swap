@@ -91,8 +91,8 @@ def test_set_password_small_payload_uses_security_i_stdin():
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=FakeSecurity()) as run:
         macos_keychain.set_password("svc", "acct", "short-secret")
 
-        args = run.call_args_list[0].args[0]
-        kwargs = run.call_args_list[0].kwargs
+        args = run.call_args_list[1].args[0]  # after reading the previous value
+        kwargs = run.call_args_list[1].kwargs
         assert args == ["/usr/bin/security", "-i"]  # stdin path
         # Secret is NOT in argv; it rides in on stdin as a hex `-X` value.
         assert "short-secret" not in args
@@ -122,8 +122,8 @@ def test_real_credential_sizes_never_reach_argv_and_round_trip(size):
     fake = FakeSecurity()
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake) as run:
         macos_keychain.set_password("Claude Code-credentials", "me", secret)
-    assert run.call_args_list[0].args[0] == ["/usr/bin/security", "-i"]
-    for call in run.call_args_list:  # the read-back too
+    assert ["/usr/bin/security", "-i"] in [call.args[0] for call in run.call_args_list]
+    for call in run.call_args_list:  # the reads too
         argv = " ".join(call.args[0])
         assert secret not in argv and secret.encode().hex() not in argv and "sk-ant" not in argv
     stdin = fake.stdin[0]
@@ -222,7 +222,103 @@ def test_a_value_read_back_as_hex_is_the_same_bytes():
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake) as run:
         macos_keychain.set_password("svc", "acct", secret)
     assert fake.items[("svc", "acct")] == secret
-    assert run.call_count == 2
+    assert run.call_count == 3  # read the previous value, write, read back
+
+
+class TestPreviousValueIsRestored:
+    SECRET = 'new"value' + "x" * 2100
+
+    def _corrupt_first_write(self, fake, *, then_fail=False):
+        """Mangles the first write only; optionally fails the one after it."""
+        calls = []
+
+        def mangle(value):
+            calls.append(value)
+            if len(calls) == 1:
+                if then_fail:
+                    fake.write_rc = 45
+                return value.replace('"', "")
+            return value
+
+        fake.mangle = mangle
+
+    def _set(self, fake, value=None):
+        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake):
+            with pytest.raises(macos_keychain.KeychainError) as err:
+                macos_keychain.set_password("svc", "acct", value or self.SECRET)
+        return err.value
+
+    def test_a_mismatch_restores_the_previous_value_and_still_raises(self):
+        fake = FakeSecurity()
+        previous = '{"claudeAiOauth": {"accessToken": "old\\"}}'
+        fake.items[("svc", "acct")] = previous
+        self._corrupt_first_write(fake)
+        error = self._set(fake)
+        assert fake.items[("svc", "acct")] == previous
+        assert len(fake.written) == 2
+        assert previous not in str(error) and self.SECRET not in str(error)
+
+    def test_a_large_previous_value_is_restored_through_the_same_path(self):
+        fake = FakeSecurity()
+        previous = 'old"value\\' + "y" * 2100
+        fake.items[("svc", "acct")] = previous
+        self._corrupt_first_write(fake)
+        self._set(fake)
+        assert fake.items[("svc", "acct")] == previous
+        assert " -w " in fake.stdin[1]
+
+    def test_a_failed_restore_leaves_the_item_alone(self):
+        fake = FakeSecurity()
+        fake.items[("svc", "acct")] = "previous"
+        self._corrupt_first_write(fake, then_fail=True)
+        self._set(fake)
+        assert fake.items[("svc", "acct")] == self.SECRET.replace('"', "")
+        assert fake.deleted == []
+        assert len(fake.written) == 2  # one try, no recursion
+
+    def test_a_restore_that_mangles_too_does_not_recurse(self):
+        fake = FakeSecurity(mangle=lambda value: value + "!")
+        fake.items[("svc", "acct")] = "previous"
+        self._set(fake)
+        assert len(fake.written) == 2
+        assert fake.deleted == []
+
+    def test_no_previous_item_means_nothing_to_restore_and_nothing_deleted(self):
+        fake = FakeSecurity(mangle=lambda value: value.replace('"', ""))
+        self._set(fake)
+        assert len(fake.written) == 1
+        assert fake.deleted == []
+
+    def test_an_unreadable_previous_value_means_nothing_to_restore(self):
+        fake = FakeSecurity()
+        fake.items[("svc", "acct")] = "previous"
+        self._corrupt_first_write(fake)
+        real_get = macos_keychain.get_password
+        calls = []
+
+        def first_read_fails(service, account):
+            calls.append(1)
+            if len(calls) == 1:
+                raise macos_keychain.KeychainError("denied")
+            return real_get(service, account)
+
+        with patch.object(macos_keychain, "get_password", first_read_fails):
+            self._set(fake)
+        assert len(fake.written) == 1
+
+    def test_a_previous_value_read_back_as_hex_is_not_written_as_text(self):
+        fake = FakeSecurity()
+        fake.items[("svc", "acct")] = "café"  # `-w` prints this as hex
+        self._corrupt_first_write(fake)
+        self._set(fake)
+        assert len(fake.written) == 1
+
+    def test_a_matching_write_writes_once(self):
+        fake = FakeSecurity()
+        fake.items[("svc", "acct")] = "previous"
+        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake):
+            macos_keychain.set_password("svc", "acct", self.SECRET)
+        assert len(fake.written) == 1 and fake.items[("svc", "acct")] == self.SECRET
 
 
 class TestSelftest:

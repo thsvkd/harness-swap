@@ -22,7 +22,6 @@ import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from datetime import UTC, datetime
 from typing import NamedTuple
 
 from claude_swap import consumed_grants, macos_keychain, oauth
@@ -51,9 +50,8 @@ _POST_TIMEOUT_S = 6.0
 # The consume lock is named after the slot, so a switch landing while we wait for
 # it means releasing everything and starting over.
 _SLOT_ATTEMPTS = 3
-# Past a refresh token's life (about 30 days), so an entry this old holds nothing
-# that still works.
-_STASH_MAX_AGE_S = 31 * 24 * 3600
+# Clock skew and a server's grace: the login's own expiry is the proof, not this.
+_STASH_LAPSED_MARGIN_S = 24 * 3600
 _UNMANAGED = "unmanaged"  # the stash's and the ledger's name for "no slot"
 
 _MESSAGES = {
@@ -218,19 +216,20 @@ def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict
     store = switcher._store
     keychain, file_creds = _read_stores(store, switcher.platform == Platform.MACOS)
     if not dry_run:
-        _prune_stash(active, keychain, file_creds)
+        _prune_stash(active)
     if not keychain and not file_creds:
         if store._read_managed_key():
             report["note"] = "api_key"  # nothing here to sync or refresh
             return None, None
         raise _Stop("no_credentials")
 
-    backup, parked_entry = _adopted_backup(active, keychain, file_creds, dry_run)
+    backup, parked_entries = _adopted_backup(active, keychain, file_creds, dry_run)
     final = _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run)
-    if parked_entry:
+    if parked_entries:
         if not _store_holds(store, switcher.platform == Platform.MACOS, backup):
             raise _Stop("refresh_failed", _FILE_NOT_UPDATED)
-        switcher._retire_stash_entry(parked_entry, _UNMANAGED)
+        for entry_id in parked_entries:
+            switcher._retire_stash_entry(entry_id, _UNMANAGED)
     token_account = None
     if _due(final, ahead):
         _refuse_spent(final)
@@ -254,68 +253,32 @@ def _read_stores(store, macos: bool) -> tuple[str, str]:
     return keychain, file_creds if file_creds.strip() else ""
 
 
-def _entry_age_s(store, entry_id: str, row: dict) -> float | None:
-    try:
-        created = datetime.strptime(str(row.get("createdAt")), "%Y-%m-%dT%H:%M:%SZ")
-        return time.time() - created.replace(tzinfo=UTC).timestamp()
-    except ValueError:
-        pass
-    try:
-        return time.time() - store._stash_entry_path(entry_id).stat().st_mtime
-    except OSError:
-        return None
-
-
-def _grant_has_successor(
-    active, recorded: dict, fingerprint: str, value: str, rows: dict, live: tuple
-) -> bool:
-    """A successor of this spent grant provably exists elsewhere: another entry names
-    it as what it replaced, or a store of that account holds a newer unspent login."""
-    if any(row.get("consumedFp") == fingerprint for row in rows.values()):
-        return True
-    switcher = active.switcher
-    account = (recorded["email"], recorded["organizationUuid"])
-    holders = []
-    for num, row in active.accounts.items():
-        if (row.get("email"), row.get("organizationUuid", "") or "") == account:
-            holders.append(switcher._read_account_credentials_ex(num, row.get("email", ""))[0])
-    if account == active.identity:
-        holders += live
-    return any(
-        creds
-        and _oauth_payload(creds).get("refreshToken")
-        and not _is_spent(creds)
-        and credential_generation(creds) > credential_generation(value)
-        for creds in holders
-    )
-
-
-def _prune_stash(active, keychain, file_creds) -> None:
-    """Stash entries are base64 on disk, so they do not stay past their use. An entry
-    goes when its grant is consumed and has a successor elsewhere, or when it is too
-    old to hold a working token. When unsure it stays, and a reservation always does."""
+def _prune_stash(active) -> None:
+    """Stash entries are base64 on disk, so one goes once its own login has provably
+    lapsed. An unknown lifetime stays until `unclaimed --purge`, as does anything a
+    successor chain or a reservation still points at."""
     switcher = active.switcher
     store = switcher._store
     if store._read_stash_manifest_ex()[1] != "ok":
         return  # orphan files could be the only record: see _adopt_stashed_successor
     rows = store._list_unclaimed_credentials()
-    for entry_id, row in rows.items():
+    pointed_at = {row.get("consumedFp") for row in rows.values()}
+    for entry_id in rows:
         value, unreadable = store._read_unclaimed_credential(entry_id)
-        fingerprint = row.get("fingerprint") or oauth.credential_fingerprint(value)
-        if unreadable or not fingerprint:
+        if unreadable or not value:
             continue
+        lapsed_at = _oauth_payload(value).get("refreshTokenExpiresAt")
+        if isinstance(lapsed_at, bool) or not isinstance(lapsed_at, (int, float)):
+            continue
+        if lapsed_at > (time.time() - _STASH_LAPSED_MARGIN_S) * 1000:
+            continue
+        fingerprint = oauth.credential_fingerprint(value)
         recorded = consumed_grants.entry(fingerprint)
-        if recorded is not None and recorded["state"] == consumed_grants.RESERVED:
-            continue
-        others = {other: r for other, r in rows.items() if other != entry_id}
-        age = _entry_age_s(store, entry_id, row)
-        if (age is not None and age > _STASH_MAX_AGE_S) or (
-            recorded is not None
-            and _grant_has_successor(
-                active, recorded, fingerprint, value, others, (keychain, file_creds)
-            )
+        if fingerprint in pointed_at or (
+            recorded is not None and recorded["state"] == consumed_grants.RESERVED
         ):
-            switcher._retire_stash_entry(entry_id, active.slot or _UNMANAGED)
+            continue
+        switcher._retire_stash_entry(entry_id, active.slot or _UNMANAGED)
 
 
 def _store_holds(store, macos: bool, parked: str) -> bool:
@@ -347,36 +310,42 @@ def _slot_copy(switcher, slot: str, email: str) -> str:
     return value
 
 
-def _adopted_backup(active, keychain, file_creds, dry_run) -> tuple[str, str | None]:
+def _adopted_backup(active, keychain, file_creds, dry_run) -> tuple[str, list[str]]:
     """The slot's copy, after adopting a successor parked for what the stores
     still hold: posting past it would present a spent token. A login with no slot
-    has only the stash, whose copy plays the same part. Returns the entry to retire."""
+    has only the stash, whose copy plays the same part. Returns the entries to retire."""
     switcher = active.switcher
     email = active.identity[0] if active.identity else ""
     backup = ""
     if active.slot:
         backup = _slot_copy(switcher, active.slot, email)
     if dry_run:
-        return backup, None
+        return backup, []
     held = [creds for creds in (backup, keychain, file_creds) if creds]
     if active.slot:
         for creds in held:
             adopted = switcher._adopt_stashed_successor(active.slot, email, creds)
             if adopted:
-                return adopted, None
-        return backup, None
+                return adopted, []
+        return backup, []
     spent = {oauth.credential_fingerprint(creds) for creds in held}
     identity = active.identity or ("", "")
-    for entry_id, row in switcher._store._read_stash_manifest().items():
-        if (
-            (row.get("email"), row.get("organizationUuid")) == identity
-            and str(row.get("reason", "")).startswith("keepalive-")
-            and row.get("consumedFp") in spent
-        ):
+
+    def is_ours(row: dict) -> bool:
+        return (row.get("email"), row.get("organizationUuid")) == identity and str(
+            row.get("reason", "")
+        ).startswith("keepalive-")
+
+    manifest = switcher._store._read_stash_manifest()
+    for entry_id, row in manifest.items():
+        if is_ours(row) and row.get("consumedFp") in spent:
             parked, _ = switcher._store._read_unclaimed_credential(entry_id)
             if parked:
-                return parked, entry_id
-    return backup, None
+                chain, terminal = switcher.stash_chain_terminal(
+                    manifest, is_ours, entry_id, parked, row.get("consumedFp")
+                )
+                return terminal, chain
+    return backup, []
 
 
 def _oauth_payload(credentials: str) -> dict:
@@ -408,7 +377,8 @@ def _belongs(active, credentials: str, backup: str, *, probe: bool) -> bool | No
     """Is this copy the current identity's login? None when nothing can tell."""
     switcher = active.switcher
     fingerprint = oauth.credential_fingerprint(credentials)
-    if active.slot and backup and fingerprint == oauth.credential_fingerprint(backup):
+    # `backup` is the slot's copy, or a stash entry recorded for this identity.
+    if backup and fingerprint == oauth.credential_fingerprint(backup):
         return True
     recorded = consumed_grants.entry(fingerprint)
     if recorded is not None:
@@ -474,9 +444,12 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
 
     authoritative = max(candidates, key=rank)
     generation = credential_generation(authoritative)
+    # Only this account's: another account's spent token says nothing about this one.
     spent_newer = [
         creds for creds in live
-        if _is_spent(creds) and credential_generation(creds) > generation
+        if belongs(creds) is True
+        and _is_spent(creds)
+        and credential_generation(creds) > generation
     ]
     if spent_newer and not dry_run:
         # An older copy of a chain whose newer link is spent was very likely spent
@@ -490,14 +463,13 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
         if loser == authoritative or oauth.credential_fingerprint(loser) == fingerprint:
             continue
         verdict = belongs(loser)
-        if loser not in spent_newer and (
-            verdict is True or _is_wiped(loser)
-        ):
+        same_account = verdict is True and belongs(authoritative) is True
+        if loser not in spent_newer and (same_account or _is_wiped(loser)):
             continue  # a stale generation of this login is not a split
         if verdict is False:
             report["note"] = "split_brain"
         if not dry_run:
-            _stash_loser(active, loser)
+            _stash_loser(active, loser, verdict)
 
     # The engine's composition with the Keychain as the live store: it wins the
     # machine-shared fields (mcpOAuth, ...), the login comes from the winner.
@@ -572,9 +544,26 @@ def _is_wiped(credentials: str) -> bool:
     return bool(payload) and not payload.get("accessToken") and not payload.get("refreshToken")
 
 
-def _stash_loser(active, loser: str) -> None:
+def _loser_identity(active, loser: str, verdict: bool | None) -> tuple[str, str]:
+    """Whose this copy is, as far as anything says; empty when nothing does."""
+    if verdict is True:
+        return active.identity or ("", "")
+    fingerprint = oauth.credential_fingerprint(loser)
+    recorded = consumed_grants.entry(fingerprint)
+    if recorded is not None:
+        return (recorded["email"], recorded["organizationUuid"])
+    for num, account in active.accounts.items():
+        email = account.get("email", "")
+        other = active.switcher._read_account_credentials_ex(num, email)[0]
+        if other and oauth.credential_fingerprint(other) == fingerprint:
+            return (email, account.get("organizationUuid", "") or "")
+    return ("", "")
+
+
+def _stash_loser(active, loser: str, verdict: bool | None) -> None:
     store = active.switcher._store
     fingerprint = oauth.credential_fingerprint(loser)
+    email, org_uuid = _loser_identity(active, loser, verdict)
     try:
         if any(
             row.get("fingerprint") == fingerprint
@@ -586,8 +575,8 @@ def _stash_loser(active, loser: str) -> None:
             {
                 "reason": "keepalive-split-brain",
                 "configSlot": active.slot or _UNMANAGED,
-                "email": (active.identity or ("", ""))[0],
-                "organizationUuid": (active.identity or ("", ""))[1],
+                "email": email,
+                "organizationUuid": org_uuid,
                 "fingerprint": fingerprint,
             },
         )

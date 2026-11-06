@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -170,6 +171,21 @@ def item_exists(service: str, account: str) -> bool:
     return result.returncode == 0
 
 
+def _value_argument(password: str, prefix: str) -> str:
+    """The value as the command line carries it: hex when that fits the line buffer,
+    else quoted. Raises :class:`KeychainError` when neither does."""
+    argument = f"-X {password.encode('utf-8').hex()}"
+    if len(f"{prefix} {argument}\n".encode()) <= SECURITY_STDIN_LINE_LIMIT:
+        return argument
+    # A line ends at a newline whatever the quoting, and argv ends at NUL.
+    if "\n" in password or "\0" in password:
+        raise KeychainError("value has a line break security -i cannot carry")
+    argument = f"-w {_quote(password)}"
+    if len(f"{prefix} {argument}\n".encode()) > SECURITY_STDIN_LINE_LIMIT:
+        raise KeychainError("value is too long for security -i's line buffer")
+    return argument
+
+
 def set_password(service: str, account: str, password: str) -> None:
     """Create or update a generic-password item (``-U``).
 
@@ -179,16 +195,32 @@ def set_password(service: str, account: str, password: str) -> None:
     does a non-zero exit, a timeout, or an item that does not read back as what was
     sent: `security -i` exits 0 whatever its quoting did to the value. Messages
     carry no argv, no stderr and no value.
+
+    On that mismatch the previous value is written back once, so a bad write does
+    not leave Claude Code reading a corrupt item. If that fails too the item is left
+    as it is: deleting could destroy a newer token a concurrent writer just stored.
     """
     prefix = f"add-generic-password -U -a {_quote(account)} -s {_quote(service)}"
-    command = f"{prefix} -X {password.encode('utf-8').hex()}\n"
-    if len(command.encode("utf-8")) > SECURITY_STDIN_LINE_LIMIT:
-        # A line ends at a newline whatever the quoting, and argv ends at NUL.
-        if "\n" in password or "\0" in password:
-            raise KeychainError("value has a line break security -i cannot carry")
-        command = f"{prefix} -w {_quote(password)}\n"
-        if len(command.encode("utf-8")) > SECURITY_STDIN_LINE_LIMIT:
-            raise KeychainError("value is too long for security -i's line buffer")
+    command = f"{prefix} {_value_argument(password, prefix)}\n"
+    try:
+        previous = get_password(service, account)
+    except KEYCHAIN_ERRORS:
+        previous = None  # nothing to restore
+    _send_write(command)
+    # `-w` prints the whole value as hex if any byte is not printable: same bytes.
+    if get_password(service, account) in (password, password.encode("utf-8").hex()):
+        return
+    # All hex can be that printed form, and writing it back would store the wrong
+    # bytes. Real values here are JSON or an sk-ant key.
+    if previous and not re.fullmatch("[0-9a-f]+", previous):
+        try:
+            _send_write(f"{prefix} {_value_argument(previous, prefix)}\n")
+        except KEYCHAIN_ERRORS:
+            pass
+    raise KeychainError("security add-generic-password stored a different value")
+
+
+def _send_write(command: str) -> None:
     try:
         result = spawn.run(
             [_SECURITY, "-i"],
@@ -204,9 +236,6 @@ def set_password(service: str, account: str, password: str) -> None:
         ) from None
     if result.returncode != 0:
         raise KeychainError(f"security add-generic-password failed (rc={result.returncode})")
-    # `-w` prints the whole value as hex if any byte is not printable: same bytes.
-    if get_password(service, account) not in (password, password.encode("utf-8").hex()):
-        raise KeychainError("security add-generic-password stored a different value")
 
 
 def delete_password(service: str, account: str) -> None:

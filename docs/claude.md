@@ -170,6 +170,7 @@ hswap claude run 2                     # Run an account in this terminal only (s
 hswap claude auto                      # Auto-switch when nearing rate limits (see above)
 hswap claude keepalive                 # Sync the active login's stores and refresh it ahead of expiry
 hswap claude keychain-selftest         # Check a credential-sized value survives a Keychain write (macOS)
+hswap claude migrate-store --to file --keep file   # Move an SSH-only Mac to the file store (macOS)
 hswap claude config                    # Show or edit settings (see Configuration below)
 hswap claude list                      # Show all accounts with 5h/7d usage and reset times
 hswap claude list --token-status       # Add source-labelled OAuth token diagnostics
@@ -220,7 +221,7 @@ The original flag spellings (`hswap claude --switch`, `hswap claude --list`, ...
 | Platform | Credentials | Config backups |
 |----------|-------------|----------------|
 | Windows | File-based (inside the backup directory, under `credentials/`) | `~/.claude-swap-backup/` |
-| macOS | macOS Keychain | `~/.claude-swap-backup/` |
+| macOS | macOS Keychain (with `credentials.store=file`: file-based, see [the file store](#keeping-an-ssh-only-mac-logged-in-file-store)) | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
 Session-mode profiles (`hswap claude run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
@@ -273,6 +274,7 @@ hswap claude config set autoswitch.model Fable   # per-model switching (see "aut
 hswap claude config set run.shareHistory true    # every hswap claude run shares chat history (see "run")
 hswap claude config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 hswap claude config set credentials.requireKeychain true  # macOS: never fall back to plaintext (see "headless")
+hswap claude config set credentials.store file   # macOS: logins in the file and .enc only (see "file store")
 hswap claude config unset autoswitch.threshold   # back to the default
 hswap claude config path                         # where settings.json lives
 ```
@@ -498,7 +500,68 @@ Every run, failures and `--dry-run` included, writes `cache/keepalive.json` in t
  "error": null}
 ```
 
-`action` is `none`, `synced-file`, `synced-keychain`, `created-file`, `refreshed` or `adopted`. `error` is null or `{"type", "message"}`, with `type` one of `keychain_unavailable`, `relogin_required`, `split_brain` (no record links two different logins, or the older copy could not be preserved, so nothing was synced), `adopt_refused`, `required_mode_unsupported` (session profiles exist), `stash_manifest_corrupt`, `refresh_failed` (transient), `no_credentials`, `locked` or `unmanaged`, and `ok` is false whenever it is set. `unmanaged` means the login matches no managed slot, and either the stores were still synced and refreshed (see `action`) but nothing backs it up until you run `hswap claude add`, or the stores agree on a token of another managed account while the config names this one, and then nothing was changed. `--dry-run` adds `"dryRun": true` and reports what it would have done. `note` is `api_key` when the active login is a managed key, which has nothing to refresh, and `split_brain` on Linux and Windows when the slot's copy replaced another account's copy in the file.
+`action` is `none`, `synced-file`, `synced-keychain`, `created-file`, `refreshed` or `adopted`. `error` is null or `{"type", "message"}`, with `type` one of `keychain_unavailable`, `keychain_item_present` (file store only), `relogin_required`, `split_brain` (no record links two different logins, or the older copy could not be preserved, so nothing was synced), `adopt_refused`, `required_mode_unsupported` (session profiles exist), `stash_manifest_corrupt`, `refresh_failed` (transient), `no_credentials`, `locked` or `unmanaged`, and `ok` is false whenever it is set. `unmanaged` means the login matches no managed slot, and either the stores were still synced and refreshed (see `action`) but nothing backs it up until you run `hswap claude add`, or the stores agree on a token of another managed account while the config names this one, and then nothing was changed. `--dry-run` adds `"dryRun": true` and reports what it would have done. `note` is `api_key` when the active login is a managed key, which has nothing to refresh, and `split_brain` on Linux and Windows when the slot's copy replaced another account's copy in the file.
+
+The report also carries `store` (`file`, `keychain` when `credentials.requireKeychain` is on, `auto` otherwise) and `keychainItemPresent`. In the file store, `keychainItemPresent` is the guard's answer, and a check that failed counts as `true`. Elsewhere it says whether this run read the Keychain item.
+
+## Keeping an SSH-only Mac logged in (file store)
+
+This is for a Mac used only over SSH and launchd daemons, where the login keychain stays locked. It is off by default: `credentials.store` is `auto`, which is everything above. Elsewhere than macOS the setting does nothing.
+
+**What Claude Code does.** Measured on Claude Code 2.1.319. No setting or environment variable puts Claude Code on a file store on macOS. Its store is Keychain first, with the file as a fallback:
+
+- *Reads:* the Keychain, and then the file if the Keychain is locked or has no item.
+- *Writes:* the Keychain first. If that works and the Keychain held nothing before, Claude Code **deletes the file**. If it fails because the keychain is locked and this process has seen the item, nothing is written anywhere. Any other failure writes the file.
+
+So the only stable file-only state has two parts: **no `Claude Code-credentials*` item in the login keychain, and every Claude Code running where the keychain is locked.** hswap can create the first part. You keep the second.
+
+**Set it up once.** From the GUI session, or after `security unlock-keychain` in the same shell:
+
+```bash
+hswap claude migrate-store --to file --keep file --dry-run   # the plan; writes nothing
+hswap claude migrate-store --to file --keep file             # or --keep keychain
+```
+
+`--keep` names the login that survives, and that should be the store whose writer refreshed last: `file` if a process on the locked side (SSH, a daemon) used the login last, `keychain` if a Claude Code with the keychain open did. Under hswap's locks and Claude Code's, `migrate-store`:
+
+1. Refuses with `keychain_unavailable` and changes nothing if the login keychain is not readable. It also refuses if `--keep` names a store with no refresh token (`no_credentials`), a token the ledger lists as spent (`relogin_required`) or another account's token (`unmanaged`), if session profiles exist, if the stash manifest is unreadable, if `credentials.requireKeychain` is on (`config_conflict`), or if an inactive slot's `.enc` and Keychain backup hold different tokens (`split_brain`; nothing says which is newer, so log in as that account and `add`, or remove the slot).
+2. With `--keep keychain`, writes the Keychain login to `~/.claude/.credentials.json` (0600, atomic). With `--keep file`, the file is not touched.
+3. Gives each slot that needs one a `.enc`. An inactive slot's comes from its Keychain copy. The active slot's comes from the kept login, whatever its Keychain copy says.
+4. Copies every Claude Code Keychain item, and whatever the steps above replace, into the login keychain as service `claude-swap`, account `claude-code-credentials.backup-<UTC time>` or `slot-<n>-<email>.backup-<UTC time>`, through `security -i`'s stdin with a read-back. If any copy fails or does not match, nothing is deleted.
+5. Deletes the originals, checks they are gone, and only then sets `credentials.store=file`.
+
+The slots' own `claude-swap` Keychain items stay where they are, and file mode never reads them.
+
+This step records no lineage, and it puts no Keychain copy in the stash as a rival. You are the tie-break and the kept login is canonical, as with `keepalive --adopt`. What lost is safe in the backups, where rule U does not look. A stash entry for the account that was already there is not touched and stays a rival, so if `keepalive` reports `split_brain` afterwards, run `/login` and `hswap claude add`.
+
+`--json` prints `ok`, `kept`, `fileFingerprint` and `keychainFingerprint` (the first 6 hex digits of each refresh token's SHA-256), `backups` (the backup account names), `slotsMigrated`, `itemAbsent` and `error`. It never prints a token.
+
+**What file mode does.** The active login is the file alone, slot backups are `.enc` files alone, and hswap does not read, write or delete a Keychain credential item or call `security` for one, with two exceptions: the guard below and `migrate-store`. Set it by hand with `hswap claude config set credentials.store file`, or force it with `HSWAP_CREDENTIALS_STORE=file`. The variable can only tighten: no other value turns off a configured `file`. It cannot be combined with `credentials.requireKeychain` or `HSWAP_REQUIRE_KEYCHAIN`, since one forbids the file and the other the Keychain. `config set` refuses the second one, and with both on through the environment or a hand edit, every command except `config` stops with `config_conflict` before it does anything.
+
+Every protection of [keychain-required mode](#keeping-a-headless-machine-logged-in-macos) applies, with the file as the only live store, so the Keychain and the file cannot disagree: the one locked gate, *every copy must agree*, *a copy is kept before it is replaced*, what says one token came before another, the ledger, Claude Code's locks held, `stash_manifest_corrupt` and the stop at session profiles. A slot's `.enc` holding a token no record links to the file's is `split_brain`, and nothing is sent. The commands keychain-required mode refuses are refused here too, with `required_mode_unsupported`. So are `keepalive --adopt`, `keepalive --ensure-file` and `keychain-selftest`.
+
+If the file is missing, `keepalive` reports `no_credentials`.
+
+**The guard.** Before any write or refresh, `keepalive`, `auto`, `switch` and the other commands that write check the login keychain for a `Claude Code-credentials` or `Claude Code-credentials-*` item, by attributes only and with the keychain's path named: `security find-generic-password -s` and `security dump-keychain` without `-d`. Both answer while the keychain is locked, and nothing is decrypted. hswap's own `claude-swap` items do not count. An item means a Claude Code with the keychain open may have written the successor of the file's token there, and sending the file's token could replay a spent one, so the command stops with `keychain_item_present` and changes and sends nothing. A check that fails or times out counts as an item.
+
+**What to avoid.** Do not run `claude` where the keychain is unlocked: at the Mac's own screen, through screen sharing, or in a session after `security unlock-keychain`. One refresh or `/login` there writes the Keychain and deletes the file. Use `/login` over SSH instead, where it writes the file.
+
+**Repair.** When `keepalive` reports `keychain_item_present`, the Keychain holds the newer login, so keep that one, from the GUI session or after `security unlock-keychain`:
+
+```bash
+hswap claude migrate-store --to file --keep keychain
+```
+
+The file and the active slot's `.enc` take the kept login, what they held goes to the Keychain backups, and the next due `keepalive` refreshes once.
+
+**Rollback.** To go back to the Keychain, turn the setting off and restore a backup. Its account name is in the report, under `backups`:
+
+```bash
+hswap claude config unset credentials.store
+hswap claude migrate-store --restore-keychain claude-code-credentials.backup-<UTC time>
+```
+
+The restore writes the backup back as `Claude Code-credentials` with a read-back, and first backs up any item already there. It does not delete the backup. With the setting left on, the restored item makes every command stop with `keychain_item_present`. If `keepalive` then reports `split_brain`, settle it with `--adopt`.
 
 ## Uninstall
 

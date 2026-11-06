@@ -86,7 +86,7 @@ class TestLogFileIsPrivate:
     def test_an_existing_0644_log_and_its_rotated_copies_are_narrowed_at_setup(self, tmp_path):
         paths = [tmp_path / "claude-swap.log", tmp_path / "claude-swap.log.1"]
         for path in paths:
-            path.write_text("old")
+            path.write_text("old", encoding="utf-8")
             path.chmod(0o644)
         self._close(setup_logging(tmp_path))  # logs nothing
         assert [self._mode(path) for path in paths] == [0o600, 0o600]

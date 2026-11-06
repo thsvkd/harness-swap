@@ -509,7 +509,7 @@ def test_timeout_carries_no_command_into_message_chain_or_log(fn, args, tmp_path
     for handler in logger.handlers:
         handler.close()
     rendered = "".join(traceback.format_exception(exc))
-    log_text = (tmp_path / "claude-swap.log").read_text()
+    log_text = (tmp_path / "claude-swap.log").read_text(encoding="utf-8")
     for text in (str(exc), repr(exc), rendered, log_text):
         assert "SECRET-TOKEN" not in text and secret_hex not in text
     assert "KeychainError" in log_text

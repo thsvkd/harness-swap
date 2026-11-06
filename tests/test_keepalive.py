@@ -49,6 +49,14 @@ OWN_ACCOUNT = {"uuid": "uuid-1", "email": "a@example.com", "organizationUuid": "
 OTHER_ACCOUNT = {"uuid": "uuid-9", "email": "z@example.com", "organizationUuid": ""}
 
 
+@pytest.fixture(autouse=True)
+def _macos_store_root():
+    """`get_backup_root()` follows `Platform.detect()`, so on Linux a store made without
+    this and a CLI run that says macOS would each see a different directory."""
+    with patch("claude_swap.models.Platform.detect", return_value=Platform.MACOS):
+        yield
+
+
 class TokenEndpoint:
     """Fake OAuth token endpoint; counts POSTs."""
 
@@ -100,7 +108,7 @@ def env(temp_home, block_real_keychain, endpoint):
             return self.keychain.data[("claude-swap", f"account-{SLOT[0]}-{SLOT[1]}")]
 
         def report_on_disk(self):
-            return json.loads((self.store.backup_dir / "cache" / "keepalive.json").read_text())
+            return json.loads((self.store.backup_dir / "cache" / "keepalive.json").read_text(encoding="utf-8"))
 
         def run(self, **kwargs):
             return run_keepalive(self.store, **kwargs)
@@ -116,7 +124,7 @@ class TestSync:
     def test_nothing_to_do(self, env):
         same = creds()
         env.active(same)
-        env.file.write_text(same)
+        env.file.write_text(same, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, same)
         report = env.run()
         assert report["ok"] is True and report["error"] is None
@@ -127,39 +135,39 @@ class TestSync:
 
     def test_same_lineage_keychain_newer_syncs_the_file(self, env):
         env.active(creds("sk-new", expires_in_s=7200))
-        env.file.write_text(creds("sk-old", expires_in_s=3700))
+        env.file.write_text(creds("sk-old", expires_in_s=3700), encoding="utf-8")
         report = env.run()
         assert report["action"] == "synced-file"
         assert report["note"] is None
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
         assert env.store._store._list_unclaimed_credentials() == {}
 
     def test_same_lineage_file_newer_syncs_the_keychain(self, env):
         newer = creds("sk-new", expires_in_s=7200)
         env.active(creds("sk-old", expires_in_s=3700))
-        env.file.write_text(newer)
+        env.file.write_text(newer, encoding="utf-8")
         report = env.run()
         assert report["action"] == "synced-keychain"
         assert access_token(env.keychain_value()) == "sk-new"
-        assert access_token(env.file.read_text()) == "sk-new"
+        assert access_token(env.file.read_text(encoding="utf-8")) == "sk-new"
 
     def test_tie_goes_to_the_keychain(self, env):
         env.active(creds("sk-k", "rt", expires_in_s=7200))
-        env.file.write_text(env.keychain_value().replace("sk-k", "sk-f"))
+        env.file.write_text(env.keychain_value().replace("sk-k", "sk-f"), encoding="utf-8")
         env.run()
-        assert access_token(env.file.read_text()) == "sk-k"
+        assert access_token(env.file.read_text(encoding="utf-8")) == "sk-k"
 
     def test_only_the_file_exists_writes_the_keychain(self, env):
-        env.file.write_text(creds("sk-file"))
+        env.file.write_text(creds("sk-file"), encoding="utf-8")
         report = env.run()
         assert report["action"] == "synced-keychain"
-        assert env.keychain_value() == env.file.read_text()
+        assert env.keychain_value() == env.file.read_text(encoding="utf-8")
 
     def test_different_account_stashes_the_loser_then_syncs(self, env, monkeypatch):
         winner = creds("sk-win", "rt-win", expires_in_s=7200)
         loser = creds("sk-lose", "rt-lose", expires_in_s=3700)
         env.active(loser)
-        env.file.write_text(winner)
+        env.file.write_text(winner, encoding="utf-8")
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: (
             OTHER_ACCOUNT if token == "sk-lose" else OWN_ACCOUNT
         ))
@@ -176,19 +184,19 @@ class TestSync:
     def test_different_account_file_loses_too(self, env, monkeypatch):
         env.active(creds("sk-win", "rt-win", expires_in_s=7200))
         loser = creds("sk-lose", "rt-lose", expires_in_s=3700)
-        env.file.write_text(loser)
+        env.file.write_text(loser, encoding="utf-8")
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: (
             OTHER_ACCOUNT if token == "sk-lose" else OWN_ACCOUNT
         ))
         report = env.run()
         assert report["action"] == "synced-file" and report["note"] == "split_brain"
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
 
     def test_a_failed_stash_syncs_nothing(self, env, monkeypatch):
         keychain_copy = creds("sk-lose", "rt-lose", expires_in_s=3700)
         file_copy = creds("sk-win", "rt-win", expires_in_s=7200)
         env.active(keychain_copy)
-        env.file.write_text(file_copy)
+        env.file.write_text(file_copy, encoding="utf-8")
         monkeypatch.setattr(
             env.store._store,
             "_write_unclaimed_credential",
@@ -197,14 +205,14 @@ class TestSync:
         report = env.run()
         assert report["ok"] is False and report["error"]["type"] == "split_brain"
         assert env.keychain_value() == keychain_copy
-        assert env.file.read_text() == file_copy
+        assert env.file.read_text(encoding="utf-8") == file_copy
 
     def test_a_wiped_copy_never_wins(self, env):
         # Claude Code empties the token fields on invalid_grant, keeping the date.
         wiped = json.loads(creds("x", "y", expires_in_s=99999))
         wiped["claudeAiOauth"].update(accessToken="", refreshToken="")
         env.active(json.dumps(wiped))
-        env.file.write_text(creds("sk-good", "rt-good"))
+        env.file.write_text(creds("sk-good", "rt-good"), encoding="utf-8")
         report = env.run()
         assert report["action"] == "synced-keychain"
         assert access_token(env.keychain_value()) == "sk-good"
@@ -212,10 +220,11 @@ class TestSync:
     def test_shared_fields_stay_with_the_live_store(self, env):
         env.active(creds("sk-old", expires_in_s=3700, mcpOAuth={"s": "live"}))
         env.file.write_text(
-            creds("sk-new", expires_in_s=7200, mcpOAuth={"s": "stale"}, trustedDeviceToken="dev")
+            creds("sk-new", expires_in_s=7200, mcpOAuth={"s": "stale"}, trustedDeviceToken="dev"),
+            encoding="utf-8",
         )
         env.run()
-        for stored in (env.keychain_value(), env.file.read_text()):
+        for stored in (env.keychain_value(), env.file.read_text(encoding="utf-8")):
             data = json.loads(stored)
             assert data["claudeAiOauth"]["accessToken"] == "sk-new"
             assert data["mcpOAuth"] == {"s": "live"}
@@ -225,7 +234,7 @@ class TestSync:
         env.active(creds())
         report = env.run(ensure_file=True)
         assert report["action"] == "created-file"
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
         if os.name == "posix":
             assert stat.S_IMODE(env.file.stat().st_mode) == 0o600
 
@@ -239,13 +248,13 @@ class TestRefresh:
     def test_near_expiry_posts_once_and_writes_everywhere(self, env):
         near = creds(expires_in_s=NEAR)
         env.active(near)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, near)
         report = env.run()
         assert report["ok"] is True and report["action"] == "refreshed"
         assert len(env.post.posts) == 1
         assert env.post.posts[0]["refresh_token"] == "sk-ant-ort01-REFRESH-1"
-        for stored in (env.keychain_value(), env.file.read_text(), env.backup()):
+        for stored in (env.keychain_value(), env.file.read_text(encoding="utf-8"), env.backup()):
             assert access_token(stored) == "sk-ant-oat01-ACCESS-NEW"
         assert report["accessExpiresAt"] > time.strftime("%Y-%m-%dT", time.gmtime())
         # A login's own expiry survives the rotation, and the store remembers it.
@@ -314,7 +323,7 @@ class TestRefresh:
     def test_invalid_grant_is_relogin_required_and_wipes_nothing(self, env):
         near = creds(expires_in_s=NEAR)
         env.active(near)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, near)
         env.post.failure = urllib.error.HTTPError(
             "u", 400, "bad", {}, io.BytesIO(b'{"error":"invalid_grant"}')
@@ -323,7 +332,7 @@ class TestRefresh:
         assert report["ok"] is False and report["error"]["type"] == "relogin_required"
         assert len(env.post.posts) == 1
         assert env.keychain_value() == near
-        assert env.file.read_text() == near
+        assert env.file.read_text(encoding="utf-8") == near
         assert env.backup() == near
         entry = env.store._usage_store.entries(IDENTITY)["1"]
         assert entry.auth_dead_strikes == 1
@@ -355,7 +364,7 @@ class TestRefresh:
     ):
         near = creds(expires_in_s=NEAR)
         env.active(near)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, near)
         real_set = env.keychain.set_password
 
@@ -367,7 +376,7 @@ class TestRefresh:
         monkeypatch.setattr(macos_keychain, "set_password", locked_active_item)
         report = env.run()
         assert report["ok"] is False and report["error"]["type"] == "keychain_unavailable"
-        assert env.file.read_text() == near  # no plaintext fallback
+        assert env.file.read_text(encoding="utf-8") == near  # no plaintext fallback
         assert len(env.post.posts) == 1
 
         # The next run (a new process) must not POST the spent grant: the slot
@@ -380,7 +389,7 @@ class TestRefresh:
         assert report["ok"] is True and report["action"] == "synced-keychain"
         assert len(env.post.posts) == 1
         assert access_token(env.keychain_value()) == "sk-ant-oat01-ACCESS-NEW"
-        assert access_token(env.file.read_text()) == "sk-ant-oat01-ACCESS-NEW"
+        assert access_token(env.file.read_text(encoding="utf-8")) == "sk-ant-oat01-ACCESS-NEW"
 
     def test_unmanaged_write_failure_stashes_the_spent_grants_successor(self, temp_home, block_real_keychain, endpoint, monkeypatch):
         s = macos_store(temp_home, active="stranger@example.com")
@@ -449,7 +458,7 @@ class TestLocks:
 class TestPreflight:
     def test_unreachable_changes_nothing_even_with_the_setting_off(self, env):
         env.active(creds("sk-k", expires_in_s=NEAR))
-        env.file.write_text(creds("sk-f", expires_in_s=NEAR - 10))
+        env.file.write_text(creds("sk-f", expires_in_s=NEAR - 10), encoding="utf-8")
         env.keychain.reachable = False
         before = snapshot(env.home, env.keychain)
         report = env.run()
@@ -460,7 +469,7 @@ class TestPreflight:
         assert env.report_on_disk()["error"]["type"] == "keychain_unavailable"
 
     def test_a_failing_keychain_read_changes_nothing(self, env, monkeypatch):
-        env.file.write_text(creds())
+        env.file.write_text(creds(), encoding="utf-8")
         monkeypatch.setattr(
             macos_keychain,
             "get_password",
@@ -481,13 +490,13 @@ class TestOtherStates:
         s = macos_store(temp_home, active="stranger@example.com")
         file_path = temp_home / ".claude" / ".credentials.json"
         block_real_keychain.data[ACTIVE_ITEM] = creds("sk-k", expires_in_s=NEAR)
-        file_path.write_text(creds("sk-f", expires_in_s=NEAR - 10))
+        file_path.write_text(creds("sk-f", expires_in_s=NEAR - 10), encoding="utf-8")
         report = run_keepalive(s)
         assert report["ok"] is False and report["error"]["type"] == "unmanaged"
         assert report["activeSlot"] is None
         assert report["action"] == "refreshed"
         assert len(endpoint.posts) == 1
-        for stored in (block_real_keychain.data[ACTIVE_ITEM], file_path.read_text()):
+        for stored in (block_real_keychain.data[ACTIVE_ITEM], file_path.read_text(encoding="utf-8")):
             assert access_token(stored) == "sk-ant-oat01-ACCESS-NEW"
 
     def test_api_key_login_has_nothing_to_do(self, env):
@@ -516,7 +525,7 @@ class TestOtherStates:
         env.store.platform = platform
         near = creds(expires_in_s=NEAR)
         env.active(near)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         before = snapshot(env.home, env.keychain)
         report = env.run()
         assert report["ok"] is False and report["error"]["type"] == "refresh_failed"
@@ -527,19 +536,19 @@ class TestOtherStates:
     def test_linux_refreshes_the_file_only(self, env):
         env.store.platform = Platform.LINUX
         near = creds(expires_in_s=NEAR)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, near)
         report = env.run()
         assert report["ok"] is True and report["action"] == "refreshed"
         assert len(env.post.posts) == 1
-        assert access_token(env.file.read_text()) == "sk-ant-oat01-ACCESS-NEW"
+        assert access_token(env.file.read_text(encoding="utf-8")) == "sk-ant-oat01-ACCESS-NEW"
         assert access_token(env.backup()) == "sk-ant-oat01-ACCESS-NEW"
         assert env.keychain.data == {}
 
     def test_linux_needs_no_preflight(self, env):
         env.store.platform = Platform.LINUX
         env.keychain.reachable = False
-        env.file.write_text(creds())
+        env.file.write_text(creds(), encoding="utf-8")
         assert env.run()["ok"] is True
 
 
@@ -548,7 +557,7 @@ class TestReport:
         env.active(creds())
         report = env.run()
         path = env.store.backup_dir / "cache" / "keepalive.json"
-        assert json.loads(path.read_text()) == report
+        assert json.loads(path.read_text(encoding="utf-8")) == report
         assert list(report) == [
             "schemaVersion", "checkedAt", "ok", "action", "note", "activeSlot",
             "accessExpiresAt", "loginExpiresAt", "error",
@@ -573,7 +582,7 @@ class TestReport:
 
     def test_dry_run_changes_nothing_and_says_so(self, env, monkeypatch):
         env.active(creds("sk-k", "rt-a", expires_in_s=NEAR))
-        env.file.write_text(creds("sk-f", "rt-b", expires_in_s=NEAR - 10))
+        env.file.write_text(creds("sk-f", "rt-b", expires_in_s=NEAR - 10), encoding="utf-8")
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: (
             OTHER_ACCOUNT if token == "sk-f" else OWN_ACCOUNT
         ))
@@ -652,14 +661,14 @@ class TestCli:
             n = next(generation)
             secret = creds(f"sk-ant-oat01-SECRET{n}", f"{refresh}{n}", expires_in_s=NEAR)
             env.active(secret)
-            env.file.write_text(secret)
+            env.file.write_text(secret, encoding="utf-8")
             env.store._write_account_credentials(*SLOT, secret)
 
         def outcomes():
             reset()
             yield  # refreshed
             reset()
-            env.file.write_text(creds("sk-ant-oat01-SECRETOTHER", "sk-ant-ort01-SECRETOTHERRT"))
+            env.file.write_text(creds("sk-ant-oat01-SECRETOTHER", "sk-ant-ort01-SECRETOTHERRT"), encoding="utf-8")
             yield  # split brain
             reset()
             env.post.failure = urllib.error.URLError(ConnectionRefusedError(f"token {refresh}"))
@@ -676,7 +685,7 @@ class TestCli:
         seen = []
         for _ in outcomes():
             _, out, err = self._main(["--json", "--debug"], capsys)
-            on_disk = (env.store.backup_dir / "cache" / "keepalive.json").read_text()
+            on_disk = (env.store.backup_dir / "cache" / "keepalive.json").read_text(encoding="utf-8")
             seen.append(json.loads(out)["error"] and json.loads(out)["error"]["type"])
             for text in (out, err, on_disk):
                 assert "SECRET" not in text
@@ -862,7 +871,7 @@ class TestConsumedGrantIsNeverPostedAgain:
         env.store._write_account_credentials(*SLOT, near)
         env.run()
         path = env.store.backup_dir / "cache" / consumed_grants.FILENAME
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         assert oauth.credential_fingerprint(near) in text
         assert "RT-LEDGER" not in text and "sk-ant" not in text
         if os.name == "posix":
@@ -914,7 +923,7 @@ class TestSwitchWhileWaitingR3:
                 keychain.data[ACTIVE_ITEM] = b
                 (home / ".claude.json").write_text(json.dumps({
                     "oauthAccount": {"emailAddress": "b@example.com", "accountUuid": "uuid-2"},
-                }))
+                }), encoding="utf-8")
                 yield
 
         monkeypatch.setattr(keepalive, "claude_credentials_lock", racing)
@@ -963,12 +972,12 @@ class TestSwitchWhileWaitingR3:
         s._write_account_credentials("2", "b@example.com", b)
         block_real_keychain.data[ACTIVE_ITEM] = b
         file_path = temp_home / ".claude" / ".credentials.json"
-        file_path.write_text(a)
+        file_path.write_text(a, encoding="utf-8")
         report = run_keepalive(s)
         assert report["activeSlot"] == 2 and report["action"] == "synced-file"
         assert report["note"] == "split_brain"
         assert block_real_keychain.data[ACTIVE_ITEM] == b
-        assert file_path.read_text() == b
+        assert file_path.read_text(encoding="utf-8") == b
 
     def test_R3_only_the_old_accounts_copy_live_restores_the_slot(
         self, temp_home, block_real_keychain, rotating
@@ -1046,18 +1055,18 @@ class TestGenerationRankR4:
         block_real_keychain.data[ACTIVE_ITEM] = full
         s._write_account_credentials(*SLOT, full)
         file_path = temp_home / ".claude" / ".credentials.json"
-        file_path.write_text(self._access_only(9000))
+        file_path.write_text(self._access_only(9000), encoding="utf-8")
         report = run_keepalive(s)
         assert report["action"] == "synced-file"
         assert block_real_keychain.data[ACTIVE_ITEM] == full
-        assert file_path.read_text() == full
+        assert file_path.read_text(encoding="utf-8") == full
 
     def test_R4_file_with_a_refresh_token_replaces_an_access_only_keychain(
         self, temp_home, block_real_keychain, rotating
     ):
         s = macos_store(temp_home)
         block_real_keychain.data[ACTIVE_ITEM] = self._access_only(9000)
-        (temp_home / ".claude" / ".credentials.json").write_text(creds("AT-F", "RT-F"))
+        (temp_home / ".claude" / ".credentials.json").write_text(creds("AT-F", "RT-F"), encoding="utf-8")
         run_keepalive(s)
         stored = oauth.extract_oauth_data(block_real_keychain.data[ACTIVE_ITEM])
         assert stored["refreshToken"] == "RT-F"
@@ -1072,7 +1081,7 @@ class TestGenerationRankR4:
         s._write_account_credentials("1", "a@example.com", foreign)
         block_real_keychain.data[ACTIVE_ITEM] = foreign
         file_copy = self._access_only(9000)
-        (temp_home / ".claude" / ".credentials.json").write_text(file_copy)
+        (temp_home / ".claude" / ".credentials.json").write_text(file_copy, encoding="utf-8")
         report = run_keepalive(s)
         assert report["ok"] is False and report["error"]["type"] == "split_brain"
         assert block_real_keychain.data[ACTIVE_ITEM] == foreign
@@ -1081,13 +1090,13 @@ class TestGenerationRankR4:
 class TestReportSurvivesR6:
     def test_R6_null_oauth_account_still_reports(self, env, capsys):
         env.active(creds())
-        (env.home / ".claude.json").write_text(json.dumps({"oauthAccount": None}))
+        (env.home / ".claude.json").write_text(json.dumps({"oauthAccount": None}), encoding="utf-8")
         report = env.run()
         assert report["ok"] is False and report["error"]["type"] == "unmanaged"
         assert env.report_on_disk()["error"]["type"] == "unmanaged"
 
     def test_R6_null_oauth_account_does_not_crash_other_commands(self, env):
-        (env.home / ".claude.json").write_text(json.dumps({"oauthAccount": None}))
+        (env.home / ".claude.json").write_text(json.dumps({"oauthAccount": None}), encoding="utf-8")
         assert env.store._get_current_account() is None
 
     def test_R6_any_exception_is_a_report_with_the_type_name_only(
@@ -1101,7 +1110,7 @@ class TestReportSurvivesR6:
         monkeypatch.setattr(env.store, "_get_current_account", boom)
         report = env.run()
         assert report["ok"] is False and report["error"]["type"] == "refresh_failed"
-        on_disk = (env.store.backup_dir / "cache" / "keepalive.json").read_text()
+        on_disk = (env.store.backup_dir / "cache" / "keepalive.json").read_text(encoding="utf-8")
         assert "SECRET" not in on_disk and "/Users" not in on_disk
         assert "SECRET" not in caplog.text
         assert "RuntimeError" in caplog.text
@@ -1118,18 +1127,18 @@ class TestOrdinaryRotationR7:
         assert report["action"] == "synced-file"
         assert report["note"] is None
         assert env.store._store._list_unclaimed_credentials() == {}
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
 
     def test_R7_probe_says_same_account(self, env, monkeypatch):
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000))
+        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000), encoding="utf-8")
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
         self._assert_plain_sync(env, env.run())
 
     def test_R7_loser_lineage_is_the_slot_backup(self, env, monkeypatch):
         older = creds("AT-0", "RT-0", expires_in_s=7000)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(older)
+        env.file.write_text(older, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, older)
         self._loser_needs_no_probe(monkeypatch)
         self._assert_plain_sync(env, env.run())
@@ -1137,7 +1146,7 @@ class TestOrdinaryRotationR7:
     def test_R7_loser_lineage_is_on_the_consumed_ledger(self, env, monkeypatch):
         older = creds("AT-0", "RT-0", expires_in_s=7000)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(older)
+        env.file.write_text(older, encoding="utf-8")
         consumed_grants.record(oauth.credential_fingerprint(older), IDENTITY["1"], consumed_grants.CONSUMED)
         self._loser_needs_no_probe(monkeypatch)
         self._assert_plain_sync(env, env.run())
@@ -1146,7 +1155,7 @@ class TestOrdinaryRotationR7:
         """Round 2, finding 3: its refresh token may be the only live one anywhere."""
         loser = creds("AT-0", "RT-0", expires_in_s=-60)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(loser)
+        env.file.write_text(loser, encoding="utf-8")
         monkeypatch.setattr(
             oauth, "fetch_oauth_profile",
             lambda token: pytest.fail("an expired token cannot be probed") if token == "AT-0" else None,
@@ -1166,7 +1175,7 @@ class TestOrdinaryRotationR7:
         b = creds("AT-B", "RT-B", expires_in_s=7200)
         s._write_account_credentials("2", "b@example.com", b)
         block_real_keychain.data[ACTIVE_ITEM] = a
-        (temp_home / ".claude" / ".credentials.json").write_text(b)
+        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
         report = run_keepalive(s)
         assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-B"
         assert report["action"] == "synced-keychain"
@@ -1179,7 +1188,7 @@ class TestOrdinaryRotationR7:
     ):
         loser = creds("AT-0", "RT-0", expires_in_s=-60)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(loser)
+        env.file.write_text(loser, encoding="utf-8")
         consumed_grants.record(oauth.credential_fingerprint(loser), IDENTITY["1"], state)
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
         env.run()
@@ -1188,7 +1197,7 @@ class TestOrdinaryRotationR7:
     def test_a_copy_on_the_ledger_is_kept_while_the_winner_is_unknown(self, env):
         loser = creds("AT-0", "RT-0", expires_in_s=-60)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(loser)
+        env.file.write_text(loser, encoding="utf-8")
         consumed_grants.record(
             oauth.credential_fingerprint(loser), IDENTITY["1"], consumed_grants.CONSUMED
         )
@@ -1198,7 +1207,7 @@ class TestOrdinaryRotationR7:
 
     def test_the_same_lineage_needs_no_stash(self, env):
         env.active(creds("AT-1", "RT-same", expires_in_s=7200))
-        env.file.write_text(creds("AT-0", "RT-same", expires_in_s=-60))
+        env.file.write_text(creds("AT-0", "RT-same", expires_in_s=-60), encoding="utf-8")
         env.run()
         assert env.store._store._list_unclaimed_credentials() == {}
 
@@ -1206,14 +1215,14 @@ class TestOrdinaryRotationR7:
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
         for i in range(3):
             env.active(creds(f"AT{i + 1}", f"RT{i + 1}", expires_in_s=7200 + 100 * i))
-            env.file.write_text(creds(f"AT{i}", f"RT{i}", expires_in_s=7000 + 100 * i))
+            env.file.write_text(creds(f"AT{i}", f"RT{i}", expires_in_s=7000 + 100 * i), encoding="utf-8")
             assert env.run()["note"] is None
         assert env.store._store._list_unclaimed_credentials() == {}
 
     def test_R7_unattributable_live_copy_is_kept_without_the_note(self, env):
         loser = creds("AT-0", "RT-0", expires_in_s=7000)  # the probe answers nothing
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(loser)
+        env.file.write_text(loser, encoding="utf-8")
         report = env.run()
         assert report["action"] == "synced-file" and report["note"] is None
         stash = env.store._store._list_unclaimed_credentials()
@@ -1224,13 +1233,13 @@ class TestOrdinaryRotationR7:
         loser = creds("AT-0", "RT-0", expires_in_s=7000)
         for _ in range(3):
             env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-            env.file.write_text(loser)
+            env.file.write_text(loser, encoding="utf-8")
             env.run()
         assert len(env.store._store._list_unclaimed_credentials()) == 1
 
     def test_R7_unparseable_copy_is_not_discarded(self, env):
         env.active(creds("AT-1", "RT-1"))
-        env.file.write_text("not json")
+        env.file.write_text("not json", encoding="utf-8")
         env.run()
         assert len(env.store._store._list_unclaimed_credentials()) == 1
 
@@ -1238,12 +1247,12 @@ class TestOrdinaryRotationR7:
 class TestEnsureFileAtomic:
     def test_created_by_rename_and_narrowed_to_0600(self, env):
         env.active(creds())
-        env.file.write_text("old")
+        env.file.write_text("old", encoding="utf-8")
         env.file.chmod(0o644)
         inode = env.file.stat().st_ino
         env.run(ensure_file=True)
         assert env.file.stat().st_ino != inode
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
         if os.name == "posix":
             assert stat.S_IMODE(env.file.stat().st_mode) == 0o600
         assert [p.name for p in env.file.parent.iterdir() if ".credentials" in p.name] == [
@@ -1270,7 +1279,7 @@ class TestFileStoreMustBeUpdated:
     def test_refresh_with_a_stuck_file_is_not_reported_as_success(self, env, monkeypatch):
         near = creds(expires_in_s=NEAR)
         env.active(near)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, near)
         self._failing_file_writes(env, monkeypatch)
         report = env.run()
@@ -1282,13 +1291,13 @@ class TestFileStoreMustBeUpdated:
         # The successor is safe, and the file still holds the spent token.
         assert access_token(env.keychain_value()) == "sk-ant-oat01-ACCESS-NEW"
         assert access_token(env.backup()) == "sk-ant-oat01-ACCESS-NEW"
-        assert env.file.read_text() == near
+        assert env.file.read_text(encoding="utf-8") == near
         assert env.report_on_disk()["ok"] is False
 
     def test_next_run_repairs_the_file_without_a_post(self, env, monkeypatch):
         near = creds(expires_in_s=NEAR)
         env.active(near)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, near)
         with monkeypatch.context() as stuck:
             self._failing_file_writes(env, stuck)
@@ -1297,20 +1306,20 @@ class TestFileStoreMustBeUpdated:
         report = env.run()
         assert report["ok"] is True and report["action"] == "synced-file"
         assert len(env.post.posts) == 1
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
 
     def test_one_failed_write_is_retried(self, env, monkeypatch):
         env.active(creds("sk-new", expires_in_s=7200))
-        env.file.write_text(creds("sk-old", expires_in_s=3700))
+        env.file.write_text(creds("sk-old", expires_in_s=3700), encoding="utf-8")
         calls = self._failing_file_writes(env, monkeypatch, failures=1)
         report = env.run()
         assert report["ok"] is True and report["action"] == "synced-file"
         assert len(calls) == 2
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
 
     def test_a_write_that_lands_wrong_is_caught_by_the_read_back(self, env, monkeypatch):
         env.active(creds("sk-new", expires_in_s=7200))
-        env.file.write_text(creds("sk-old", expires_in_s=3700))
+        env.file.write_text(creds("sk-old", expires_in_s=3700), encoding="utf-8")
         monkeypatch.setattr(
             env.store._store, "_write_active_credentials_file", lambda credentials: None
         )
@@ -1320,7 +1329,7 @@ class TestFileStoreMustBeUpdated:
 
     def test_a_stuck_file_does_not_block_the_refresh(self, env, monkeypatch):
         env.active(creds("sk-k", expires_in_s=NEAR))
-        env.file.write_text(creds("sk-f", expires_in_s=NEAR - 10))
+        env.file.write_text(creds("sk-f", expires_in_s=NEAR - 10), encoding="utf-8")
         env.store._write_account_credentials(*SLOT, env.keychain_value())
         self._failing_file_writes(env, monkeypatch)
         report = env.run()
@@ -1346,14 +1355,14 @@ class TestFileStoreMustBeUpdated:
         """The Keychain write's own file rewrite swallows its failure."""
         near = creds(expires_in_s=NEAR)
         env.active(near)
-        env.file.write_text(near)
+        env.file.write_text(near, encoding="utf-8")
         env.store._write_account_credentials(*SLOT, near)
         monkeypatch.setattr(
             env.store._store, "_refresh_stale_credentials_file", lambda credentials: None
         )
         report = env.run()
         assert report["ok"] is True  # the retry below it repaired the file
-        assert env.file.read_text() == env.keychain_value()
+        assert env.file.read_text(encoding="utf-8") == env.keychain_value()
 
 
 def _timeout_after_rotating(endpoint):
@@ -1478,7 +1487,7 @@ class TestUncertainOutcomeIsNeverRetried:
             oauth.credential_fingerprint(near), IDENTITY["1"], consumed_grants.RESERVED
         )
         newer = creds("AT-9", "RT-9", expires_in_s=20000)
-        (temp_home / ".claude" / ".credentials.json").write_text(newer)
+        (temp_home / ".claude" / ".credentials.json").write_text(newer, encoding="utf-8")
         report = run_keepalive(new_process())
         assert report["ok"] is True and report["action"] == "synced-keychain"
         assert block_real_keychain.data[ACTIVE_ITEM] == newer
@@ -1619,7 +1628,7 @@ class TestLedgerFailsClosed:
         s, _ = self._setup(temp_home, block_real_keychain)
         path = self._ledger(s)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}")
+        path.write_text("{}", encoding="utf-8")
         real = consumed_grants.Path.read_text
 
         def denied(self, *a, **kw):
@@ -1683,7 +1692,7 @@ class TestStashIsRetiredOnlyOnProof:
         s.platform = Platform.LINUX
         file_path = temp_home / ".claude" / ".credentials.json"
         spent = creds("AT-0", "RT-0", expires_in_s=NEAR)
-        file_path.write_text(spent)
+        file_path.write_text(spent, encoding="utf-8")
         successor = creds("AT-1", "RT-1", expires_in_s=28800)
         s.stash_consumed_successor(
             "unmanaged", ("stranger@example.com", ""), successor,
@@ -1709,7 +1718,7 @@ class TestStashIsRetiredOnlyOnProof:
 
         monkeypatch.setattr(s._store, "_write_active_credentials_file", real_write)
         report = run_keepalive(s)
-        assert file_path.read_text() == successor
+        assert file_path.read_text(encoding="utf-8") == successor
         assert s._store._list_unclaimed_credentials() == {}
         assert rotating.posts == []
 
@@ -1763,7 +1772,7 @@ class TestLedgerAttributionByAccount:
         )
         renumber(s)
         keychain.data[ACTIVE_ITEM] = b
-        (temp_home / ".claude" / ".credentials.json").write_text(a)
+        (temp_home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
         return s, a, b
 
     @pytest.mark.parametrize(
@@ -1780,7 +1789,7 @@ class TestLedgerAttributionByAccount:
         s, a, b = self._a_spent_then_slots_renumbered(temp_home, block_real_keychain, renumber)
         report = run_keepalive(new_process())
         assert block_real_keychain.data[ACTIVE_ITEM] == b
-        assert (temp_home / ".claude" / ".credentials.json").read_text() == b
+        assert (temp_home / ".claude" / ".credentials.json").read_text(encoding="utf-8") == b
         assert report["note"] == "split_brain"
         rows = s._store._list_unclaimed_credentials()
         assert [s._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
@@ -1823,7 +1832,7 @@ class TestLedgerAttributionByAccount:
             oauth.credential_fingerprint(spent), IDENTITY["1"], consumed_grants.CONSUMED
         )
         block_real_keychain.data[ACTIVE_ITEM] = spent
-        (temp_home / ".claude" / ".credentials.json").write_text(older)
+        (temp_home / ".claude" / ".credentials.json").write_text(older, encoding="utf-8")
         for _ in range(3):
             report = run_keepalive(new_process())
             assert report["error"]["type"] == "relogin_required"
@@ -1841,7 +1850,8 @@ class TestLedgerAttributionByAccount:
         )
         block_real_keychain.data[ACTIVE_ITEM] = spent
         (temp_home / ".claude" / ".credentials.json").write_text(
-            creds("AT-old", "RT-old", expires_in_s=-60)
+            creds("AT-old", "RT-old", expires_in_s=-60),
+            encoding="utf-8",
         )
         report = run_keepalive(s)
         assert report["action"] == "synced-file"
@@ -1854,7 +1864,7 @@ class TestEveryPostGoesThroughTheHelper:
         found = set()
         root = Path(claude_swap.__file__).parent.parent
         for path in root.rglob("*.py"):
-            tree = ast.parse(path.read_text())
+            tree = ast.parse(path.read_text(encoding="utf-8"))
             for parent in ast.walk(tree):
                 if not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
@@ -1886,7 +1896,7 @@ class TestEveryPostGoesThroughTheHelper:
         assert self._functions_calling("fetch_usage_for_account") == set()
         root = Path(claude_swap.__file__).parent.parent
         for path in root.rglob("*.py"):
-            for node in ast.walk(ast.parse(path.read_text())):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.Call) and getattr(
                     node.func, "attr", getattr(node.func, "id", "")
                 ) == "try_fetch_usage_for_account":
@@ -1902,10 +1912,10 @@ class TestEveryPostGoesThroughTheHelper:
         users = [
             path.name
             for path in root.rglob("*.py")
-            if "OAUTH_TOKEN_URL" in path.read_text() or "oauth/token" in path.read_text()
+            if "OAUTH_TOKEN_URL" in path.read_text(encoding="utf-8") or "oauth/token" in path.read_text(encoding="utf-8")
         ]
         assert users == ["oauth.py"]
-        tree = ast.parse((root / "claude_swap" / "oauth.py").read_text())
+        tree = ast.parse((root / "claude_swap" / "oauth.py").read_text(encoding="utf-8"))
         owners = {
             fn.name
             for fn in ast.walk(tree)
@@ -2051,7 +2061,7 @@ class TestLedgerRetention:
     def _seed(self, rows):
         path = consumed_grants._path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(rows))
+        path.write_text(json.dumps(rows), encoding="utf-8")
         return path
 
     def _row(self, state, age_days):
@@ -2255,11 +2265,15 @@ class TestDryRunChangesNothing:
         s._store._write_backup_enc("2", "b@example.com", creds("AT-b0", "RT-b0", expires_in_s=100))
         block_real_keychain.data[ACTIVE_ITEM] = creds("AT-K", "RT-K", expires_in_s=NEAR)
         (temp_home / ".claude" / ".credentials.json").write_text(
-            creds("AT-F", "RT-F", expires_in_s=NEAR - 10)
+            creds("AT-F", "RT-F", expires_in_s=NEAR - 10),
+            encoding="utf-8",
         )
+        # Constructed first: a new process applies its platform's one-time migrations,
+        # and the snapshot should compare only what the dry run does.
+        process = new_process()
         before = snapshot(temp_home, block_real_keychain)
         assert any(name.endswith(".enc") for name in before["files"])
-        report = run_keepalive(new_process(), dry_run=True, ensure_file=True)
+        report = run_keepalive(process, dry_run=True, ensure_file=True)
         assert report["dryRun"] is True
         assert snapshot(temp_home, block_real_keychain) == before
         assert rotating.posts == []
@@ -2424,8 +2438,10 @@ class TestStashIsPruned:
 
     def test_dry_run_deletes_nothing(self, store, temp_home, block_real_keychain):
         self._stash(store, self._login("0", lapsed_ago_s=30 * self.DAY))
+        # Constructed first: a new process applies its platform's one-time migrations.
+        process = new_process()
         before = snapshot(temp_home, block_real_keychain)
-        assert run_keepalive(new_process(), dry_run=True)["ok"] is True
+        assert run_keepalive(process, dry_run=True)["ok"] is True
         assert snapshot(temp_home, block_real_keychain) == before
 
     def test_an_unreadable_manifest_deletes_nothing(self, store, monkeypatch):
@@ -2465,7 +2481,7 @@ class TestAdoptionFollowsTheChain:
         b = creds("AT-B", "RT-B", expires_in_s=7200)
         c = creds("AT-C", "RT-C", expires_in_s=28000)
         block_real_keychain.data[ACTIVE_ITEM] = a
-        (temp_home / ".claude" / ".credentials.json").write_text(a)
+        (temp_home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
         s._write_account_credentials(*SLOT, a)
         for spent in (a, b):
             consumed_grants.record(
@@ -2483,7 +2499,7 @@ class TestAdoptionFollowsTheChain:
         report = run_keepalive(s)
         assert report["ok"] is True and report["action"] == "synced-keychain"
         assert block_real_keychain.data[ACTIVE_ITEM] == c
-        assert (temp_home / ".claude" / ".credentials.json").read_text() == c
+        assert (temp_home / ".claude" / ".credentials.json").read_text(encoding="utf-8") == c
         assert s._read_account_credentials(*SLOT) == c
         assert rotating.posts == []
         assert s._store._list_unclaimed_credentials() == {}
@@ -2642,12 +2658,12 @@ class TestLoserIsKeptUnlessTheWinnerIsProven:
         unknown = creds("AT-U", "RT-U", expires_in_s=20000)
         block_real_keychain.data[ACTIVE_ITEM] = a
         file_path = temp_home / ".claude" / ".credentials.json"
-        file_path.write_text(unknown)
+        file_path.write_text(unknown, encoding="utf-8")
         monkeypatch.setattr(
             oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT if token == "AT-A" else None
         )
         report = run_keepalive(s)
-        assert block_real_keychain.data[ACTIVE_ITEM] == unknown and file_path.read_text() == unknown
+        assert block_real_keychain.data[ACTIVE_ITEM] == unknown and file_path.read_text(encoding="utf-8") == unknown
         assert report["note"] is None  # nothing says the winner is another account
         rows = s._store._list_unclaimed_credentials()
         assert [s._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
@@ -2665,7 +2681,7 @@ class TestLoserIsKeptUnlessTheWinnerIsProven:
             oauth.credential_fingerprint(a), ("a@example.com", ""), consumed_grants.CONSUMED
         )
         block_real_keychain.data[ACTIVE_ITEM] = b
-        (temp_home / ".claude" / ".credentials.json").write_text(a)
+        (temp_home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
         run_keepalive(s)
         row = next(iter(s._store._list_unclaimed_credentials().values()))
         assert (row["email"], row["organizationUuid"]) == ("a@example.com", "")
@@ -2679,21 +2695,21 @@ class TestLoserIsKeptUnlessTheWinnerIsProven:
         s._write_account_credentials("1", "a@example.com", a)
         s._write_account_credentials("2", "b@example.com", b)
         block_real_keychain.data[ACTIVE_ITEM] = b
-        (temp_home / ".claude" / ".credentials.json").write_text(a)
+        (temp_home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
         run_keepalive(s)
         row = next(iter(s._store._list_unclaimed_credentials().values()))
         assert (row["email"], row["organizationUuid"]) == ("a@example.com", "")
 
     def test_an_unattributed_loser_claims_no_identity(self, env):
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000))
+        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000), encoding="utf-8")
         env.run()
         row = next(iter(env.store._store._list_unclaimed_credentials().values()))
         assert (row["email"], row["organizationUuid"]) == ("", "")
 
     def test_both_proven_is_a_plain_sync(self, env, monkeypatch):
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000))
+        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000), encoding="utf-8")
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
         report = env.run()
         assert report["action"] == "synced-file"
@@ -2711,7 +2727,7 @@ class TestUnknownWinnerStaysOffTheLedger:
             oauth.credential_fingerprint(a), IDENTITY["1"], consumed_grants.CONSUMED
         )
         keychain.data[ACTIVE_ITEM] = a
-        (temp_home / ".claude" / ".credentials.json").write_text(b)
+        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
         return s, a, b
 
     def test_b_is_not_on_the_ledger_and_refreshes_on_the_next_due_run(
@@ -2758,7 +2774,7 @@ class TestAnotherAccountsSpentTokenSaysNothing:
             oauth.credential_fingerprint(a), ("a@example.com", ""), consumed_grants.CONSUMED
         )
         block_real_keychain.data[ACTIVE_ITEM] = b
-        (temp_home / ".claude" / ".credentials.json").write_text(a)
+        (temp_home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
         fingerprint = oauth.credential_fingerprint(b)
 
         real = keepalive._refresh
@@ -2779,7 +2795,7 @@ class TestAnotherAccountsSpentTokenSaysNothing:
         good = creds("AT-G", "RT-G", expires_in_s=7200)
         s._write_account_credentials(*SLOT, good)
         block_real_keychain.data[ACTIVE_ITEM] = good
-        (temp_home / ".claude" / ".credentials.json").write_text(spent)
+        (temp_home / ".claude" / ".credentials.json").write_text(spent, encoding="utf-8")
         consumed_grants.record(
             oauth.credential_fingerprint(spent), ("", ""), consumed_grants.CONSUMED
         )

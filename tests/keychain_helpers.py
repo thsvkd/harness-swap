@@ -57,7 +57,7 @@ def macos_store(home: Path, *, active: str = "a@example.com") -> ClaudeAccountSw
     s._write_json(s.sequence_file, data)
     (home / ".claude.json").write_text(json.dumps({
         "oauthAccount": {"emailAddress": active, "accountUuid": "uuid-1"},
-    }))
+    }), encoding="utf-8")
     # A real store has already recorded its one-time migrations; the first
     # switcher above ran before the directory existed, so settle them now.
     with patch("claude_swap.models.Platform.detect", return_value=Platform.MACOS):

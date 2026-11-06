@@ -33,6 +33,14 @@ from .keychain_helpers import ACTIVE_ITEM, FakeSecurity, creds, macos_store, sna
 LOGIN = "/Users/me/Library/Keychains/login.keychain-db"
 
 
+@pytest.fixture(autouse=True)
+def _macos_store_root():
+    """`get_backup_root()` follows `Platform.detect()`, so on Linux a store made without
+    this and a CLI run that says macOS would each see a different directory."""
+    with patch("claude_swap.models.Platform.detect", return_value=Platform.MACOS):
+        yield
+
+
 def _fake_security(**answers):
     """A runner: {"list-keychains": (rc, stdout)}. Anything else rc 0, empty."""
 
@@ -217,7 +225,7 @@ def unreachable(temp_home, block_real_keychain, monkeypatch):
     """Two slots, live slot 1, mode on, and the keychain out of reach."""
     s = macos_store(temp_home)
     block_real_keychain.data[ACTIVE_ITEM] = creds()
-    (temp_home / ".claude" / ".credentials.json").write_text(creds())
+    (temp_home / ".claude" / ".credentials.json").write_text(creds(), encoding="utf-8")
     s._write_account_credentials("1", "a@example.com", creds())
     s._write_account_credentials("2", "b@example.com", creds("sk-b", "rt-b"))
     set_setting(s.backup_dir, "credentials.requireKeychain", "true")
@@ -226,6 +234,13 @@ def unreachable(temp_home, block_real_keychain, monkeypatch):
         "claude_swap.oauth.urllib.request.urlopen",
         lambda *a, **kw: pytest.fail("no network while refused"),
     )
+    # If a refusal ever regresses, these fail the test: a loop would hang the run, and
+    # `run` would exec a real claude.
+    monkeypatch.setattr(
+        "claude_swap.autoswitch.AutoSwitchEngine.run_loop",
+        lambda self: pytest.fail("auto started its loop while refused"),
+    )
+    monkeypatch.setattr("claude_swap.session.shutil.which", lambda name: None)
     return s
 
 
@@ -263,7 +278,7 @@ class TestRefusals:
         self, unreachable, temp_home, tmp_path, block_real_keychain, capsys
     ):
         source = tmp_path / "backup.cswap"
-        source.write_text("{}")
+        source.write_text("{}", encoding="utf-8")
         before = snapshot(temp_home, block_real_keychain)
         code, _, err = _main(["import", str(source)], capsys)
         assert code == 1 and "GUI session" in err
@@ -432,10 +447,10 @@ class TestNoFallback:
 
     def test_managed_key_write_raises(self, store, temp_home, monkeypatch):
         monkeypatch.setattr(macos_keychain, "set_password", _failing_set(None))
-        config_before = (temp_home / ".claude.json").read_text()
+        config_before = (temp_home / ".claude.json").read_text(encoding="utf-8")
         with pytest.raises(KeychainUnavailableError):
             store._write_credentials("sk-ant-api03-KEY")
-        assert (temp_home / ".claude.json").read_text() == config_before
+        assert (temp_home / ".claude.json").read_text(encoding="utf-8") == config_before
 
     def test_sticky_file_mode_does_not_reach_a_file_either(self, store, temp_home):
         store._store._keychain_usable_cache = False  # an earlier read failed
@@ -862,7 +877,7 @@ class TestKeychainThatManglesWithRcZero:
         fake.mangle = lambda value: value.replace('"', "")
         value = self._credential("AT", "RT", 7200)
         s._write_credentials(value)
-        assert (temp_home / ".claude" / ".credentials.json").read_text() == value
+        assert (temp_home / ".claude" / ".credentials.json").read_text(encoding="utf-8") == value
         assert ACTIVE_ITEM not in fake.items  # the fallback clears what would shadow it
 
     def test_non_ascii_metadata_stays_readable_and_the_enc_is_not_lost_to_it(self, mangling):

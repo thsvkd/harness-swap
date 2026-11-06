@@ -1812,9 +1812,10 @@ class TestLedgerAttributionByAccount:
         assert rotating.posts == []
 
     def test_the_spent_copy_is_kept_and_its_older_replacement_is_never_posted(
-        self, temp_home, block_real_keychain, rotating
+        self, temp_home, block_real_keychain, rotating, monkeypatch
     ):
         """An older link of a spent chain was very likely spent to make it."""
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
         s = macos_store(temp_home)
         spent = creds("AT-spent", "RT-spent", expires_in_s=20000)
         older = creds("AT-old", "RT-old", expires_in_s=NEAR)
@@ -2330,6 +2331,41 @@ class TestStashIsPruned:
         run_keepalive(store)
         assert entry in self._ids(store)
 
+    @pytest.mark.parametrize(
+        "raw",
+        ["0", "-1", "-1793900000000", "NaN", "Infinity", "-Infinity", '"1000"', "true", "null",
+         "1", "946684799", "1e-3"],
+        ids=["zero", "negative", "big-negative", "nan", "inf", "minus-inf", "string", "bool",
+             "null", "one", "before-2000-seconds", "tiny-float"],
+    )
+    def test_an_invalid_date_is_no_proof(self, store, raw):
+        """Each of these read as a past timestamp would delete a live successor."""
+        value = (
+            f'{{"claudeAiOauth": {{"accessToken": "a", "refreshToken": "r-{raw}", '
+            f'"refreshTokenExpiresAt": {raw}}}}}'
+        )
+        entry = self._stash(store, value)
+        run_keepalive(store)
+        assert entry in self._ids(store)
+
+    def test_a_missing_date_is_no_proof(self, store):
+        entry = self._stash(store, self._no_lifetime("0"))
+        run_keepalive(store)
+        assert entry in self._ids(store)
+
+    @pytest.mark.parametrize(
+        "lapsed_ago_days, unit, goes",
+        [(30, "ms", True), (30, "s", True), (-30, "ms", False), (-30, "s", False)],
+        ids=["past-ms", "past-seconds", "future-ms", "future-seconds"],
+    )
+    def test_a_valid_date_counts_in_either_unit(self, store, lapsed_ago_days, unit, goes):
+        when = time.time() - lapsed_ago_days * self.DAY
+        data = json.loads(self._login("0"))
+        data["claudeAiOauth"]["refreshTokenExpiresAt"] = int(when * (1000 if unit == "ms" else 1))
+        entry = self._stash(store, json.dumps(data))
+        run_keepalive(store)
+        assert (entry not in self._ids(store)) is goes
+
     def test_age_alone_never_deletes(self, store):
         """Finding 4: stash age is not credential expiry."""
         entry = self._stash(store, self._login("0"))
@@ -2662,6 +2698,51 @@ class TestLoserIsKeptUnlessTheWinnerIsProven:
         report = env.run()
         assert report["action"] == "synced-file"
         assert env.store._store._list_unclaimed_credentials() == {}
+
+
+class TestUnknownWinnerStaysOffTheLedger:
+    def _spent_a_and_healthy_b(self, temp_home, keychain):
+        """Config says A. Keychain holds A, spent, with the later expiry. The file
+        holds a healthy B whose identity probe fails."""
+        s = macos_store(temp_home)
+        a = creds("AT-A", "RT-A", expires_in_s=20000)
+        b = creds("AT-B", "RT-B", expires_in_s=7200)
+        consumed_grants.record(
+            oauth.credential_fingerprint(a), IDENTITY["1"], consumed_grants.CONSUMED
+        )
+        keychain.data[ACTIVE_ITEM] = a
+        (temp_home / ".claude" / ".credentials.json").write_text(b)
+        return s, a, b
+
+    def test_b_is_not_on_the_ledger_and_refreshes_on_the_next_due_run(
+        self, temp_home, block_real_keychain, rotating
+    ):
+        s, a, b = self._spent_a_and_healthy_b(temp_home, block_real_keychain)
+        report = run_keepalive(s)
+        assert report["ok"] is True
+        assert consumed_grants.entry(oauth.credential_fingerprint(b)) is None
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+        rows = s._store._list_unclaimed_credentials()
+        assert [s._store._read_unclaimed_credential(i)[0] for i in rows] == [a]  # kept
+        assert rotating.posts == []
+
+        report = run_keepalive(new_process(), ahead=7300)
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert rotating.posts == ["RT-B"]
+
+    def test_the_same_winner_proven_this_accounts_is_still_inferred_spent(
+        self, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        s, _, b = self._spent_a_and_healthy_b(temp_home, block_real_keychain)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
+        run_keepalive(s)
+        assert consumed_grants.entry(oauth.credential_fingerprint(b))["state"] == "reserved"
+
+    def test_dry_run_writes_no_inference(self, temp_home, block_real_keychain, rotating, monkeypatch):
+        _, _, b = self._spent_a_and_healthy_b(temp_home, block_real_keychain)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
+        run_keepalive(new_process(), dry_run=True)
+        assert consumed_grants.entry(oauth.credential_fingerprint(b)) is None
 
 
 class TestAnotherAccountsSpentTokenSaysNothing:

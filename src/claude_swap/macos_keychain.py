@@ -25,10 +25,11 @@ The read/write/delete shapes mirror Claude Code's own implementation
   can tell a genuine miss apart from a locked/denied/unavailable Keychain.
 
 Caveat: values must be printable text. ``find-generic-password -w`` prints the
-stored data raw only when it is printable; data with non-printable bytes comes
-back *hex-encoded*, so a write/read round-trip would not be identity. Fine for
-this codebase (credentials are ASCII JSON), but don't reuse this wrapper for
-arbitrary binary data. Claude Code's ``-w`` reads share the same constraint.
+stored data raw only when every byte is printable; otherwise the whole value comes
+back *hex-encoded*, and ``get_password`` returns that hex as it is. So
+``set_password`` re-serializes credential JSON to ASCII when it has to, and refuses
+anything else that would not read back. Claude Code's ``-w`` reads share the same
+constraint.
 
 This module is import-safe on every platform (it only shells out at call time);
 its functions are only meaningful on macOS.
@@ -37,6 +38,7 @@ its functions are only meaningful on macOS.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import re
 import secrets
@@ -72,7 +74,9 @@ _CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoun
 _UNLOCK_STATE_STATUS = 1  # kSecUnlockStateStatus
 # Every character `-w` quoting could get wrong, at a real credential's size: past
 # what the hex form can carry, so `set_password` takes the path real logins take.
-_SELFTEST_VALUE = '{"a":"b\\"c \\\\ \'d\' $HOME %s é"}' + "AbC-_.~09" * 240
+_SELFTEST_VALUE = json.dumps(
+    {"a": "b\"c \\ 'd' $HOME %s é", "pad": "AbC-_.~09" * 240}, ensure_ascii=False
+)
 
 
 class KeychainError(Exception):
@@ -171,6 +175,19 @@ def item_exists(service: str, account: str) -> bool:
     return result.returncode == 0
 
 
+def _readable_form(value: str) -> str:
+    """A value `-w` prints as itself. A printable one stays byte for byte. A JSON
+    object is re-serialized as ASCII, which any JSON reader decodes to the same data.
+    Anything else stays as it is, and fails the read-back."""
+    if all(0x20 <= byte <= 0x7e for byte in value.encode("utf-8")):
+        return value
+    try:
+        data = json.loads(value)
+    except ValueError:
+        return value
+    return json.dumps(data) if isinstance(data, dict) else value
+
+
 def _value_argument(password: str, prefix: str) -> str:
     """The value as the command line carries it: hex when that fits the line buffer,
     else quoted. Raises :class:`KeychainError` when neither does."""
@@ -193,13 +210,15 @@ def set_password(service: str, account: str, password: str) -> None:
     that fits the line buffer, else quoted (``-w``), which a typical credential's
     JSON does. A value neither form can carry raises :class:`KeychainError`, as
     does a non-zero exit, a timeout, or an item that does not read back as what was
-    sent: `security -i` exits 0 whatever its quoting did to the value. Messages
+    sent: `security -i` exits 0 whatever its quoting did to the value. The check is
+    the read every caller uses, so a value that comes back as hex fails it. Messages
     carry no argv, no stderr and no value.
 
     On that mismatch the previous value is written back once, so a bad write does
     not leave Claude Code reading a corrupt item. If that fails too the item is left
     as it is: deleting could destroy a newer token a concurrent writer just stored.
     """
+    password = _readable_form(password)
     prefix = f"add-generic-password -U -a {_quote(account)} -s {_quote(service)}"
     command = f"{prefix} {_value_argument(password, prefix)}\n"
     try:
@@ -207,8 +226,7 @@ def set_password(service: str, account: str, password: str) -> None:
     except KEYCHAIN_ERRORS:
         previous = None  # nothing to restore
     _send_write(command)
-    # `-w` prints the whole value as hex if any byte is not printable: same bytes.
-    if get_password(service, account) in (password, password.encode("utf-8").hex()):
+    if get_password(service, account) == password:
         return
     # All hex can be that printed form, and writing it back would store the wrong
     # bytes. Real values here are JSON or an sk-ant key.

@@ -865,6 +865,22 @@ class TestKeychainThatManglesWithRcZero:
         assert (temp_home / ".claude" / ".credentials.json").read_text() == value
         assert ACTIVE_ITEM not in fake.items  # the fallback clears what would shadow it
 
+    def test_non_ascii_metadata_stays_readable_and_the_enc_is_not_lost_to_it(self, mangling):
+        """The review's path: hex in the slot, the readable .enc reconciled away, and a
+        successor the next run could not adopt."""
+        s, *_ = mangling
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        value = json.dumps(
+            {"claudeAiOauth": json.loads(self._credential("AT", "RT", 7200))["claudeAiOauth"],
+             "mcpOAuth": {"server": "café"}},
+            ensure_ascii=False,
+        )
+        s._store._write_backup_enc("1", "a@example.com", value)
+        s._write_account_credentials("1", "a@example.com", value)
+        stored = s._read_account_credentials("1", "a@example.com")
+        assert oauth.extract_oauth_data(stored)["refreshToken"].startswith("RT")
+        assert json.loads(stored)["mcpOAuth"] == {"server": "café"}
+
     def test_a_faithful_keychain_round_trips_a_real_sized_credential(self, mangling):
         s, fake, _ = mangling
         value = self._credential("AT", "RT", 7200)

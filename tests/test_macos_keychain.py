@@ -134,7 +134,7 @@ def test_real_credential_sizes_never_reach_argv_and_round_trip(size):
 
 @pytest.mark.parametrize(
     "secret",
-    ['a"b', 'a\\b', 'trailing\\', '\\"', 'it\'s', "with space", '-w', 'é"\\'],
+    ['a"b', 'a\\b', 'trailing\\', '\\"', 'it\'s', "with space", '-w'],
 )
 def test_quotes_and_backslashes_survive_security_i_parsing(secret):
     padded = secret + "x" * 2100  # past the hex form's limit, so `-w`
@@ -178,8 +178,8 @@ def test_set_password_raises_on_nonzero():
 
 
 def test_set_get_roundtrip_hex_is_decodable():
-    # The hex written on set must decode back to the original UTF-8 secret.
-    secret = 'token-with "quotes" and \\ backslash and é'
+    # The hex written on set must decode back to the original secret.
+    secret = 'token-with "quotes" and \\ backslash'
     fake = FakeSecurity()
     with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake):
         macos_keychain.set_password("svc", "acct", secret)
@@ -215,14 +215,71 @@ def test_an_item_that_is_missing_after_the_write_fails_it():
             macos_keychain.set_password("svc", "acct", "secret")
 
 
-def test_a_value_read_back_as_hex_is_the_same_bytes():
-    """`-w` prints the whole value as hex when any byte is not printable."""
-    secret = "café " + "x" * 2100
+@pytest.mark.parametrize("secret", ["café", "café " + "x" * 2100], ids=["hex-path", "w-path"])
+def test_a_value_only_readable_as_hex_fails_the_write(secret):
+    """`-w` prints the whole value as hex when any byte is not printable, and
+    `get_password` returns that hex: no reader could use this value."""
     fake = FakeSecurity()
-    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake) as run:
-        macos_keychain.set_password("svc", "acct", secret)
-    assert fake.items[("svc", "acct")] == secret
-    assert run.call_count == 3  # read the previous value, write, read back
+    with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake):
+        with pytest.raises(macos_keychain.KeychainError) as err:
+            macos_keychain.set_password("svc", "acct", secret)
+        assert macos_keychain.get_password("svc", "acct") == secret.encode().hex()
+    assert "caf" not in str(err.value)
+
+
+class TestCredentialJsonIsStoredReadable:
+    def _stored(self, value):
+        fake = FakeSecurity()
+        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake):
+            macos_keychain.set_password("svc", "acct", value)
+            return fake.items[("svc", "acct")], macos_keychain.get_password("svc", "acct")
+
+    @pytest.mark.parametrize("pad", [0, 2100], ids=["hex-path", "w-path"])
+    def test_non_ascii_json_is_stored_as_ascii_the_normal_read_can_use(self, pad):
+        value = json.dumps(
+            {"claudeAiOauth": {"accessToken": "a"}, "mcpOAuth": {"name": "café ✓"}, "p": "x" * pad},
+            ensure_ascii=False,
+        )
+        stored, read = self._stored(value)
+        assert read == stored and stored.isascii()
+        assert json.loads(read) == json.loads(value)
+        assert "\\u00e9" in read
+
+    def test_multi_line_json_is_stored_on_one_line(self):
+        value = json.dumps({"claudeAiOauth": {"accessToken": "a" * 2100}}, indent=2)
+        stored, read = self._stored(value)
+        assert "\n" not in stored and read == stored
+        assert json.loads(read) == json.loads(value)
+
+    def test_printable_json_is_kept_byte_for_byte(self):
+        # Compact, as Claude Code writes it: rewriting it would churn the file copy.
+        value = '{"claudeAiOauth":{"accessToken":"a"},"k":[1,2]}'
+        assert self._stored(value)[0] == value
+
+    def test_a_key_is_never_rewritten(self):
+        assert self._stored("sk-ant-api03-KEY")[0] == "sk-ant-api03-KEY"
+
+    @pytest.mark.parametrize("value", ['["é"]', '"é"'], ids=["list", "string"])
+    def test_json_that_is_not_an_object_is_left_to_fail(self, value):
+        fake = FakeSecurity()
+        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake):
+            with pytest.raises(macos_keychain.KeychainError):
+                macos_keychain.set_password("svc", "acct", value)
+
+    def test_a_failed_read_back_of_the_normalized_form_still_restores(self):
+        fake = FakeSecurity()
+        fake.items[("svc", "acct")] = "previous"
+        seen = []
+
+        def corrupt_first(value):
+            seen.append(value)
+            return value.replace('"', "") if len(seen) == 1 else value
+
+        fake.mangle = corrupt_first
+        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake):
+            with pytest.raises(macos_keychain.KeychainError):
+                macos_keychain.set_password("svc", "acct", '{"a": "é"}')
+        assert fake.items[("svc", "acct")] == "previous"
 
 
 class TestPreviousValueIsRestored:
@@ -337,6 +394,21 @@ class TestSelftest:
         assert 2000 < len(value.encode()) < 2500
         for needle in ('"', "\\", "'", "$", "%", " ", "é", "AbC-_.~09AbC-_.~09"):
             assert needle in value
+
+    def test_non_ascii_json_passes_through_the_normal_read(self):
+        """The dummy is JSON holding é, so it passes only through normalization."""
+        assert isinstance(json.loads(macos_keychain._SELFTEST_VALUE), dict)
+        fake = FakeSecurity()
+        stored = []
+        fake.mangle = lambda value: (stored.append(value), value)[1]
+        assert self._run(fake) is True
+        assert stored[0].isascii() and "\\u00e9" in stored[0]
+
+    def test_a_dummy_that_only_reads_back_as_hex_would_fail(self, monkeypatch):
+        monkeypatch.setattr(macos_keychain, "_SELFTEST_VALUE", "raw café " + "x" * 2100)
+        fake = FakeSecurity()
+        assert self._run(fake) is False
+        assert fake.items == {}
 
     def test_each_run_uses_a_new_service(self):
         fake = FakeSecurity()

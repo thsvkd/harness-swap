@@ -267,10 +267,8 @@ def _prune_stash(active) -> None:
         value, unreadable = store._read_unclaimed_credential(entry_id)
         if unreadable or not value:
             continue
-        lapsed_at = _oauth_payload(value).get("refreshTokenExpiresAt")
-        if isinstance(lapsed_at, bool) or not isinstance(lapsed_at, (int, float)):
-            continue
-        if lapsed_at > (time.time() - _STASH_LAPSED_MARGIN_S) * 1000:
+        lapsed_at = oauth.refresh_expiry_ms(_oauth_payload(value).get("refreshTokenExpiresAt"))
+        if lapsed_at is None or lapsed_at > (time.time() - _STASH_LAPSED_MARGIN_S) * 1000:
             continue
         fingerprint = oauth.credential_fingerprint(value)
         recorded = consumed_grants.entry(fingerprint)
@@ -451,9 +449,10 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
         and _is_spent(creds)
         and credential_generation(creds) > generation
     ]
-    if spent_newer and not dry_run:
+    if spent_newer and belongs(authoritative) is True and not dry_run:
         # An older copy of a chain whose newer link is spent was very likely spent
-        # to make that link. Keep that knowledge past the overwrite below.
+        # to make that link. Keep that knowledge past the overwrite below. Only with
+        # the winner proven: an unknown login may be no part of that chain.
         consumed_grants.reserve(
             oauth.credential_fingerprint(authoritative), active.identity or ("", "")
         )

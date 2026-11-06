@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import socket
 import ssl
 import sys
@@ -28,6 +29,9 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 GRANT_SPENT = "spent"  # rotated, or the server says this token is dead
 GRANT_UNCHANGED = "unchanged"  # never sent, or refused without touching it
 GRANT_UNCERTAIN = "uncertain"  # the server may have rotated it
+
+_EPOCH_S_FROM = 946_684_800  # 2000-01-01 in seconds
+_EPOCH_MS_FROM = 100_000_000_000  # above any seconds value before the year 5138
 
 _logger = logging.getLogger("claude-swap")
 
@@ -92,18 +96,32 @@ def login_expires_at_iso(credentials: str) -> str | None:
     Code recorded the field carry nothing, which means "unknown", never "now".
     """
     data = extract_oauth_data(credentials)
-    return expires_at_iso(data.get("refreshTokenExpiresAt") if data else None)
+    return expires_at_iso(refresh_expiry_ms(data.get("refreshTokenExpiresAt") if data else None))
+
+
+def refresh_expiry_ms(value: object) -> float | None:
+    """``refreshTokenExpiresAt`` as epoch milliseconds, or ``None`` when it proves
+    nothing. Claude Code records milliseconds. A seconds value is converted, since
+    read as milliseconds it lands in 1970 and looks long lapsed. So is anything
+    before 2000 in either unit: garbage, not a date."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value >= _EPOCH_MS_FROM:
+        return value
+    return value * 1000 if value >= _EPOCH_S_FROM else None
 
 
 def expires_at_iso(value: object) -> str | None:
     """An epoch-milliseconds expiry as ISO-8601 UTC, or ``None`` when unusable."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         return None
-    return (
-        datetime.fromtimestamp(value / 1000, tz=timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
+    try:
+        when = datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):  # NaN, infinity, past year 9999
+        return None
+    return when.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:

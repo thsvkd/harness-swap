@@ -22,6 +22,9 @@ from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
+    COPIES_DISAGREE_MESSAGE,
+    CopiesDisagreeError,
+    CredentialWriteError,
     KeychainUnavailableError,
     ConfigError,
     CredentialReadError,
@@ -390,6 +393,7 @@ class ClaudeAccountSwitcher:
         # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
+        self._store.preserve_copy = self._preserve_copy
         self._keychain_gate: tuple[float, bool] | None = None
 
         # The active read's verdict, PER THREAD. Set by _build_accounts_info
@@ -700,51 +704,20 @@ class ClaudeAccountSwitcher:
         """
         if self.keychain_gate_closed(fresh=True):
             return oauth.RefreshOutcome(None, "transient")
-        if self._store._keychain_is_required() and not self._active_post_is_safe(
-            identity, credentials, locks_held
-        ):
-            self._logger.info("Refresh deferred: the credentials file disagrees or is unknown.")
-            return oauth.RefreshOutcome(None, "transient")
+        if self._store._keychain_is_required():
+            active = self._get_current_account()
+            if active is None or (identity == active and not locks_held):
+                self._logger.info("Refresh deferred: the active login needs the locks.")
+                return oauth.RefreshOutcome(None, "transient")
+            if identity == active:
+                try:
+                    self._require_unanimity(credentials, identity)
+                except StoresDisagreeError:
+                    self._logger.info("Refresh deferred: a copy of this login differs.")
+                    return oauth.RefreshOutcome(None, "stores-disagree")
         if self._store.records_consumed_grants():
             kwargs["ledger_identity"] = identity
         return oauth.try_refresh_oauth_credentials(credentials, **kwargs)
-
-    def _active_post_is_safe(
-        self, identity: tuple[str, str], credentials: str, locks_held: bool
-    ) -> bool:
-        """A process that sees only the file may have spent this token there, which no
-        ledger here records. Another account's token has nothing to fear from the file.
-        """
-        active = self._get_current_account()
-        if active is None:
-            return False
-        if identity != active:
-            return True
-        return locks_held and self._file_permits_post(credentials)
-
-    def _file_permits_post(self, credentials: str) -> bool:
-        """The file holds no other login of this account that could be newer. A later
-        expiry is no proof of that, so a differing copy only passes when a record shows
-        this one descends from it."""
-        try:
-            file_creds = get_credentials_path().read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return True
-        except (OSError, UnicodeDecodeError):
-            return False
-        if not file_creds.strip():
-            return True
-        fingerprint = oauth.credential_fingerprint(file_creds)
-        if fingerprint == oauth.credential_fingerprint(credentials):
-            return True
-        if _credential_object(file_creds) is None:
-            return False
-        try:
-            return oauth.credential_fingerprint(credentials) in self._recorded_successors(
-                self._get_current_account(), None, fingerprint
-            )
-        except consumed_grants.LedgerUnreadable:
-            return False
 
     def refuse_in_required_mode(self, command: str) -> None:
         """Keychain-required mode supports what the keepalive workflow uses, and every
@@ -779,7 +752,8 @@ class ClaudeAccountSwitcher:
         The stores must agree: only `keepalive --adopt` writes past a disagreement, and
         ``reconciling`` (keepalive) past one a record explains. A ``candidate`` from
         ``account`` (number, email, organization) must also be off the ledger, and every
-        other copy of that account must be provably its predecessor. Nothing here looks
+        other copy of that account must be provably its predecessor, or for the active
+        login's own token, it must pass `_require_unanimity`. Nothing here looks
         at an expiry or a write time: a refresh can issue a shorter lifetime and a clock
         can step back. Raises StoresDisagreeError or ReloginRequiredError.
         """
@@ -816,39 +790,193 @@ class ClaudeAccountSwitcher:
         if consumed_grants.entry(fingerprint) is not None:
             raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
         num, email, org_uuid = account
-        from claude_swap.session import read_session_credentials, session_identity_drifted
+        # The active login's own token answers to rule U, at its POST.
+        if (email, org_uuid) == active and fingerprint in live:
+            return
+        try:
+            unproven = self._unproven_copy(candidate, num, email, org_uuid)
+        except CopiesDisagreeError as e:
+            raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE) from e
+        if unproven:
+            raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
 
+    def _require_unanimity(self, candidate: str, identity: tuple[str, str]) -> None:
+        """Rule U: the active login's token goes only if every copy we can see holds it
+        or is a recorded predecessor of it. With the locks held, right before the
+        reservation. Raises CopiesDisagreeError."""
+        if not self._store._keychain_is_required():
+            return
+        data = self._get_sequence_data() or {}
+        num = self._find_account_slot(data, *identity) if data else None
+        if self._unproven_copy(candidate, num, *identity):
+            raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+
+    def _unproven_copy(self, candidate: str, num: str | None, email: str, org_uuid: str) -> bool:
+        """Does any copy of the account hold another token not recorded as older?"""
+        fingerprint = oauth.credential_fingerprint(candidate)
+        identity = (email, org_uuid or "")
+        return any(
+            other != fingerprint
+            and fingerprint not in self._recorded_successors(identity, num, other)
+            for other in self._copy_fingerprints(num, email, org_uuid)
+        )
+
+    def _copy_fingerprints(self, num: str | None, email: str, org_uuid: str) -> set[str]:
+        """Every copy of an account we can see: the two stores when it is the active
+        login, the slot, its `.enc`, its session, and its stash entries. Raises
+        CopiesDisagreeError when one cannot be read."""
+        copies = list(self._stored_copies(num, email, org_uuid) if num else [])
+        if (email, org_uuid or "") == self._get_current_account():
+            keychain, failed = self._store._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
+            if failed:
+                raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+            try:
+                copies.extend([keychain or "", get_credentials_path().read_text(encoding="utf-8")])
+            except FileNotFoundError:
+                pass
+            except (OSError, UnicodeDecodeError) as e:
+                raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE) from e
+        found = {
+            oauth.credential_fingerprint(creds)
+            for creds in copies
+            if creds.strip() and not holds_no_login(creds)
+        }
+        manifest, verdict = self._store._read_stash_manifest_ex()
+        if verdict == "unreadable" or (
+            verdict == "corrupt" and self._store._stash_entry_files_exist()
+        ):
+            raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+        for entry_id, row in manifest.items():
+            if (row.get("email"), row.get("organizationUuid", "") or "") != (email, org_uuid or ""):
+                continue
+            stashed = row.get("fingerprint")
+            if not stashed:
+                value, unreadable = self._store._read_unclaimed_credential(entry_id)
+                if unreadable:
+                    raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+                stashed = oauth.credential_fingerprint(value)
+            if stashed:
+                found.add(stashed)
+        return found
+
+    def _stored_copies(self, num: str, email: str, org_uuid: str) -> list[str]:
+        """What a slot holds apart from the stash: its backup, a leftover `.enc`, and its
+        session's copy. Raises CopiesDisagreeError when one cannot be read."""
+        from claude_swap.session import (
+            _may_have_credential_material,
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        copy, unreadable = self._read_account_credentials_ex(num, email)
+        if unreadable:
+            raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+        try:
+            copies = [copy, self._store._leftover_backup_enc(num, email)]
+        except OSError as e:
+            raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE) from e
+        # Not only with the directory there: a session's Keychain item can outlive it.
         session_dir = self._session_dir(num, email)
         profile = read_session_credentials(session_dir)
-        others = (
-            [profile]
-            if profile and not session_identity_drifted(session_dir, email, org_uuid)
-            else []
-        )
-        others = [oauth.credential_fingerprint(creds) for creds in others]
-        # The live stores are authoritative over the slot and the stash (see keepalive).
-        if not ((email, org_uuid) == active and fingerprint in live):
-            if (email, org_uuid) == active:
-                others.extend(live)
-            copy, unreadable = self._read_account_credentials_ex(num, email)
-            if unreadable:
-                raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
-            others.append(oauth.credential_fingerprint(copy))
-            others.append(
-                oauth.credential_fingerprint(self._store._leftover_backup_enc(num, email))
-            )
-            others.extend(
-                row.get("fingerprint")
-                for row in self._store._read_stash_manifest().values()
-                if (row.get("email"), row.get("organizationUuid", "")) == (email, org_uuid)
-            )
-        for other in others:
-            if (
-                other
-                and other != fingerprint
-                and fingerprint not in self._recorded_successors((email, org_uuid), num, other)
+        if profile:
+            if not session_identity_drifted(session_dir, email, org_uuid):
+                copies.append(profile)
+        elif _may_have_credential_material(session_dir):
+            raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+        return copies
+
+    def _preserve_copy(
+        self,
+        copy: str,
+        replacement: str | None,
+        *,
+        account_num: str | None = None,
+        email: str | None = None,
+        identity: tuple[str, str] | None = None,
+        reason: str = "replaced",
+        slot_keeps_it: bool = False,
+    ) -> None:
+        """Rule P: before a credential copy is replaced or deleted, it goes to the stash
+        and is read back. Not when its refresh token outlives the change: the replacement
+        holds it, a record shows it was spent for the replacement, the stash holds it, or
+        (``slot_keeps_it``, a live store on a switch) a slot does. Raises when the copy
+        cannot be kept, which must stop the replacement."""
+        if not self._store._keychain_is_required() or holds_no_login(copy):
+            return
+        if identity is None:
+            if email is not None:
+                org_uuid = self.account_identity(account_num).get("organizationUuid", "") or ""
+                identity = (email, org_uuid)
+            else:
+                identity = self._get_current_account() or ("", "")
+        fingerprint = oauth.credential_fingerprint(copy)
+        if replacement is not None:
+            successor = oauth.credential_fingerprint(replacement)
+            if fingerprint == successor or successor in self._recorded_successors(
+                identity, account_num, fingerprint
             ):
-                raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
+                return
+        if slot_keeps_it:
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            for num, account in accounts.items():
+                held, _ = self._read_account_credentials_ex(num, account.get("email", ""))
+                if held and oauth.credential_fingerprint(held) == fingerprint:
+                    return
+        self.stash_verified(copy, identity, account_num, reason)
+
+    def stash_verified(
+        self, copy: str, identity: tuple[str, str], account_num: str | None, reason: str
+    ) -> None:
+        """Into the stash once per refresh token, and read back. Raises if it did not land."""
+        store = self._store
+        fingerprint = oauth.credential_fingerprint(copy)
+        for entry_id, row in store._list_unclaimed_credentials().items():
+            if row.get("fingerprint") == fingerprint:
+                value, unreadable = store._read_unclaimed_credential(entry_id)
+                if not unreadable and oauth.credential_fingerprint(value) == fingerprint:
+                    return
+        entry_id = store._write_unclaimed_credential(
+            copy,
+            {
+                "reason": reason,
+                "configSlot": account_num or "",
+                "email": identity[0],
+                "organizationUuid": identity[1] or "",
+                "fingerprint": fingerprint,
+            },
+        )
+        value, _ = store._read_unclaimed_credential(entry_id)
+        if value != copy:
+            raise CredentialWriteError("The stashed copy did not read back; nothing was replaced.")
+
+    def _preserve_session_copy(self, account_num: str, email: str, replacement: str | None) -> None:
+        """Rule P for what `_post_backup_write` and a slot's removal delete. A live
+        session keeps its copy, so nothing is lost there."""
+        if not self._store._keychain_is_required():
+            return
+        from claude_swap.session import (
+            _may_have_credential_material,
+            read_session_credentials,
+            session_identity_drifted,
+        )
+
+        session_dir = self._session_dir(account_num, email)
+        if not session_dir.exists() or self._live_session_pids(account_num, email):
+            return
+        profile = read_session_credentials(session_dir)
+        if not profile:
+            if _may_have_credential_material(session_dir):
+                raise CredentialWriteError("Cannot read the session copy it would delete.")
+            return
+        org_uuid = self.account_identity(account_num).get("organizationUuid", "") or ""
+        drifted = session_identity_drifted(session_dir, email, org_uuid)
+        self._preserve_copy(
+            profile,
+            replacement,
+            account_num=account_num,
+            identity=("", "") if drifted else (email, org_uuid),
+            reason="session-replaced",
+        )
 
     def _recorded_successors(
         self, identity: tuple[str, str] | None, slot: str | None, fingerprint: str | None
@@ -901,24 +1029,19 @@ class ClaudeAccountSwitcher:
         successor = oauth.credential_fingerprint(live)
         fingerprint = oauth.credential_fingerprint(copy)
         if copy and fingerprint != successor:
-            if not any(
-                row.get("fingerprint") == fingerprint
-                for row in self._store._list_unclaimed_credentials().values()
-            ):
-                self._store._write_unclaimed_credential(
-                    copy,
-                    {
-                        "reason": "slot-replaced-by-live",
-                        "configSlot": account_num,
-                        "email": email,
-                        "organizationUuid": org_uuid or "",
-                        "fingerprint": fingerprint,
-                    },
-                )
+            self._preserve_copy(
+                copy, None, account_num=account_num, identity=identity,
+                reason="slot-replaced-by-live",
+            )
             consumed_grants.record(
                 fingerprint, identity, consumed_grants.CONSUMED, successor=successor
             )
         if new_login:
+            # Stashed now rather than when the write replaces them, so they are behind it too.
+            for held in self._stored_copies(account_num, email, org_uuid or ""):
+                self._preserve_copy(
+                    held, live, account_num=account_num, identity=identity, reason="replaced"
+                )
             self.supersede_stashed_copies(identity, live)
 
     def supersede_stashed_copies(self, identity: tuple[str, str], login: str) -> None:
@@ -1190,6 +1313,7 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
+        self._preserve_session_copy(account_num, email, credentials)
         self._store._write_account_credentials(account_num, email, credentials)
         try:
             self._post_backup_write(account_num, email)
@@ -1234,6 +1358,7 @@ class ClaudeAccountSwitcher:
             SessionError: a live session-mode instance is using this account.
         """
         self._ensure_no_live_session(account_num, email, "the operation")
+        self._preserve_session_copy(account_num, email, None)
         self._delete_account_credentials(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():

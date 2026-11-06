@@ -24,6 +24,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
@@ -379,6 +380,9 @@ class CredentialStore:
 
     def __init__(self, host: _StoreHost):
         self._host = host
+        # Rule P (see ClaudeAccountSwitcher._preserve_copy): the owner's check before a
+        # credential copy is replaced or deleted. Set by the owner: the host is data only.
+        self.preserve_copy: Callable[..., None] | None = None
         # macOS Keychain usability, learned per-process from real `security`
         # calls (see _kc_call / _use_keychain). None = not yet probed; True/False
         # once an op has run. _last_active_credentials_backend records where the
@@ -865,9 +869,46 @@ class CredentialStore:
 
     def _write_active_credentials_file(self, credentials: str) -> None:
         """Atomically write Claude Code's plaintext active-credentials file."""
+        self._preserve_active_file(credentials)
         cred_dir = get_claude_config_home()
         cred_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_text(cred_dir / ".credentials.json", credentials)
+
+    def _preserve_active_file(self, replacement: str | None) -> None:
+        if self.preserve_copy is None or not self._keychain_is_required():
+            return
+        try:
+            copy = get_credentials_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        except (OSError, UnicodeDecodeError) as e:
+            raise CredentialWriteError(f"Cannot read the file it would replace: {e}") from e
+        self.preserve_copy(copy, replacement, slot_keeps_it=True)
+
+    def _preserve_active_keychain(self, replacement: str | None) -> None:
+        if self.preserve_copy is None or not self._keychain_is_required():
+            return
+        copy, failed = self._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        if failed:
+            raise CredentialWriteError("Cannot read the Keychain item it would replace")
+        if copy:
+            self.preserve_copy(copy, replacement, slot_keeps_it=True)
+
+    def _preserve_slot(self, account_num: str, email: str, replacement: str | None) -> None:
+        """Every copy a slot holds: its Keychain backup and a leftover `.enc`."""
+        if self.preserve_copy is None or not self._keychain_is_required():
+            return
+        try:
+            enc_copy = self._leftover_backup_enc(account_num, email)
+        except OSError as e:
+            raise CredentialWriteError(f"Cannot read the .enc it would replace: {e}") from e
+        try:
+            copy = self._kc_read_backup(account_num, email)
+        except macos_keychain.KEYCHAIN_ERRORS as e:
+            raise CredentialWriteError("Cannot read the backup it would replace") from e
+        for held in (copy, enc_copy):
+            if held:
+                self.preserve_copy(held, replacement, account_num=account_num, email=email)
 
     def _delete_active_keychain_entry(self) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
@@ -1044,6 +1085,8 @@ class CredentialStore:
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
         """
+        self._preserve_active_keychain(None)
+        self._preserve_active_file(None)
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
@@ -1072,6 +1115,7 @@ class CredentialStore:
         Raises:
             CredentialWriteError: If writing credentials fails.
         """
+        self._preserve_active_keychain(credentials)
         if self._use_keychain():
             try:
                 self._kc_call(
@@ -1438,11 +1482,15 @@ class CredentialStore:
         return ""
 
     def _leftover_backup_enc(self, account_num: str, email: str) -> str:
-        """The slot's `.enc` as bytes on disk, "" when absent or garbled."""
+        """The slot's `.enc` as bytes on disk, "" when absent or garbled (nothing in it
+        can be recovered). Raises OSError when it exists and cannot be read."""
         try:
             encoded = self._backup_enc_path(account_num, email).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        try:
             return base64.b64decode(encoded.strip(), validate=True).decode("utf-8")
-        except (OSError, ValueError):
+        except ValueError:
             return ""
 
     def _newest_backup(
@@ -1551,6 +1599,7 @@ class CredentialStore:
         # Before retention, which would write a file-mode `.prev` on its own.
         if not self._use_keychain():
             self._refuse_file_fallback()
+        self._preserve_slot(account_num, email, credentials)
         self._retain_previous_backup(account_num, email, credentials)
         if self._use_keychain():
             try:
@@ -1591,6 +1640,7 @@ class CredentialStore:
         if str(account_num) != "None":
             nums.append("None")
         for num in nums:
+            self._preserve_slot(num, email, None)
             enc_file = self._backup_enc_path(num, email)
             try:
                 if enc_file.exists():

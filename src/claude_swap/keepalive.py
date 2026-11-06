@@ -40,6 +40,7 @@ from claude_swap.credentials import (
 )
 from claude_swap.exceptions import (
     ClaudeSwitchError,
+    CopiesDisagreeError,
     KeychainUnavailableError,
     LockError,
     StoresDisagreeError,
@@ -145,6 +146,8 @@ def run_keepalive(
         _keep(switcher, report, ahead, ensure_file, dry_run, adopt)
     except _Stop as stop:
         report["error"] = {"type": stop.kind, "message": stop.message}
+    except CopiesDisagreeError as e:
+        report["error"] = {"type": "split_brain", "message": str(e)}
     except StoresDisagreeError:
         report["error"] = {"type": "split_brain", "message": _UNLINKED_STORES}
     except KeychainUnavailableError:
@@ -250,7 +253,7 @@ def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict
     moved = False
     if switcher.platform == Platform.MACOS:
         final, backup, moved = _reconcile(
-            active, report, keychain, file_creds, ensure_file, dry_run
+            active, report, keychain, file_creds, ahead, ensure_file, dry_run
         )
     else:
         backup = _read_slot(active)
@@ -455,7 +458,7 @@ def _linked_successor(active, keychain: str, file_creds: str) -> str:
 
 
 def _reconcile(
-    active, report, keychain, file_creds, ensure_file, dry_run
+    active, report, keychain, file_creds, ahead, ensure_file, dry_run
 ) -> tuple[str, str, bool]:
     """The required-mode decision table, on evidence only (see the module docstring).
     Returns what the stores now hold, the slot's copy, and whether a recorded
@@ -488,6 +491,9 @@ def _reconcile(
         login = successor
         backup = successor if active.slot else backup
     _refuse_spent(login)
+    # Before anything is written: a POST is coming, and rule U may forbid it.
+    if not stores_differ and not successor and _due(login, ahead):
+        switcher._require_unanimity(login, active.identity or ("", ""))
 
     if stores_differ and not dry_run:
         for stale in holders:
@@ -515,8 +521,11 @@ def _adopt(active, report, choice: str) -> str:
     for stale in (keychain, file_creds):
         if not holds_no_login(stale) and oauth.credential_fingerprint(stale) != fingerprint:
             _stash_loser(active, stale, _belongs(active, stale, backup, probe=True))
-    if not holds_no_login(backup) and oauth.credential_fingerprint(backup) != fingerprint:
-        _stash_loser(active, backup, True)
+    # Stashed now rather than when the writes replace them, so they are behind it too.
+    held = switcher._stored_copies(active.slot, *active.identity) if active.slot else []
+    for stale in held:
+        if not holds_no_login(stale) and oauth.credential_fingerprint(stale) != fingerprint:
+            _stash_loser(active, stale, True)
     switcher.supersede_stashed_copies(active.identity or ("", ""), chosen)
     final = _write_stores(active, report, keychain, file_creds, chosen, True, False)
     if active.slot:
@@ -682,24 +691,12 @@ def _loser_identity(active, loser: str, verdict: bool | None) -> tuple[str, str]
 
 
 def _stash_loser(active, loser: str, verdict: bool | None) -> None:
-    store = active.switcher._store
-    fingerprint = oauth.credential_fingerprint(loser)
-    email, org_uuid = _loser_identity(active, loser, verdict)
     try:
-        if any(
-            row.get("fingerprint") == fingerprint
-            for row in store._list_unclaimed_credentials().values()
-        ):
-            return
-        store._write_unclaimed_credential(
+        active.switcher.stash_verified(
             loser,
-            {
-                "reason": "keepalive-split-brain",
-                "configSlot": active.slot or _UNMANAGED,
-                "email": email,
-                "organizationUuid": org_uuid,
-                "fingerprint": fingerprint,
-            },
+            _loser_identity(active, loser, verdict),
+            active.slot or _UNMANAGED,
+            "keepalive-split-brain",
         )
     except (ClaudeSwitchError, OSError) as e:
         raise _Stop("split_brain") from e

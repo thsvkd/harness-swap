@@ -38,6 +38,13 @@ STORES_DISAGREE_MESSAGE = (
     "Run hswap claude keepalive --adopt file|keychain, naming the store whose writer "
     "refreshed last."
 )
+COPIES_DISAGREE_MESSAGE = (
+    "A copy of this login (the slot's backup, a leftover .enc, a session or the stash) "
+    "holds a different token, or cannot be read, and no record shows it is older; "
+    "nothing was sent. Run hswap claude keepalive --adopt file|keychain, naming the "
+    "store whose writer refreshed last, or log in again with /login and run hswap "
+    "claude add."
+)
 RELOGIN_REQUIRED_MESSAGE = (
     "This login's token is already spent, or another copy of it holds a different token "
     "and no record shows which is newer; nothing was sent. Log in again with /login and "
@@ -49,6 +56,10 @@ class StoresDisagreeError(CredentialError):
     """Keychain-required mode: the Keychain and the file hold different logins."""
 
     json_type = "stores_disagree"
+
+
+class CopiesDisagreeError(StoresDisagreeError):
+    """Keychain-required mode: a copy of the active login outside the stores differs."""
 
 
 class ReloginRequiredError(CredentialError):

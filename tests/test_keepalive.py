@@ -276,24 +276,36 @@ class TestRefresh:
         assert access_token(env.keychain_value()) == "sk-ant-oat01-ACCESS-NEW"
         assert access_token(env.backup()) == "sk-ant-oat01-ACCESS-NEW"
 
-    def test_slot_on_an_older_lineage_is_healed_by_the_token_endpoint_identity(self, env):
+    def test_a_slot_on_another_lineage_stops_a_due_refresh(self, env):
+        """Rule U: nothing here shows the slot's copy is the older one."""
         env.active(creds("sk-live", "rt-live", expires_in_s=NEAR))
         env.store._write_account_credentials(*SLOT, creds("sk-old", "rt-old", expires_in_s=-100))
-        env.post.account = {"uuid": "uuid-1", "email_address": "a@example.com"}
+        before = snapshot(env.home, env.keychain)
         report = env.run()
-        assert report["ok"] is True and report["action"] == "refreshed"
-        assert env.post.posts[0]["refresh_token"] == "rt-live"
-        assert access_token(env.backup()) == "sk-ant-oat01-ACCESS-NEW"
+        assert report["ok"] is False and report["error"]["type"] == "split_brain"
+        assert env.post.posts == []
+        assert snapshot(env.home, env.keychain) == before
 
-    def test_token_answering_as_another_account_is_reported_and_not_stored(self, env):
-        slot_copy = creds("sk-old", "rt-old", expires_in_s=-100)
-        env.active(creds("sk-live", "rt-live", expires_in_s=NEAR))
-        env.store._write_account_credentials(*SLOT, slot_copy)
+    def test_a_slot_on_another_lineage_follows_while_nothing_is_due(self, env):
+        env.active(creds("sk-live", "rt-live", expires_in_s=7200))
+        old = creds("sk-old", "rt-old", expires_in_s=-100)
+        env.store._write_account_credentials(*SLOT, old)
+        assert env.run()["ok"] is True
+        assert access_token(env.backup()) == "sk-live"
+        rows = env.store._store._list_unclaimed_credentials()
+        assert [env.store._store._read_unclaimed_credential(i)[0] for i in rows] == [old]
+
+        assert env.run(ahead=7300)["action"] == "refreshed"
+        assert [post["refresh_token"] for post in env.post.posts] == ["rt-live"]
+
+    def test_token_answering_as_another_account_is_reported(self, env):
+        near = creds("sk-live", "rt-live", expires_in_s=NEAR)
+        env.active(near)
+        env.store._write_account_credentials(*SLOT, near)
         env.post.account = {"uuid": "someone-else", "email_address": "z@example.com"}
         report = env.run()
         assert report["ok"] is False and report["error"]["type"] == "unmanaged"
         assert access_token(env.keychain_value()) == "sk-ant-oat01-ACCESS-NEW"
-        assert env.backup() == slot_copy
 
     def test_racing_writer_rotates_before_the_lock_no_post(self, env, monkeypatch):
         rotated = creds("sk-raced", "rt-raced", expires_in_s=28000)
@@ -804,31 +816,6 @@ class TestConsumedGrantIsNeverPostedAgain:
             s._store._kc_call(macos_keychain.get_password, "svc", "acct")
         assert s._store._use_keychain() is True
         assert s._store._keychain_disabled_until == 0.0
-
-    def test_R2_direct_post_write_failure_is_adopted_not_reposted(
-        self, temp_home, block_real_keychain, rotating, monkeypatch
-    ):
-        s = macos_store(temp_home)
-        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-0", "RT-0", expires_in_s=NEAR)
-        # The slot is one rotation behind, so this POST bypasses the gate.
-        s._write_account_credentials(*SLOT, creds("AT-old", "RT-old", expires_in_s=-100))
-        real_set = block_real_keychain.set_password
-        monkeypatch.setattr(
-            macos_keychain, "set_password", _active_item_write_fails(block_real_keychain)
-        )
-        report = run_keepalive(s)
-        assert report["error"]["type"] == "keychain_unavailable"
-        assert rotating.posts == ["RT-0"]
-
-        monkeypatch.setattr(macos_keychain, "set_password", real_set)
-        second = new_process()
-        report = run_keepalive(second)
-        assert report["ok"] is True and report["action"] == "synced-keychain"
-        assert rotating.posts == ["RT-0"]
-        assert strikes(second) == 0
-        assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
-        assert second._store._list_unclaimed_credentials() == {}
-        assert access_token(second._read_account_credentials(*SLOT)) == "AT-1"
 
     def test_R2_unmanaged_successor_is_adopted_from_the_stash(
         self, temp_home, block_real_keychain, rotating, monkeypatch
@@ -1994,8 +1981,12 @@ class TestEveryPostGoesThroughTheHelper:
 
     def test_keepalive_direct_reserves_first(self, required, block_real_keychain):
         s, _, seen = required
+        # A login with no slot is the one case that goes straight to the helper.
+        (s.backup_dir.parent / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "stranger@example.com", "accountUuid": "uuid-9"},
+        }), encoding="utf-8")
         block_real_keychain.data[ACTIVE_ITEM] = creds("AT-live", "RT-live", expires_in_s=NEAR)
-        run_keepalive(s)  # the slot is on another lineage, so this bypasses the gate
+        run_keepalive(s)
         self._assert_reserved(seen)
 
     def test_keepalive_gate_reserves_first(self, required, block_real_keychain):
@@ -2175,8 +2166,9 @@ class TestSuccessorFollowsTheAccount:
         self, temp_home, block_real_keychain, rotating, monkeypatch
     ):
         s = macos_store(temp_home)
-        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-0", "RT-0", expires_in_s=NEAR)
-        s._write_account_credentials(*SLOT, creds("AT-old", "RT-old", expires_in_s=-100))
+        near = creds("AT-0", "RT-0", expires_in_s=NEAR)
+        block_real_keychain.data[ACTIVE_ITEM] = near
+        s._write_account_credentials(*SLOT, near)
         real_set = block_real_keychain.set_password
         monkeypatch.setattr(
             macos_keychain, "set_password", _active_item_write_fails(block_real_keychain)
@@ -2804,18 +2796,23 @@ class TestEvidenceOnlyDecisionTable:
         assert report["ok"] is True and report["action"] == "refreshed"
         assert rotating.posts == ["RT-B"]
 
-    def test_round_10_finding_1_when_due_at_once_only_the_live_token_goes(
+    def test_round_10_finding_1_when_due_at_once_nothing_goes_until_someone_chooses(
         self, store, temp_home, block_real_keychain, rotating
     ):
+        """Rule U: the slot's copy is different and not proven older."""
         a = creds("AT-A", "RT-A", expires_in_s=28000)
         b = creds("AT-B", "RT-B", expires_in_s=NEAR)
         store._write_account_credentials(*SLOT, a)
         self._stores(temp_home, block_real_keychain, b, b)
         report = run_keepalive(new_process())
-        assert report["action"] == "refreshed"
-        assert rotating.posts == ["RT-B"]
+        assert report["error"]["type"] == "split_brain"
+        assert rotating.posts == []
+        assert store._read_account_credentials(*SLOT) == a
+
+        assert run_keepalive(new_process(), adopt="file")["action"] == "adopted"
         assert self._stashed(store) == [a]
-        assert oauth.extract_oauth_data(store._read_account_credentials(*SLOT))["refreshToken"] != "RT-A"
+        assert run_keepalive(new_process())["action"] == "refreshed"
+        assert rotating.posts == ["RT-B"]
 
     def test_a_token_proven_foreign_does_not_take_the_slot(
         self, store, temp_home, block_real_keychain, rotating, monkeypatch
@@ -2854,7 +2851,7 @@ class TestEvidenceOnlyDecisionTable:
         monkeypatch.setattr("claude_swap.session.read_session_credentials", lambda sdir: profile)
         monkeypatch.setattr("claude_swap.session.session_identity_drifted", lambda *a: False)
         report = run_keepalive(new_process())
-        assert report["error"]["type"] == "relogin_required"
+        assert report["error"]["type"] == "split_brain"
         assert rotating.posts == []
         assert store._read_account_credentials(*SLOT) == x
         assert block_real_keychain.data[ACTIVE_ITEM] == x
@@ -2911,7 +2908,7 @@ class TestEvidenceOnlyDecisionTable:
 
         set_setting(store.backup_dir, "credentials.requireKeychain", "true")
         outcome = new_process().post_refresh(IDENTITY["1"], a, locks_held=True)
-        assert outcome.error == "transient" and rotating.posts == []
+        assert outcome.error == "stores-disagree" and rotating.posts == []
 
     @pytest.mark.parametrize("successor_in", ["file", "keychain"])
     @pytest.mark.parametrize(

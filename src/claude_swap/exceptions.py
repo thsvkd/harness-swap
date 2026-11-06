@@ -33,6 +33,30 @@ class KeychainUnavailableError(CredentialError):
     json_type = "keychain_unavailable"  # the --json error envelope's ``type``
 
 
+STORES_DISAGREE_MESSAGE = (
+    "The Keychain and the credentials file hold different logins; nothing was changed. "
+    "Run hswap claude keepalive --adopt file|keychain, naming the store whose writer "
+    "refreshed last."
+)
+RELOGIN_REQUIRED_MESSAGE = (
+    "This login's token is already spent, or another copy of it holds a different token "
+    "and no record shows which is newer; nothing was sent. Log in again with /login and "
+    "run hswap claude add."
+)
+
+
+class StoresDisagreeError(CredentialError):
+    """Keychain-required mode: the Keychain and the file hold different logins."""
+
+    json_type = "stores_disagree"
+
+
+class ReloginRequiredError(CredentialError):
+    """Keychain-required mode: nothing proves this token is the account's newest."""
+
+    json_type = "relogin_required"
+
+
 class ConfigError(ClaudeSwitchError):
     """Error related to configuration operations."""
 

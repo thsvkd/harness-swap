@@ -17,9 +17,19 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli, consumed_grants, macos_keychain, oauth
+from claude_swap import switcher as switcher_module
 from claude_swap.autoswitch import AutoSwitchEngine, TickOutcome
-from claude_swap.exceptions import ClaudeSwitchError, KeychainUnavailableError
+from claude_swap.exceptions import (
+    ClaudeSwitchError,
+    CredentialReadError,
+    KeychainUnavailableError,
+    ReloginRequiredError,
+    StoresDisagreeError,
+    SwitchError,
+)
 from claude_swap.keepalive import run_keepalive
+from claude_swap.session import SessionManager
+from claude_swap.transfer import import_accounts
 from claude_swap.models import Platform
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -618,9 +628,9 @@ class TestEncDoesNotShadowR9:
         assert not enc.exists()
         assert self._access(store) == "AT-new"
 
-    def test_R9_newer_enc_still_wins(self, store):
+    def test_R9_a_later_enc_does_not_win_on_its_expiry(self, store):
         enc = self._seed(store, enc_expires=7200, keychain_expires=100)
-        assert self._access(store) == "AT-enc"
+        assert self._access(store) == "AT-kc"
         assert enc.exists()
 
     def test_R9_refresh_token_outranks_a_later_date(self, store):
@@ -1132,14 +1142,29 @@ class TestRequiredModeReadsTheFileBeforeAnActivePost:
         assert self._post(store, candidate).error is None
         assert endpoint.posts == ["RT-K"]
 
-    def test_a_file_copy_spent_here_does_not_block_a_newer_token(self, store, temp_home, endpoint):
+    def test_a_file_copy_recorded_as_its_predecessor_does_not_block_a_token(
+        self, store, temp_home, endpoint
+    ):
+        spent = creds("AT-F", "RT-F", expires_in_s=100)
+        token = creds("AT-K", "RT-K", expires_in_s=7200)
+        (temp_home / ".claude" / ".credentials.json").write_text(spent, encoding="utf-8")
+        consumed_grants.record(
+            oauth.credential_fingerprint(spent), self.IDENTITY, consumed_grants.CONSUMED,
+            successor=oauth.credential_fingerprint(token),
+        )
+        assert self._post(store, token).error is None
+        assert endpoint.posts == ["RT-K"]
+
+    def test_a_file_copy_spent_here_with_no_link_blocks_even_a_later_token(
+        self, store, temp_home, endpoint
+    ):
         spent = creds("AT-F", "RT-F", expires_in_s=100)
         (temp_home / ".claude" / ".credentials.json").write_text(spent, encoding="utf-8")
         consumed_grants.record(
             oauth.credential_fingerprint(spent), self.IDENTITY, consumed_grants.CONSUMED
         )
-        assert self._post(store, creds("AT-K", "RT-K", expires_in_s=7200)).error is None
-        assert endpoint.posts == ["RT-K"]
+        assert self._post(store, creds("AT-K", "RT-K", expires_in_s=7200)).error == "transient"
+        assert endpoint.posts == []
 
     def test_a_newer_file_copy_spent_here_still_blocks_an_older_token(self, store, temp_home, endpoint):
         spent = creds("AT-F", "RT-F", expires_in_s=28000)
@@ -1375,34 +1400,6 @@ class TestOnlyKeepaliveReconcilesTheActiveStores:
         rows = store._store._list_unclaimed_credentials()
         assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
 
-    def test_stores_on_the_same_token_are_not_a_disagreement(
-        self, store, temp_home, block_real_keychain
-    ):
-        k = creds("AT-K", "RT-K")
-        block_real_keychain.data[ACTIVE_ITEM] = k
-        file_path = temp_home / ".claude" / ".credentials.json"
-        file_path.write_text(k, encoding="utf-8")
-        assert store.active_stores_disagree() is False
-        file_path.write_text(creds("AT-F", "RT-F"), encoding="utf-8")
-        assert store.active_stores_disagree() is True
-
-    def test_auto_does_not_switch_accounts_while_the_stores_disagree(
-        self, store, temp_home, block_real_keychain, monkeypatch
-    ):
-        store._write_account_credentials("2", "b@example.com", creds("AT-2", "RT-2"))
-        k = creds("AT-K", "RT-K")
-        block_real_keychain.data[ACTIVE_ITEM] = k
-        file_path = temp_home / ".claude" / ".credentials.json"
-        file_path.write_text(creds("AT-F", "RT-F"), encoding="utf-8")
-        events = []
-        engine = AutoSwitchEngine(store, AutoSwitchSettings(), events.append)
-        monkeypatch.setattr(
-            store, "switch_to", lambda *a, **kw: pytest.fail("the stores would be overwritten")
-        )
-        outcome = engine._perform("2", "b@example.com", "failover", (None, float("inf")))
-        assert outcome == TickOutcome.NO_ACTION
-        assert [event.reason for event in events] == ["stores-disagree"]
-
     def test_default_mode_still_restores_the_slot_copy(
         self, temp_home, block_real_keychain, endpoint, capsys
     ):
@@ -1412,3 +1409,507 @@ class TestOnlyKeepaliveReconcilesTheActiveStores:
         _main(["auto", "--once", "--json"], capsys)
         assert block_real_keychain.data[ACTIVE_ITEM] == a
         assert endpoint.posts == []
+
+
+_GATED_ENTRY_POINTS = {
+    "switch_to": lambda s, h: s.switch_to("2", json_output=True),
+    "force": lambda s, h: s.switch_to("1", json_output=True, force=True),
+    "add": lambda s, h: s.add_account(assume_yes=True),
+    "add-token": lambda s, h: s.add_account_from_token(
+        "sk-ant-oat01-" + "x" * 40, email="c@example.com", assume_yes=True
+    ),
+    "remove": lambda s, h: s.remove_account("2", assume_yes=True),
+    "swap": lambda s, h: s.swap_accounts("1", "2"),
+    "move": lambda s, h: s.move_account("2", "5"),
+    "persist": lambda s, h: s.persist_backup_credentials(
+        "2", "b@example.com", creds("AT-N", "RT-N")
+    ),
+    "import": lambda s, h: import_accounts(s, str(h / "export.json")),
+    "run": lambda s, h: SessionManager(s).setup_session("2", False, False),
+}
+
+
+class TestRequiredModeGate:
+    """Codex round 11: one gate, under the locks, for every write and POST."""
+
+    A_ID = ("a@example.com", "")
+    B_ID = ("b@example.com", "")
+
+    @pytest.fixture
+    def endpoint(self, monkeypatch):
+        fake = _TokenAndUsage()
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", fake)
+        return fake
+
+    @pytest.fixture
+    def store(self, temp_home, block_real_keychain, endpoint):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        set_setting(s.backup_dir, "updates.check", "false")
+        return s
+
+    def _engine(self, s, events):
+        return AutoSwitchEngine(s, AutoSwitchSettings(), events.append)
+
+    def _agreeing(self, s, home, keychain, a=None):
+        a = a or creds("AT-A", "RT-A", expires_in_s=28000)
+        keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", creds("AT-2", "RT-2", expires_in_s=28000))
+        file_path = home / ".claude" / ".credentials.json"
+        file_path.write_text(a, encoding="utf-8")
+        return a, file_path
+
+    def _disagreeing(self, s, home, keychain):
+        a, file_path = self._agreeing(s, home, keychain)
+        b = creds("AT-B", "RT-B", expires_in_s=7200)
+        file_path.write_text(b, encoding="utf-8")
+        return a, b, file_path
+
+    # Round 11, finding 1.
+
+    def test_a_refresh_landing_before_the_locks_stops_the_auto_switch(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch, capsys
+    ):
+        """No check before the locks can see this one: Claude Code refreshes the file
+        A -> B just as the switch reaches for them."""
+        a, file_path = self._agreeing(store, temp_home, block_real_keychain)
+        b = creds("AT-B", "RT-B", expires_in_s=7200)
+        slot_2 = store._read_account_credentials("2", "b@example.com")
+        real_lock = switcher_module.claude_credentials_lock
+
+        def refreshed_first(*args, **kwargs):
+            file_path.write_text(b, encoding="utf-8")
+            return real_lock(*args, **kwargs)
+
+        monkeypatch.setattr(switcher_module, "claude_credentials_lock", refreshed_first)
+        events = []
+        outcome = self._engine(store, events)._perform(
+            "2", "b@example.com", "failover", (None, float("inf"))
+        )
+        monkeypatch.setattr(switcher_module, "claude_credentials_lock", real_lock)
+        assert outcome == TickOutcome.NO_ACTION
+        assert [event.reason for event in events] == ["stores-disagree"]
+        assert file_path.read_text(encoding="utf-8") == b
+        assert block_real_keychain.data[ACTIVE_ITEM] == a
+        assert store._read_account_credentials("1", "a@example.com") == a
+        assert store._read_account_credentials("2", "b@example.com") == slot_2
+        assert store._get_sequence_data()["activeAccountNumber"] == 1
+
+        # Nor does anything later send the predecessor.
+        _main(["auto", "--once", "--json"], capsys)
+        assert store.consume_backup_grant("1", "a@example.com", a).error == "stores-disagree"
+        assert run_keepalive(ClaudeAccountSwitcher(), ahead=40000)["error"]["type"] == "split_brain"
+        assert endpoint.posts == []
+        assert file_path.read_text(encoding="utf-8") == b
+
+    def test_a_manual_switch_refuses_and_writes_nothing(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        self._disagreeing(store, temp_home, block_real_keychain)
+        before = snapshot(temp_home, block_real_keychain)
+        code, out, _ = _main(["--switch-to", "2", "--json"], capsys)
+        assert code == 1
+        assert json.loads(out)["error"]["type"] == "stores_disagree"
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert endpoint.posts == []
+
+    # Round 11, finding 2.
+
+    def _exited_session(self, s, copy):
+        session_dir = s._session_dir("2", "b@example.com")
+        session_dir.mkdir(parents=True, exist_ok=True)
+        path = session_dir / ".credentials.json"
+        path.write_text(copy, encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("session_expires", [300, 600, 1200], ids=["earlier", "equal", "later"])
+    def test_an_exited_sessions_successor_stops_the_slot_post_whatever_its_expiry(
+        self, store, temp_home, block_real_keychain, endpoint, session_expires
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
+        store._write_account_credentials("2", "b@example.com", a)
+        b = creds("AT-S", "RT-S", expires_in_s=session_expires)
+        path = self._exited_session(store, b)
+
+        outcome = store.consume_backup_grant("2", "b@example.com", a)
+        assert outcome.credentials is None and outcome.error == "relogin_required"
+        assert self._engine(store, [])._freshen_target("2", "b@example.com") == "invalid_grant"
+        assert endpoint.posts == []
+        assert path.read_text(encoding="utf-8") == b
+        assert store._read_account_credentials("2", "b@example.com") == a
+
+    def test_a_session_on_the_same_token_lets_the_post_through(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
+        store._write_account_credentials("2", "b@example.com", a)
+        self._exited_session(store, creds("AT-other", "RT-OLD", expires_in_s=300))
+        assert store.consume_backup_grant("2", "b@example.com", a).error is None
+        assert endpoint.posts == ["RT-OLD"]
+
+    def test_a_session_recorded_as_the_predecessor_lets_the_post_through(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        older = creds("AT-P", "RT-P", expires_in_s=9000)
+        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
+        store._write_account_credentials("2", "b@example.com", a)
+        self._exited_session(store, older)
+        consumed_grants.record(
+            oauth.credential_fingerprint(older), self.B_ID, consumed_grants.CONSUMED,
+            successor=oauth.credential_fingerprint(a),
+        )
+        assert store.consume_backup_grant("2", "b@example.com", a).error is None
+        assert endpoint.posts == ["RT-OLD"]
+
+    @pytest.mark.parametrize("state", ["consumed", "reserved"])
+    def test_a_token_on_the_ledger_is_refused_before_the_post(
+        self, store, temp_home, block_real_keychain, endpoint, state
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
+        store._write_account_credentials("2", "b@example.com", a)
+        consumed_grants.record(oauth.credential_fingerprint(a), self.B_ID, state)
+        assert store.consume_backup_grant("2", "b@example.com", a).error == "relogin_required"
+        assert endpoint.posts == []
+
+    def test_a_stashed_rival_stops_the_slot_post_and_a_linked_one_does_not(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
+        rival = creds("AT-R", "RT-R", expires_in_s=9000)
+        store._write_account_credentials("2", "b@example.com", a)
+        store._store._write_unclaimed_credential(rival, {
+            "reason": "keepalive-split-brain", "configSlot": "2",
+            "email": "b@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(rival),
+        })
+        assert store.consume_backup_grant("2", "b@example.com", a).error == "relogin_required"
+        assert endpoint.posts == []
+        consumed_grants.record(
+            oauth.credential_fingerprint(rival), self.B_ID, consumed_grants.CONSUMED,
+            successor=oauth.credential_fingerprint(a),
+        )
+        assert store.consume_backup_grant("2", "b@example.com", a).error is None
+        assert endpoint.posts == ["RT-OLD"]
+
+    def test_a_differing_leftover_enc_is_a_rival(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        a = creds("AT-OLD", "RT-OLD", expires_in_s=600)
+        store._write_account_credentials("2", "b@example.com", a)
+        store._store._write_backup_enc(
+            "2", "b@example.com", creds("AT-E", "RT-E", expires_in_s=100)
+        )
+        assert store.consume_backup_grant("2", "b@example.com", a).error == "relogin_required"
+        assert endpoint.posts == []
+
+    def test_switching_to_a_slot_a_session_has_moved_past_is_refused(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch
+    ):
+        """Activating it would make the stores agree on a spent token."""
+        self._agreeing(store, temp_home, block_real_keychain)
+        path = self._exited_session(store, creds("AT-S", "RT-S", expires_in_s=7200))
+        before = snapshot(temp_home, block_real_keychain)
+        with pytest.raises(ReloginRequiredError):
+            store.switch_to("2", json_output=True)
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert path.exists()
+
+    def test_no_expiry_decides_which_slot_copy_is_read(self, store):
+        store._write_account_credentials("2", "b@example.com", creds("AT-K", "RT-K", expires_in_s=100))
+        store._store._write_backup_enc("2", "b@example.com", creds("AT-E", "RT-E", expires_in_s=9000))
+        read = oauth.extract_access_token(store._read_account_credentials("2", "b@example.com"))
+        assert read == "AT-K"
+
+    def test_two_recorded_successors_of_one_token_defer(self, store, temp_home, block_real_keychain):
+        x = creds("AT-X", "RT-X")
+        x_fp = oauth.credential_fingerprint(x)
+        y = creds("AT-Y", "RT-Y")
+        y_fp = oauth.credential_fingerprint(y)
+        for value in (creds("AT-1", "RT-1"), creds("AT-2", "RT-2")):
+            store.stash_consumed_successor("1", self.A_ID, value, y_fp, "keepalive-live-write-failed")
+        manifest = store._store._read_stash_manifest()
+        with pytest.raises(CredentialReadError):
+            store.stash_chain_terminal(manifest, lambda row: True, "start", y, x_fp)
+
+    # Every entry point, with the stores apart.
+
+    @pytest.mark.parametrize("entry", sorted(_GATED_ENTRY_POINTS))
+    def test_every_entry_point_refuses_and_writes_nothing(
+        self, store, temp_home, block_real_keychain, endpoint, entry
+    ):
+        self._disagreeing(store, temp_home, block_real_keychain)
+        (temp_home / "export.json").write_text(json.dumps({"version": 1, "accounts": []}), encoding="utf-8")
+        before = snapshot(temp_home, block_real_keychain)
+        with pytest.raises(StoresDisagreeError):
+            _GATED_ENTRY_POINTS[entry](store, temp_home)
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert endpoint.posts == []
+
+    def test_purge_refuses_and_writes_nothing(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch
+    ):
+        self._disagreeing(store, temp_home, block_real_keychain)
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        before = snapshot(temp_home, block_real_keychain)
+        with pytest.raises(StoresDisagreeError):
+            store.purge()
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_the_stash_cannot_be_purged_past_a_disagreement(
+        self, store, temp_home, block_real_keychain, capsys
+    ):
+        self._disagreeing(store, temp_home, block_real_keychain)
+        entry = store._store._write_unclaimed_credential(creds("AT-X", "RT-X"), {"reason": "test"})
+        code, _, _ = _main(["unclaimed", "--purge", entry], capsys)
+        assert code == 1
+        assert entry in store._store._list_unclaimed_credentials()
+
+    @pytest.mark.parametrize("name", ["fetch", "resync", "gate", "gate-held"])
+    def test_the_never_raising_paths_refuse_and_write_nothing(
+        self, store, temp_home, block_real_keychain, endpoint, name
+    ):
+        a, _, _ = self._disagreeing(store, temp_home, block_real_keychain)
+        before = snapshot(temp_home, block_real_keychain)
+        if name == "fetch":
+            store._fetch_active_usage("1", "a@example.com", creds("AT-old", "RT-old", expires_in_s=-60), "")
+        elif name == "resync":
+            key = store._lineage_key("1", "a@example.com", oauth.credential_fingerprint(a))
+            store._probe_verdicts[key] = True
+            store._resync_rotated_backup("1", "a@example.com", "", a)
+        else:
+            outcome = (
+                store.consume_backup_grant("2", "b@example.com", a)
+                if name == "gate"
+                else store._consume_backup_grant_locked("2", "b@example.com", a, global_lock_held=True)
+            )
+            assert outcome.error == "stores-disagree"
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert endpoint.posts == []
+
+    def test_adopt_alone_passes_a_disagreement(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        _, b, _ = self._disagreeing(store, temp_home, block_real_keychain)
+        report = run_keepalive(ClaudeAccountSwitcher(), adopt="file")
+        assert report["ok"] is True and report["action"] == "adopted"
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+
+    def test_an_unreadable_file_counts_as_a_disagreement(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        _, file_path = self._agreeing(store, temp_home, block_real_keychain)
+        real = Path.read_text
+
+        def denied(self, *a, **kw):
+            if self == file_path:
+                raise PermissionError("denied")
+            return real(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+        with pytest.raises(StoresDisagreeError):
+            store._required_mode_gate()
+
+    def test_the_gate_holds_the_locks_it_asks_for(
+        self, store, temp_home, block_real_keychain, endpoint, monkeypatch
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        held = []
+        real_lock = switcher_module.claude_credentials_lock
+        real_gate = ClaudeAccountSwitcher._required_mode_gate
+
+        class Spy:
+            def __enter__(self):
+                held.append("claude")
+                self.inner = real_lock()
+                return self.inner.__enter__()
+
+            def __exit__(self, *exc):
+                held.remove("claude")
+                return self.inner.__exit__(*exc)
+
+        calls = []
+
+        def gate(self, *a, **kw):
+            calls.append("claude" in held)  # the callers' own handlers would swallow an assert
+            return real_gate(self, *a, **kw)
+
+        monkeypatch.setattr(switcher_module, "claude_credentials_lock", Spy)
+        monkeypatch.setattr(ClaudeAccountSwitcher, "_required_mode_gate", gate)
+        store.consume_backup_grant(
+            "2", "b@example.com", store._read_account_credentials("2", "b@example.com")
+        )
+        store.add_account(assume_yes=True)
+        store.swap_accounts("1", "2")
+        assert calls and all(calls)
+
+    def test_a_switch_to_an_empty_slot_is_still_refused_as_a_disagreement(
+        self, store, temp_home, block_real_keychain
+    ):
+        self._disagreeing(store, temp_home, block_real_keychain)
+        store._delete_account_credentials("2", "b@example.com")
+        with pytest.raises(StoresDisagreeError):
+            store.switch_to("2", json_output=True)
+
+    def test_a_stash_row_is_not_adopted_by_the_consume_gate_with_the_stores_apart(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._disagreeing(store, temp_home, block_real_keychain)
+        x = store._read_account_credentials("2", "b@example.com")
+        y = creds("AT-Y", "RT-Y", expires_in_s=28000)
+        store.stash_consumed_successor(
+            "2", self.B_ID, y, oauth.credential_fingerprint(x), "keepalive-live-write-failed"
+        )
+        assert store.consume_backup_grant("2", "b@example.com", x).error == "stores-disagree"
+        assert store._read_account_credentials("2", "b@example.com") == x
+        assert len(store._store._list_unclaimed_credentials()) == 1
+
+    def test_a_stashed_copy_does_not_stop_the_live_token(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        """The live stores are authoritative: the rival check is for a slot's token."""
+        near = creds("AT-A", "RT-A", expires_in_s=600)
+        self._agreeing(store, temp_home, block_real_keychain, a=near)
+        rival = creds("AT-R", "RT-R", expires_in_s=9000)
+        store._store._write_unclaimed_credential(rival, {
+            "reason": "keepalive-split-brain", "configSlot": "1",
+            "email": "a@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(rival),
+        })
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["action"] == "refreshed"
+        assert endpoint.posts == ["RT-A"]
+
+    def test_a_live_session_on_another_token_refuses_the_switch_whatever_its_expiry(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        self._exited_session(store, creds("AT-S", "RT-S", expires_in_s=60))
+        monkeypatch.setattr(
+            "claude_swap.session.scan_live_sessions",
+            lambda path: ([SimpleNamespace(pid=4242)], 0),
+        )
+        with pytest.raises(SwitchError, match="rotated past"):
+            store.switch_to("2", json_output=True)
+
+    def test_an_attributed_live_token_goes_whatever_the_slot_expiry_says(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        a = creds("AT-A", "RT-A", expires_in_s=28000)
+        b = creds("AT-B", "RT-B", expires_in_s=-60)
+        store._write_account_credentials("1", "a@example.com", a)
+        block_real_keychain.data[ACTIVE_ITEM] = b
+        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
+        key = store._lineage_key("1", "a@example.com", oauth.credential_fingerprint(b))
+        store._probe_verdicts[key] = True
+        store._fetch_active_usage("1", "a@example.com", b, "")
+        assert endpoint.posts == ["RT-B"]
+
+    def test_run_refuses_to_seed_a_profile_over_a_sessions_other_token(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._agreeing(store, temp_home, block_real_keychain)
+        b = creds("AT-S", "RT-S", expires_in_s=7200)
+        path = self._exited_session(store, b)
+        with pytest.raises(ReloginRequiredError):
+            SessionManager(store).setup_session("2", False, False)
+        assert path.read_text(encoding="utf-8") == b
+        assert endpoint.posts == []
+
+    def test_adopt_clears_earlier_rivals_for_the_chosen_login(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        self._disagreeing(store, temp_home, block_real_keychain)
+        rival = creds("AT-R", "RT-R", expires_in_s=9000)
+        store._store._write_unclaimed_credential(rival, {
+            "reason": "keepalive-split-brain", "configSlot": "1",
+            "email": "a@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(rival),
+        })
+        assert run_keepalive(ClaudeAccountSwitcher(), adopt="file")["ok"] is True
+        fresh = ClaudeAccountSwitcher()
+        fresh.platform = Platform.MACOS
+        fresh.switch_to("2", json_output=True)
+        left = fresh._read_account_credentials("1", "a@example.com")
+        assert oauth.extract_access_token(left) == "AT-B"
+        assert fresh.consume_backup_grant("1", "a@example.com", left).error is None
+        assert endpoint.posts == ["RT-B"]
+
+    # Healthy paths.
+
+    def test_a_healthy_auto_switch_works_and_each_due_token_goes_once(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        _, file_path = self._agreeing(store, temp_home, block_real_keychain)
+        slot_2 = creds("AT-2", "RT-2", expires_in_s=7200)
+        store._write_account_credentials("2", "b@example.com", slot_2)
+        events = []
+        outcome = self._engine(store, events)._perform(
+            "2", "b@example.com", "failover", (None, float("inf"))
+        )
+        assert outcome == TickOutcome.SWITCHED
+        assert oauth.extract_access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-2"
+        assert oauth.extract_access_token(file_path.read_text(encoding="utf-8")) == "AT-2"
+        assert endpoint.posts == []
+
+        # The new active comes due, and the one left behind later comes due too.
+        for _ in range(2):
+            run_keepalive(ClaudeAccountSwitcher(), ahead=7300)
+        assert endpoint.posts == ["RT-2"]
+        left = store._read_account_credentials("1", "a@example.com")
+        assert oauth.extract_access_token(left) == "AT-A"
+        fresh = ClaudeAccountSwitcher()
+        fresh.platform = Platform.MACOS
+        assert fresh.consume_backup_grant("1", "a@example.com", left).error is None
+        assert endpoint.posts == ["RT-2", "RT-A"]
+
+    def test_a_login_rotated_while_active_stays_refreshable_after_the_switch(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        """The outgoing backup replaces the slot's older copy, and records it as the
+        predecessor: otherwise the kept copy would read as a rival for good."""
+        old = creds("AT-OLD", "RT-OLD", expires_in_s=7200)
+        a, _ = self._agreeing(store, temp_home, block_real_keychain, a=creds("AT-A", "RT-A", expires_in_s=28000))
+        store._write_account_credentials("1", "a@example.com", old)
+        store.switch_to("2", json_output=True)
+        assert store._read_account_credentials("1", "a@example.com") == a
+        rows = store._store._list_unclaimed_credentials()
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [old]
+        assert store.consume_backup_grant("1", "a@example.com", a).error is None
+        assert endpoint.posts == ["RT-A"]
+
+    def test_a_new_login_clears_every_earlier_rival(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        rival = creds("AT-R", "RT-R", expires_in_s=9000)
+        store._store._write_unclaimed_credential(rival, {
+            "reason": "keepalive-split-brain", "configSlot": "1",
+            "email": "a@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(rival),
+        })
+        a, _ = self._agreeing(store, temp_home, block_real_keychain)
+        store.add_account(assume_yes=True)
+        store.switch_to("2", json_output=True)
+        assert store.consume_backup_grant("1", "a@example.com", a).error is None
+        assert endpoint.posts == ["RT-A"]
+
+    def test_default_mode_takes_no_gate_and_no_extra_lock(
+        self, temp_home, block_real_keychain, endpoint
+    ):
+        s = macos_store(temp_home)
+        a = creds("AT-A", "RT-A", expires_in_s=28000)
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials("1", "a@example.com", a)
+        s._write_account_credentials("2", "b@example.com", creds("AT-2", "RT-2", expires_in_s=7200))
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            creds("AT-B", "RT-B"), encoding="utf-8"
+        )
+        s._required_mode_gate()  # returns at once with the stores apart
+        s.switch_to("2", json_output=True)
+        assert oauth.extract_access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-2"

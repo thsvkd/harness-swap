@@ -50,6 +50,10 @@ from typing import TYPE_CHECKING, NoReturn
 from claude_swap import macos_keychain, spawn
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
+    RELOGIN_REQUIRED_MESSAGE,
+    STORES_DISAGREE_MESSAGE,
+    ReloginRequiredError,
+    StoresDisagreeError,
     ClaudeCodeLockTimeout,
     CredentialReadError,
     SessionError,
@@ -731,6 +735,11 @@ class SessionManager:
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
+            # Seeding the profile from this copy would let claude itself present it.
+            if outcome.error == "stores-disagree":
+                raise StoresDisagreeError(STORES_DISAGREE_MESSAGE)
+            if outcome.error == "relogin_required":
+                raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
                 # and safe to activate" signal, and it is NOT implied by
@@ -785,7 +794,11 @@ class SessionManager:
                     "continuing with the stored credentials."
                 )
 
-        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+        with (
+            FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT),
+            self.switcher._required_mode_locks(),
+        ):
+            self.switcher._required_mode_gate()
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):

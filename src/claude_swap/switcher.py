@@ -11,7 +11,9 @@ import shutil
 import threading
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from functools import wraps
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -24,7 +26,11 @@ from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
     LockError,
+    RELOGIN_REQUIRED_MESSAGE,
+    ReloginRequiredError,
     SessionError,
+    STORES_DISAGREE_MESSAGE,
+    StoresDisagreeError,
     SwitchError,
     ValidationError,
 )
@@ -53,6 +59,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     CredentialStore,
     _credential_object,
     credential_generation,
+    holds_no_login,
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -216,6 +223,12 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "stores-disagree": (
+        "the Keychain and the credentials file hold different logins — run keepalive"
+    ),
+    "relogin_required": (
+        "nothing proves this slot's token is the newest — log in again and re-add it"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -324,6 +337,17 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+
+
+def _gated_in_required_mode(method):
+    """An entry point whose whole body runs inside `_required_mode_section`."""
+
+    @wraps(method)
+    def gated(self, *args, **kwargs):
+        with self._required_mode_section():
+            return method(self, *args, **kwargs)
+
+    return gated
 
 
 class ClaudeAccountSwitcher:
@@ -699,8 +723,8 @@ class ClaudeAccountSwitcher:
 
     def _file_permits_post(self, credentials: str) -> bool:
         """The file holds no other login of this account that could be newer. A later
-        expiry is no proof of that, so a differing copy only passes when the ledger
-        shows it spent here and this one is newer."""
+        expiry is no proof of that, so a differing copy only passes when a record shows
+        this one descends from it."""
         try:
             file_creds = get_credentials_path().read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -715,47 +739,194 @@ class ClaudeAccountSwitcher:
         if _credential_object(file_creds) is None:
             return False
         try:
-            spent_here = consumed_grants.entry(fingerprint) is not None
+            return oauth.credential_fingerprint(credentials) in self._recorded_successors(
+                self._get_current_account(), None, fingerprint
+            )
         except consumed_grants.LedgerUnreadable:
             return False
-        return spent_here and credential_generation(credentials) > credential_generation(file_creds)
 
-    def active_stores_disagree(self) -> bool:
-        """Required mode: the rule `post_refresh` applies to a POST, for anything else
-        that would write the active login's stores. Only keepalive reconciles them."""
+    def _required_mode_locks(self):
+        """Claude Code's refresh locks, which the gate needs held. Default mode: none."""
+        return claude_credentials_lock() if self._store._keychain_is_required() else nullcontext()
+
+    @contextmanager
+    def _required_mode_section(self) -> Iterator[None]:
+        """The slot lock, Claude Code's locks, then the gate. Default mode: nothing."""
         if not self._store._keychain_is_required():
-            return False
-        live = self._read_credentials()
-        return live is None or not self._file_permits_post(live)
+            yield
+            return
+        with FileLock(self.lock_file), claude_credentials_lock():
+            self._required_mode_gate()
+            yield
+
+    def _required_mode_gate(
+        self,
+        candidate: str | None = None,
+        account: tuple[str, str, str] | None = None,
+        *,
+        reconciling: bool = False,
+    ) -> None:
+        """The one check before every required-mode write of a credential store or POST
+        of a refresh token, with the slot lock and Claude Code's locks held.
+
+        The stores must agree: only `keepalive --adopt` writes past a disagreement, and
+        ``reconciling`` (keepalive) past one a record explains. A ``candidate`` from
+        ``account`` (number, email, organization) must also be off the ledger, and every
+        other copy of that account must be provably its predecessor. Nothing here looks
+        at an expiry or a write time: a refresh can issue a shorter lifetime and a clock
+        can step back. Raises StoresDisagreeError or ReloginRequiredError.
+        """
+        if not self._store._keychain_is_required():
+            return
+        keychain, failed = self._store._read_one_oauth_keychain(CLAUDE_CODE_KEYCHAIN_SERVICE)
+        if failed:
+            raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
+        try:
+            file_creds = get_credentials_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            file_creds = ""
+        except (OSError, UnicodeDecodeError) as e:
+            raise StoresDisagreeError(STORES_DISAGREE_MESSAGE) from e
+        file_creds = file_creds if file_creds.strip() else ""
+        live = {
+            oauth.credential_fingerprint(creds)
+            for creds in (keychain or "", file_creds)
+            if not holds_no_login(creds)
+        }
+        active = self._get_current_account()
+        if len(live) > 1:
+            keychain_fp = oauth.credential_fingerprint(keychain)
+            file_fp = oauth.credential_fingerprint(file_creds)
+            explained = (
+                file_fp in self._recorded_successors(active, None, keychain_fp)
+            ) != (keychain_fp in self._recorded_successors(active, None, file_fp))
+            if not (reconciling and explained):
+                raise StoresDisagreeError(STORES_DISAGREE_MESSAGE)
+        if candidate is None or account is None:
+            return
+
+        fingerprint = oauth.credential_fingerprint(candidate)
+        if consumed_grants.entry(fingerprint) is not None:
+            raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
+        num, email, org_uuid = account
+        from claude_swap.session import read_session_credentials, session_identity_drifted
+
+        session_dir = self._session_dir(num, email)
+        profile = read_session_credentials(session_dir)
+        others = (
+            [profile]
+            if profile and not session_identity_drifted(session_dir, email, org_uuid)
+            else []
+        )
+        others = [oauth.credential_fingerprint(creds) for creds in others]
+        # The live stores are authoritative over the slot and the stash (see keepalive).
+        if not ((email, org_uuid) == active and fingerprint in live):
+            if (email, org_uuid) == active:
+                others.extend(live)
+            copy, unreadable = self._read_account_credentials_ex(num, email)
+            if unreadable:
+                raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
+            others.append(oauth.credential_fingerprint(copy))
+            others.append(
+                oauth.credential_fingerprint(self._store._leftover_backup_enc(num, email))
+            )
+            others.extend(
+                row.get("fingerprint")
+                for row in self._store._read_stash_manifest().values()
+                if (row.get("email"), row.get("organizationUuid", "")) == (email, org_uuid)
+            )
+        for other in others:
+            if (
+                other
+                and other != fingerprint
+                and fingerprint not in self._recorded_successors((email, org_uuid), num, other)
+            ):
+                raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
+
+    def _recorded_successors(
+        self, identity: tuple[str, str] | None, slot: str | None, fingerprint: str | None
+    ) -> set[str]:
+        """Every login recorded as descending from this one on this account: by this
+        machine's own POST or a replacement (the ledger's successorFp), or a parked
+        successor (the stash's consumedFp)."""
+        identity = identity or ("", "")
+        manifest = self._store._read_stash_manifest()
+
+        def is_ours(meta: dict) -> bool:
+            if "email" in meta:
+                return (meta["email"], meta.get("organizationUuid", "")) == identity
+            return slot is not None and meta.get("configSlot") == slot
+
+        found: set[str] = set()
+        pending = [fingerprint]
+        while pending:
+            current = pending.pop()
+            row = consumed_grants.entry(current) or {}
+            links = [
+                meta.get("fingerprint")
+                for meta in manifest.values()
+                if meta.get("consumedFp") == current
+                and meta.get("reason") != "consume-gate-cas-conflict"
+                and is_ours(meta)
+            ]
+            if (row.get("email"), row.get("organizationUuid")) == identity:
+                links.append(row.get("successorFp"))
+            for link in links:
+                if link and link != fingerprint and link not in found:
+                    found.add(link)
+                    pending.append(link)
+        return found
 
     def _keep_slot_copy_before_overwrite(
-        self, account_num: str, email: str, org_uuid: str, live: str
+        self, account_num: str, email: str, org_uuid: str, live: str, *, new_login: bool = False
     ) -> None:
-        """Required mode: a slot copy of another lineage is kept before the live login
-        replaces it. Raises when it cannot be, which must stop the overwrite."""
+        """Required mode: a slot copy of another lineage is kept before the login that
+        replaces it lands, and recorded as that login's predecessor. Without the record
+        the kept copy would read as a rival for good. ``new_login``: an explicit add or
+        import, which supersedes every copy the account has stashed too. Raises when it
+        cannot keep the copy, which must stop the overwrite."""
         if not self._store._keychain_is_required():
             return
         copy, unreadable = self._read_account_credentials_ex(account_num, email)
         if unreadable:
             raise CredentialReadError(f"account {account_num}'s stored credential is unreadable")
+        identity = (email, org_uuid or "")
+        successor = oauth.credential_fingerprint(live)
         fingerprint = oauth.credential_fingerprint(copy)
-        if not copy or fingerprint == oauth.credential_fingerprint(live):
-            return
-        if any(
-            row.get("fingerprint") == fingerprint
-            for row in self._store._list_unclaimed_credentials().values()
-        ):
-            return
-        self._store._write_unclaimed_credential(
-            copy,
-            {
-                "reason": "slot-replaced-by-live",
-                "configSlot": account_num,
-                "email": email,
-                "organizationUuid": org_uuid or "",
-                "fingerprint": fingerprint,
-            },
-        )
+        if copy and fingerprint != successor:
+            if not any(
+                row.get("fingerprint") == fingerprint
+                for row in self._store._list_unclaimed_credentials().values()
+            ):
+                self._store._write_unclaimed_credential(
+                    copy,
+                    {
+                        "reason": "slot-replaced-by-live",
+                        "configSlot": account_num,
+                        "email": email,
+                        "organizationUuid": org_uuid or "",
+                        "fingerprint": fingerprint,
+                    },
+                )
+            consumed_grants.record(
+                fingerprint, identity, consumed_grants.CONSUMED, successor=successor
+            )
+        if new_login:
+            self.supersede_stashed_copies(identity, live)
+
+    def supersede_stashed_copies(self, identity: tuple[str, str], login: str) -> None:
+        """A person chose this login: every copy stashed for the account is behind it."""
+        successor = oauth.credential_fingerprint(login)
+        for row in self._store._read_stash_manifest().values():
+            stashed = row.get("fingerprint")
+            if (
+                stashed
+                and stashed != successor
+                and (row.get("email"), row.get("organizationUuid", "")) == identity
+            ):
+                consumed_grants.record(
+                    stashed, identity, consumed_grants.CONSUMED, successor=successor
+                )
 
     def stash_consumed_successor(
         self,
@@ -1252,7 +1423,8 @@ class ClaudeAccountSwitcher:
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
         self._refuse_session_shell()
-        with FileLock(self.lock_file):
+        with FileLock(self.lock_file), self._required_mode_locks():
+            self._required_mode_gate()
             return self._swap_accounts_locked(first, second)
 
     def _read_backup_or_abort(self, account_num: str, email: str) -> str:
@@ -1695,7 +1867,8 @@ class ClaudeAccountSwitcher:
         # the mutation (via the *_locked helpers — FileLock is non-reentrant):
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
-        with FileLock(self.lock_file):
+        with FileLock(self.lock_file), self._required_mode_locks():
+            self._required_mode_gate()
             self._get_sequence_data_migrated()
 
             num_src = self._resolve_account_identifier(account)
@@ -1894,18 +2067,6 @@ class ClaudeAccountSwitcher:
     def read_account_credentials(self, account_num: str, email: str) -> str:
         """Public wrapper for session bootstrap. Empty string when missing."""
         return self._read_account_credentials(account_num, email)
-
-    def write_account_credentials(
-        self, account_num: str, email: str, credentials: str
-    ) -> None:
-        """Public wrapper for session bootstrap.
-
-        Takes NO lock: the caller is expected to hold ``self.lock_file``
-        already. Never combine with the locking persist callback in
-        list_accounts() — FileLock is not re-entrant across instances in one
-        process (see the v0.7.3 deadlock history).
-        """
-        self._write_account_credentials(account_num, email, credentials)
 
     def read_account_config(self, account_num: str, email: str) -> str:
         """Public wrapper for session bootstrap. Empty string when missing."""
@@ -2331,7 +2492,8 @@ class ClaudeAccountSwitcher:
         the persist callback ``_fetch_account_usage`` uses. The caller must NOT
         hold ``self.lock_file`` (FileLock is non-reentrant).
         """
-        with FileLock(self.lock_file):
+        with FileLock(self.lock_file), self._required_mode_locks():
+            self._required_mode_gate()
             self._write_account_credentials(account_num, email, credentials)
 
     def account_identity(self, account_num: str) -> dict:
@@ -2499,7 +2661,8 @@ class ClaudeAccountSwitcher:
         )
 
         try:
-            with slot_lock():
+            with slot_lock(), nullcontext() if global_lock_held else self._required_mode_locks():
+                self._required_mode_gate()
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2578,7 +2741,11 @@ class ClaudeAccountSwitcher:
                 # With the credential, under this lock: once it is released a
                 # `move` can hand this number to someone else.
                 identity = (email, org_uuid)
-                if not self._live_session_pids(account_num, email):
+                self._required_mode_gate(refresh_input, (account_num, email, org_uuid))
+                if (
+                    not self._store._keychain_is_required()
+                    and not self._live_session_pids(account_num, email)
+                ):
                     sdir = session_dir_for(self.backup_dir, account_num, email)
                     profile = read_session_credentials(sdir)
                     if (
@@ -2593,26 +2760,14 @@ class ClaudeAccountSwitcher:
                         prof_oauth = oauth.extract_oauth_data(profile)
                         cur_exp = (input_oauth or {}).get("expiresAt") or 0
                         prof_exp = (prof_oauth or {}).get("expiresAt") or 0
-                        profile_differs = (
+                        if (
                             prof_oauth
                             and prof_oauth.get("accessToken")
                             and prof_oauth.get("refreshToken")
                             and oauth.credential_fingerprint(profile)
                             != oauth.credential_fingerprint(refresh_input)
-                        )
-                        if (
-                            profile_differs
-                            and global_lock_held
-                            and self._store._keychain_is_required()
+                            and prof_exp > cur_exp
                         ):
-                            # Keepalive orders nothing by expiry: the session may
-                            # have spent this token, or may hold an older one.
-                            self._logger.info(
-                                "Account %s's session profile holds another token; "
-                                "deferring the refresh.", account_num,
-                            )
-                            return oauth.RefreshOutcome(None, "transient")
-                        if profile_differs and prof_exp > cur_exp:
                             # The profile holds the newer generation: the
                             # backup rt is already consumed. Resync so the
                             # slot's stored credential is the live lineage,
@@ -2623,6 +2778,12 @@ class ClaudeAccountSwitcher:
                             refresh_input = profile
                             input_oauth = prof_oauth
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
+        except StoresDisagreeError:
+            return oauth.RefreshOutcome(None, "stores-disagree")
+        except ReloginRequiredError:
+            return oauth.RefreshOutcome(None, "relogin_required")
+        except consumed_grants.LedgerUnreadable:
+            return oauth.RefreshOutcome(None, "ledger-unreadable")
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
             # the slot; defer cleanly rather than raise through callers
@@ -3079,6 +3240,8 @@ class ClaudeAccountSwitcher:
                 oauth.credential_fingerprint(value) in seen for _, value in links
             ):
                 raise CredentialReadError("stash successors form a cycle or too long a chain")
+            if len(links) > 1 and self._store._keychain_is_required():
+                raise CredentialReadError("two recorded successors of one token")
             link_id, creds = max(links, key=lambda link: credential_generation(link[1]))
             chain.append(link_id)
             seen.add(oauth.credential_fingerprint(creds))
@@ -3296,6 +3459,8 @@ class ClaudeAccountSwitcher:
             backup
         ):
             return None
+        if self._store._keychain_is_required():
+            return profile  # a different token is all that can be told without an expiry
         issued = oauth.extract_oauth_data(profile) or {}
         stored = oauth.extract_oauth_data(backup) or {}
         try:
@@ -3348,6 +3513,10 @@ class ClaudeAccountSwitcher:
         """
         from claude_swap.session import profile_is_quiescent, read_session_identity
 
+        # Required mode: nothing proves a session's copy is newer, so it is never
+        # adopted; the gate refuses the slot's copy while the two differ.
+        if self._store._keychain_is_required():
+            return False
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
             if not profile_is_quiescent(session_dir):
@@ -3982,6 +4151,7 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    @_gated_in_required_mode
     def add_account(
         self,
         slot: int | None = None,
@@ -4063,6 +4233,9 @@ class ClaudeAccountSwitcher:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
+            self._keep_slot_copy_before_overwrite(
+                account_num, current_email, current_org_uuid, current_creds, new_login=True
+            )
             self._write_account_credentials(account_num, current_email, current_creds)
             self._write_account_config(account_num, current_email, current_config)
             self._usage_store.clear_dead_token(
@@ -4206,6 +4379,9 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, data)
 
         # Store backups
+        self._keep_slot_copy_before_overwrite(
+            account_num, current_email, organization_uuid, current_creds, new_login=True
+        )
         self._write_account_credentials(account_num, current_email, current_creds)
         self._write_account_config(account_num, current_email, current_config)
         self._usage_store.clear_dead_token(
@@ -4330,7 +4506,11 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
-            self._write_account_credentials(account_num, email, credentials)
+            with self._required_mode_section():
+                self._keep_slot_copy_before_overwrite(
+                    account_num, email, "", credentials, new_login=True
+                )
+                self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
             # A refreshed credential invalidates any dead-token quarantine on this
             # slot (mirrors ``add_account``); otherwise the stale strike row keeps
@@ -4414,7 +4594,11 @@ class ClaudeAccountSwitcher:
             del data["accounts"][migrate_from]
             self._write_json(self.sequence_file, data)
 
-        self._write_account_credentials(account_num, email, credentials)
+        with self._required_mode_section():
+            self._keep_slot_copy_before_overwrite(
+                account_num, email, "", credentials, new_login=True
+            )
+            self._write_account_credentials(account_num, email, credentials)
         self._write_account_config(account_num, email, config)
         # Reusing/overwriting a slot with a fresh credential lifts any dead-token
         # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
@@ -4523,15 +4707,16 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
-        # Remove backup files
-        self._delete_account_files(account_num, email)
+        with self._required_mode_section():
+            # Remove backup files
+            self._delete_account_files(account_num, email)
 
-        # Update sequence.json
-        del data["accounts"][account_num]
-        data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-        data["lastUpdated"] = get_timestamp()
+            # Update sequence.json
+            del data["accounts"][account_num]
+            data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
+            data["lastUpdated"] = get_timestamp()
 
-        self._write_json(self.sequence_file, data)
+            self._write_json(self.sequence_file, data)
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
@@ -4824,10 +5009,8 @@ class ClaudeAccountSwitcher:
                 #   backup.
                 if not self._live_identity_matches(email, org_uuid):
                     return _defer(force_refresh)
-                # Required mode: only keepalive reconciles the two stores.
                 required = self._store._keychain_is_required()
-                if required and not self._file_permits_post(live):
-                    return _defer(force_refresh)
+                self._required_mode_gate()
                 # A successor an earlier pass could not persist: nothing below
                 # may POST past it, the generation it supersedes is spent.
                 for held in (backup, live):
@@ -4965,7 +5148,7 @@ class ClaudeAccountSwitcher:
                         if (
                             live_oauth
                             and live_oauth.get("refreshToken")
-                            and live_exp > backup_exp
+                            and (required or live_exp > backup_exp)
                         ):
                             if self._probe_verdicts.get(
                                 self._lineage_key(
@@ -5162,6 +5345,8 @@ class ClaudeAccountSwitcher:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
                         return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        except StoresDisagreeError:
+            return _defer(force_refresh)
         except LockError:
             # A live holder — Claude Code mid-refresh (ClaudeCodeLockTimeout)
             # or another cswap operation holding the account FileLock. Either
@@ -5316,11 +5501,7 @@ class ClaudeAccountSwitcher:
                     == oauth.credential_fingerprint(creds)
                 ):
                     return
-                if (
-                    self._store._keychain_is_required()
-                    and not self._file_permits_post(live)
-                ):
-                    return
+                self._required_mode_gate()
                 self._keep_slot_copy_before_overwrite(account_num, email, org_uuid, live)
                 self._write_account_credentials(account_num, email, live)
                 self._logger.info(
@@ -5328,7 +5509,7 @@ class ClaudeAccountSwitcher:
                     "credential (rotation completed outside a collect pass).",
                     account_num,
                 )
-        except LockError:
+        except (LockError, StoresDisagreeError):
             return  # holder is mid-operation; the next pass retries
         except Exception:
             self._logger.warning(
@@ -7430,10 +7611,21 @@ class ClaudeAccountSwitcher:
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
         with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+            self._required_mode_gate()
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
+            target_copy = self._read_account_credentials(target_account, target_email)
+            if target_copy:
+                self._required_mode_gate(
+                    target_copy,
+                    (
+                        target_account,
+                        target_email,
+                        data["accounts"][target_account].get("organizationUuid", "") or "",
+                    ),
+                )
             to_ref = account_ref(int(target_account), target_email)
             current_identity = self._get_current_account()
             if current_identity is not None:
@@ -7766,6 +7958,9 @@ class ClaudeAccountSwitcher:
                     # call a best-effort recovery cushion. Log only:
                     # indistinguishable from a legitimate rotation, so a
                     # warning would cry wolf.
+                    self._keep_slot_copy_before_overwrite(
+                        current_account, current_email, current_org_uuid, original_creds
+                    )
                     self._write_account_credentials(
                         current_account, current_email, original_creds
                     )
@@ -7791,6 +7986,9 @@ class ClaudeAccountSwitcher:
                         "credentials unchanged)"
                     )
                 else:  # own-family / own-rotated
+                    self._keep_slot_copy_before_overwrite(
+                        current_account, current_email, current_org_uuid, original_creds
+                    )
                     self._write_account_credentials(
                         current_account, current_email, original_creds
                     )
@@ -8000,6 +8198,10 @@ class ClaudeAccountSwitcher:
         if confirm.lower() != "y":
             print(dimmed("Cancelled"))
             return
+
+        # Checked and released: what follows never touches the live stores.
+        with self._required_mode_section():
+            pass
 
         removed_items = []
 

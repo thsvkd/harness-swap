@@ -36,11 +36,13 @@ from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     _credential_object,
     credential_generation,
+    holds_no_login,
 )
 from claude_swap.exceptions import (
     ClaudeSwitchError,
     KeychainUnavailableError,
     LockError,
+    StoresDisagreeError,
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -82,8 +84,8 @@ _FILE_NOT_UPDATED = "file store could not be updated"
 _UNLINKED_STORES = (
     "The Keychain and the credentials file hold different logins and no record links "
     "them; nothing was changed. Run hswap claude keepalive --adopt file|keychain, "
-    "naming the store whose writer refreshed last, or log in again with /login and "
-    "run hswap claude add."
+    "naming the store whose writer refreshed last. If you cannot tell, log in again "
+    "with /login, adopt the store that login wrote, and run hswap claude add."
 )
 _ADOPT_NEEDS_KEYCHAIN = "--adopt needs the macOS Keychain and a real run; nothing was changed."
 _LEDGER_UNREADABLE = "consumed-grant ledger unreadable"
@@ -143,6 +145,8 @@ def run_keepalive(
         _keep(switcher, report, ahead, ensure_file, dry_run, adopt)
     except _Stop as stop:
         report["error"] = {"type": stop.kind, "message": stop.message}
+    except StoresDisagreeError:
+        report["error"] = {"type": "split_brain", "message": _UNLINKED_STORES}
     except KeychainUnavailableError:
         report["error"] = _error("keychain_unavailable")
     except consumed_grants.LedgerUnreadable:
@@ -232,6 +236,7 @@ def _locks(switcher, slot) -> Iterator[None]:
 
 def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict | None]:
     switcher = active.switcher
+    switcher._required_mode_gate(reconciling=True)
     store = switcher._store
     keychain, file_creds = _read_stores(store, switcher.platform == Platform.MACOS)
     if not dry_run:
@@ -440,47 +445,13 @@ def _belongs(active, credentials: str, backup: str, *, probe: bool) -> bool | No
     return None if org is None else (org or "") == org_uuid
 
 
-def _recorded_successors(active, fingerprint: str | None) -> set[str]:
-    """Every login recorded as descending from this one on this account: by this
-    machine's own POST (the ledger) or a parked successor (the stash)."""
-    identity = active.identity or ("", "")
-    manifest = active.switcher._store._read_stash_manifest()
-
-    def is_ours(meta: dict) -> bool:
-        if "email" in meta:
-            return (meta["email"], meta.get("organizationUuid", "")) == identity
-        return meta.get("configSlot") == active.slot
-
-    found: set[str] = set()
-    pending = [fingerprint]
-    while pending:
-        current = pending.pop()
-        row = consumed_grants.entry(current) or {}
-        links = [
-            meta.get("fingerprint")
-            for meta in manifest.values()
-            if meta.get("consumedFp") == current
-            and meta.get("reason") != "consume-gate-cas-conflict"
-            and is_ours(meta)
-        ]
-        if (row.get("email"), row.get("organizationUuid")) == identity:
-            links.append(row.get("successorFp"))
-        for link in links:
-            if link and link != fingerprint and link not in found:
-                found.add(link)
-                pending.append(link)
-    return found
-
-
 def _linked_successor(active, keychain: str, file_creds: str) -> str:
-    """Of two differing stores, the one recorded as the other's successor."""
-    keychain_fp = oauth.credential_fingerprint(keychain)
+    """Of two differing stores the gate let through, the recorded successor."""
     file_fp = oauth.credential_fingerprint(file_creds)
-    file_is_next = file_fp in _recorded_successors(active, keychain_fp)
-    keychain_is_next = keychain_fp in _recorded_successors(active, file_fp)
-    if file_is_next == keychain_is_next:
-        raise _Stop("split_brain", _UNLINKED_STORES)
-    return file_creds if file_is_next else keychain
+    successors = active.switcher._recorded_successors(
+        active.identity, active.slot, oauth.credential_fingerprint(keychain)
+    )
+    return file_creds if file_fp in successors else keychain
 
 
 def _reconcile(
@@ -492,7 +463,7 @@ def _reconcile(
     """
     switcher = active.switcher
     backup = _read_slot(active)
-    holders = [creds for creds in (keychain, file_creds) if not _is_empty(creds)]
+    holders = [creds for creds in (keychain, file_creds) if not holds_no_login(creds)]
     if not holders:
         raise _Stop("no_credentials")
     stores_differ = len({oauth.credential_fingerprint(creds) for creds in holders}) > 1
@@ -503,7 +474,7 @@ def _reconcile(
         raise _Stop("unmanaged")
 
     fingerprint = oauth.credential_fingerprint(login)
-    successors = _recorded_successors(active, fingerprint)
+    successors = switcher._recorded_successors(active.identity, active.slot, fingerprint)
     successor, parked_entries = _parked_successor(active, [login], dry_run)
     if not successor and backup and oauth.credential_fingerprint(backup) in successors:
         successor = backup
@@ -542,10 +513,11 @@ def _adopt(active, report, choice: str) -> str:
 
     fingerprint = oauth.credential_fingerprint(chosen)
     for stale in (keychain, file_creds):
-        if not _is_empty(stale) and oauth.credential_fingerprint(stale) != fingerprint:
+        if not holds_no_login(stale) and oauth.credential_fingerprint(stale) != fingerprint:
             _stash_loser(active, stale, _belongs(active, stale, backup, probe=True))
-    if not _is_empty(backup) and oauth.credential_fingerprint(backup) != fingerprint:
+    if not holds_no_login(backup) and oauth.credential_fingerprint(backup) != fingerprint:
         _stash_loser(active, backup, True)
+    switcher.supersede_stashed_copies(active.identity or ("", ""), chosen)
     final = _write_stores(active, report, keychain, file_creds, chosen, True, False)
     if active.slot:
         switcher._write_account_credentials(active.slot, active.identity[0], final)
@@ -693,17 +665,6 @@ def _is_wiped(credentials: str) -> bool:
     return bool(payload) and not payload.get("accessToken") and not payload.get("refreshToken")
 
 
-def _is_empty(credentials: str) -> bool:
-    """Holds no login: absent, or no token in it at all. Unparsable bytes are not
-    this: they may be a login nothing here can read."""
-    if not credentials:
-        return True
-    payload = _oauth_payload(credentials)
-    return _credential_object(credentials) is not None and not (
-        payload.get("accessToken") or payload.get("refreshToken")
-    )
-
-
 def _loser_identity(active, loser: str, verdict: bool | None) -> tuple[str, str]:
     """Whose this copy is, as far as anything says; empty when nothing does."""
     if verdict is True:
@@ -775,8 +736,10 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
         )
 
     if not outcome.credentials:
-        if outcome.error == "consumed":
+        if outcome.error in ("consumed", "relogin_required"):
             raise _Stop("relogin_required")  # nothing parked and no POST can help
+        if outcome.error == "stores-disagree":
+            raise _Stop("split_brain", _UNLINKED_STORES)
         if outcome.error == "ledger-unreadable":
             raise _Stop("refresh_failed", _LEDGER_UNREADABLE)
         if outcome.fate == oauth.GRANT_UNCERTAIN:

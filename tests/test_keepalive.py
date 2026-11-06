@@ -1809,6 +1809,96 @@ class TestEveryPostGoesThroughTheHelper:
             ("keepalive.py", "_refresh"),
         }
 
+    # What writes a credential store or sends a refresh token.
+    MUTATIONS = frozenset({
+        "post_refresh",
+        "_write_credentials",
+        "_write_oauth_credentials",
+        "_write_active_credentials_file",
+        "_write_account_credentials",
+        "_delete_account_credentials",
+        "_delete_account_credentials_strict",
+        "_delete_account_files",
+        "_write_unclaimed_credential",
+        "_remove_unclaimed_credential",
+        "_keep_slot_copy_before_overwrite",
+        "supersede_stashed_copies",
+        "_bootstrap",
+    })
+    GATES = frozenset({"_required_mode_gate", "_required_mode_section", "_gated_in_required_mode"})
+    # Not reachable with the gate, each for a reason of its own.
+    OUTSIDE_THE_GATE = frozenset({
+        "_adopt",  # the human tie-break, the one thing allowed past a disagreement
+        "migrate_windows_keyring_to_files",  # startup; Windows only
+        "migrate_macos_keyring_to_security",  # startup; one-time, before any mode applies
+        "_keychain_selftest_command",  # its own throwaway item
+        "_adopt_session_credential",  # returns before this write in required mode
+    })
+
+    def _call_graph(self):
+        """(callers by callee name, names that hold the gate themselves)"""
+        callers, gated = {}, set()
+        root = Path(claude_swap.__file__).parent
+        # By name, so a UI's own `_refresh` or `_reconcile` would read as a caller; a UI
+        # reaches the engine through the public methods this graph already covers.
+        for path in root.glob("*.py"):
+            if path.name in ("menubar.py", "snapshot_source.py"):
+                continue
+            for fn in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                decorators = {getattr(d, "id", "") for d in fn.decorator_list}
+                if decorators & self.GATES:
+                    gated.add(fn.name)
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Call):
+                        func = node.func
+                        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                        if name in self.GATES:
+                            gated.add(fn.name)
+                        elif name:
+                            callers.setdefault(name, set()).add(fn.name)
+        return callers, gated
+
+    def test_every_write_and_post_reaches_the_gate(self):
+        callers, gated = self._call_graph()
+        unprotected = set()
+
+        def covered(name, seen):
+            if name in gated or name in self.OUTSIDE_THE_GATE:
+                return True
+            if name in seen:
+                return True  # a cycle adds no new way in
+            above = callers.get(name, set())
+            return bool(above) and all(covered(c, seen | {name}) for c in above)
+
+        for mutation in self.MUTATIONS:
+            assert callers.get(mutation), f"{mutation} is no longer called: update this list"
+            for caller in callers[mutation]:
+                if caller not in self.MUTATIONS and not covered(caller, frozenset()):
+                    unprotected.add((mutation, caller))
+        assert unprotected == set()
+
+    def test_the_named_entry_points_hold_the_gate_themselves(self):
+        _, gated = self._call_graph()
+        assert {
+            "_perform_switch",
+            "_consume_backup_grant_locked",
+            "_fetch_active_usage",
+            "_resync_rotated_backup",
+            "add_account",
+            "add_account_from_token",
+            "remove_account",
+            "swap_accounts",
+            "move_account",
+            "purge",
+            "import_accounts",
+            "persist_backup_credentials",
+            "setup_session",
+            "_unclaimed_command",
+            "_pass",
+        } <= gated
+
     def test_the_unreserved_oauth_paths_have_no_production_caller(self):
         assert self._functions_calling("refresh_oauth_credentials") == set()
         assert self._functions_calling("fetch_usage_for_account") == set()
@@ -2749,7 +2839,7 @@ class TestEvidenceOnlyDecisionTable:
         monkeypatch.setattr("claude_swap.session.read_session_credentials", lambda sdir: profile)
         monkeypatch.setattr("claude_swap.session.session_identity_drifted", lambda *a: False)
         report = run_keepalive(new_process())
-        assert report["error"]["type"] == "refresh_failed"
+        assert report["error"]["type"] == "relogin_required"
         assert rotating.posts == []
         assert store._read_account_credentials(*SLOT) == x
         assert block_real_keychain.data[ACTIVE_ITEM] == x

@@ -259,6 +259,20 @@ ACCOUNT_CREDENTIAL_KEYS = frozenset({
 })
 
 
+def holds_no_login(credentials: str) -> bool:
+    """Absent, or no token in it at all. Unparsable bytes are not this: they may be
+    a login nothing here can read."""
+    if not credentials:
+        return True
+    data = _credential_object(credentials)
+    if data is None:
+        return False
+    payload = data.get("claudeAiOauth")
+    return not (
+        isinstance(payload, dict) and (payload.get("accessToken") or payload.get("refreshToken"))
+    )
+
+
 def credential_generation(credentials: str | None) -> tuple[bool, float]:
     """Orders copies of one login: a refresh token beats none, then the later
     ``expiresAt``. Claude Code wipes the token fields in place when a refresh is
@@ -1423,13 +1437,21 @@ class CredentialStore:
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
 
+    def _leftover_backup_enc(self, account_num: str, email: str) -> str:
+        """The slot's `.enc` as bytes on disk, "" when absent or garbled."""
+        try:
+            encoded = self._backup_enc_path(account_num, email).read_text(encoding="utf-8")
+            return base64.b64decode(encoded.strip(), validate=True).decode("utf-8")
+        except (OSError, ValueError):
+            return ""
+
     def _newest_backup(
         self, account_num: str, email: str, enc_value: str, failed: list | None, cached: bool
     ) -> str:
-        """Keychain-required mode ranks by generation: `.enc`-wins exists for a
-        Keychain that may be stale, and here the `.enc` is the leftover. A read
-        changes nothing: the next Keychain write of this slot removes it
-        (`_reconcile_enc_after_keychain_write`)."""
+        """Keychain-required mode reads the Keychain: `.enc`-wins exists for a Keychain
+        that may be stale, and here the `.enc` is the leftover. A differing one is a
+        rival the gate counts. A read changes nothing: the next Keychain write of this
+        slot removes it (`_reconcile_enc_after_keychain_write`)."""
         try:
             keychain_value = self._kc_read_backup(account_num, email, cached=cached)
         except macos_keychain.KEYCHAIN_ERRORS:
@@ -1438,9 +1460,7 @@ class CredentialStore:
             if failed is not None:
                 failed.append(True)
             return ""
-        if credential_generation(keychain_value) <= credential_generation(enc_value):
-            return enc_value
-        return keychain_value
+        return keychain_value or enc_value
 
     def _read_account_credentials_ex(
         self, account_num: str, email: str, *, cached: bool = False

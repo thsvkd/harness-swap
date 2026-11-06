@@ -424,7 +424,8 @@ def _unclaimed_command(argv: list[str]) -> None:
             if args.purge not in entries:
                 error(f"Error: no unclaimed entry {args.purge}")
                 sys.exit(1)
-            switcher._store._remove_unclaimed_credential(args.purge)
+            with switcher._required_mode_section():
+                switcher._store._remove_unclaimed_credential(args.purge)
             print(f"{accent('Purged')} {args.purge}")
             return
 

@@ -50,7 +50,11 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import (
+    ClaudeSwitchError,
+    ReloginRequiredError,
+    StoresDisagreeError,
+)
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
@@ -88,6 +92,8 @@ _SYSTEMIC_MESSAGES = {
                         "keychain or fix the file, then retry; "
                         "`cswap unclaimed` inspects it",
     "consume-busy": "another cswap surface holds the slot — retries next pass",
+    "stores-disagree": "the Keychain and the credentials file hold different logins — "
+                       "run keepalive",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
 # drift apart.
@@ -851,7 +857,7 @@ class AutoSwitchEngine:
                 # once the credential is replaced by a re-add).
                 return "identity-conflict"
             return "ok"
-        if outcome.error in ("invalid_grant", "no_refresh_token"):
+        if outcome.error in ("invalid_grant", "no_refresh_token", "relogin_required"):
             return "invalid_grant"
         if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
@@ -2478,13 +2484,14 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            # shortcut: checked before the switch takes its locks, so a refresh landing
-            # in between goes unseen; move it under them if that window ever matters.
-            if self.switcher.active_stores_disagree():
+            try:
+                result = self.switcher.switch_to(number, json_output=True)
+            except StoresDisagreeError:
                 self._emit(NoSwitchEvent(reason="stores-disagree"))
                 return TickOutcome.NO_ACTION
-
-            result = self.switcher.switch_to(number, json_output=True)
+            except ReloginRequiredError:
+                self._emit(NoSwitchEvent(reason="relogin_required", detail=number))
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

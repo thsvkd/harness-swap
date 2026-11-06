@@ -204,6 +204,8 @@ def _keep(switcher, report, ahead, ensure_file, dry_run, adopt=None) -> None:
     macos = switcher.platform == Platform.MACOS
     active = _read_active(switcher)
     report["activeSlot"] = int(active.slot) if active.slot else None
+    # First, so `keychainItemPresent` is this answer whatever stops the run below.
+    switcher.refuse_keychain_item_present()
 
     # Keepalive reads the unsuffixed Keychain item. Claude Code hashes either
     # variable into its service name when it is set at all, even to the default
@@ -266,8 +268,10 @@ def _locks(switcher, slot) -> Iterator[None]:
 
 def _pass(active, report, ahead, ensure_file, dry_run) -> tuple[str | None, dict | None]:
     switcher = active.switcher
-    switcher._required_mode_gate(reconciling=True)
     store = switcher._store
+    if store.keychain_required and store._file_store():
+        raise _Stop("locked")  # migrate-store landed while this run waited for the locks
+    switcher._required_mode_gate(reconciling=True)
     keychain, file_creds = _read_stores(store, store._has_keychain())
     report["keychainItemPresent"] = bool(keychain)
     if not dry_run:

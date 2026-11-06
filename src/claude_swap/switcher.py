@@ -5547,7 +5547,12 @@ class ClaudeAccountSwitcher:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
                         return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
-        except (StoresDisagreeError, RequiredModeUnsupportedError, StashManifestCorruptError):
+        except (
+            StoresDisagreeError,
+            RequiredModeUnsupportedError,
+            StashManifestCorruptError,
+            KeychainItemPresentError,
+        ):
             return _defer(force_refresh)
         except LockError:
             # A live holder — Claude Code mid-refresh (ClaudeCodeLockTimeout)
@@ -5711,7 +5716,11 @@ class ClaudeAccountSwitcher:
                     account_num,
                 )
         except (
-            LockError, StoresDisagreeError, RequiredModeUnsupportedError, StashManifestCorruptError
+            LockError,
+            StoresDisagreeError,
+            RequiredModeUnsupportedError,
+            StashManifestCorruptError,
+            KeychainItemPresentError,
         ):
             return  # holder is mid-operation; the next pass retries
         except Exception:

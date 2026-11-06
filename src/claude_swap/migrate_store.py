@@ -185,8 +185,9 @@ def _slot_plan(switcher, active, kept: str) -> list[tuple[str, str, str, list[st
                 plan.append((num, email, kept, replaced))
         elif item and not enc:
             plan.append((num, email, item, []))
-        elif item and not _same_login(enc, item):
+        elif item and not _same_login(enc, item) and not store._file_store():
             # Nothing here says which is newer, and posting a spent token can revoke the login.
+            # Once the store is file, the `.enc` is: file mode never updates the item.
             raise _Stop(
                 "split_brain",
                 f"Slot {num} holds different tokens in its .enc and its Keychain backup, so "
@@ -255,7 +256,8 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
 
 def run_restore_keychain(switcher, backup_account: str) -> dict:
     """The rollback: a backup goes back as the Claude Code item and stays where it is. An
-    item already there is backed up first, since it may be a newer login."""
+    item already there is backed up first, since it may be a newer login. Backups stop at
+    the migration, so one can be spent by now, and Claude Code would POST it from there."""
     report = {
         "schemaVersion": 1,
         "ok": False,
@@ -272,12 +274,16 @@ def run_restore_keychain(switcher, backup_account: str) -> dict:
         with _all_locks(switcher):
             value = (
                 macos_keychain.get_password(SECURITY_SERVICE, backup_account)
-                if ".backup-" in backup_account
+                if backup_account.startswith(f"{CREDENTIALS_BACKUP}.backup-")
                 else None
             )
             if value is None:
                 raise _Stop("backup_not_found", "No such backup in the login keychain.")
             report["fingerprint"] = _refresh_fingerprint(value)
+            _refuse_spent(value)
+            active = _read_active(switcher)
+            if _belongs(active, value, _read_slot(active), probe=True) is False:
+                raise _Stop("unmanaged", "That backup is another account's; nothing was changed.")
             current = macos_keychain.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account)
             if current and current != value:
                 _back_up(CREDENTIALS_BACKUP, current, report)

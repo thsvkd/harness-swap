@@ -250,6 +250,8 @@ class TestConfig:
 
     def test_env_forces_file_and_can_only_tighten(self, temp_home, monkeypatch):
         root = temp_home / "root"
+        monkeypatch.setenv("HSWAP_CREDENTIALS_STORE", "auto")
+        assert credentials_store(root) == "auto"
         monkeypatch.setenv("HSWAP_CREDENTIALS_STORE", "file")
         assert credentials_store(root) == "file"
         monkeypatch.setenv("HSWAP_CREDENTIALS_STORE", "auto")
@@ -571,6 +573,51 @@ class TestGuard:
         for call in healthy.security.calls:
             assert "-w" not in call and "-d" not in call
             assert call[-1] == macos_keychain.login_keychain_file()
+
+
+class TestReportAndRaces:
+    def test_item_present_wins_over_whatever_else_stops_the_run(self, healthy):
+        (healthy.root / "sessions" / "x").mkdir(parents=True)
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        report = healthy.keepalive()
+        assert report["error"]["type"] == "keychain_item_present"
+        assert report["keychainItemPresent"] is True
+
+    def test_a_clean_guard_is_reported_when_another_stop_ends_the_run(self, healthy):
+        (healthy.root / "sessions" / "x").mkdir(parents=True)
+        report = healthy.keepalive()
+        assert report["error"]["type"] == "required_mode_unsupported"
+        assert report["keychainItemPresent"] is False
+
+    def test_a_pinned_run_that_finds_the_store_changed_stops_before_the_post(self, env):
+        due = creds("AT-1", "RT-1", expires_in_s=NEAR)
+        env.write_file(due)
+        env.security.items[ACTIVE_ITEM] = due
+        s = ClaudeAccountSwitcher()
+
+        def migrated_while_waiting(active):
+            set_setting(env.root, "credentials.store", "file")
+            del env.security.items[ACTIVE_ITEM]
+            return active
+
+        real = __import__("claude_swap.keepalive", fromlist=["_pass"])._pass
+        with patch(
+            "claude_swap.keepalive._pass",
+            lambda active, *args, **kwargs: real(migrated_while_waiting(active), *args, **kwargs),
+        ):
+            report = run_keepalive(s)
+        assert report["error"]["type"] == "locked"
+        assert env.endpoint.posts == []
+
+    def test_usage_passes_defer_without_a_traceback_when_an_item_is_present(self, healthy, caplog):
+        expired = creds("AT-1", "RT-1", expires_in_s=-60)
+        healthy.write_file(expired)
+        healthy.write_enc(SLOT_1, expired)
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        s = ClaudeAccountSwitcher()
+        s.list_accounts(json_output=True)
+        assert healthy.endpoint.posts == []
+        assert "failed unexpectedly" not in caplog.text
 
 
 class TestDumpParsing:
@@ -1042,6 +1089,18 @@ class TestMigrateStore:
         assert [post["refresh_token"] for post in split.endpoint.posts] == ["RT-K2"]
         assert split.security.non_guard_calls() == []
 
+    def test_repair_after_a_slot_rotated_in_file_mode(self, split):
+        assert self._run(split, "file")["ok"] is True
+        # File mode updated slot 2's `.enc`, and its Keychain item stays behind.
+        rotated = creds("AT-S2-NEW", "RT-S2-NEW")
+        split.write_enc(SLOT_2, rotated)
+        split.security.items[ACTIVE_ITEM] = creds("AT-K2", "RT-K2")
+        split.file.unlink()
+        report = self._run(split, "keychain")
+        assert report["ok"] is True and report["slotsMigrated"] == [1]
+        assert split.read_enc(SLOT_2) == rotated
+        assert split.keepalive()["ok"] is True
+
     def test_rerun_is_a_no_op_with_no_new_backups(self, split):
         assert self._run(split, "file")["ok"] is True
         count = len(backups(split)) + len(backups(split, "slot-"))
@@ -1125,8 +1184,36 @@ class TestRestoreKeychain:
         run_restore_keychain(ClaudeAccountSwitcher(), next(iter(backups(split))))
         assert split.keepalive()["error"]["type"] == "keychain_item_present"
 
-    @pytest.mark.parametrize("name", ["claude-code-credentials.backup-none", "account-1-a@example.com"])
+    def test_a_spent_backup_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "file")
+        name = next(iter(backups(split)))
+        consumed_grants.reserve(
+            oauth.credential_fingerprint(split.keychain_login), ("a@example.com", "")
+        )
+        report = run_restore_keychain(ClaudeAccountSwitcher(), name)
+        assert report["error"]["type"] == "relogin_required"
+        assert ACTIVE_ITEM not in split.security.items
+
+    def test_another_accounts_backup_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "file")
+        name = next(iter(backups(split)))
+        split.write_enc(SLOT_2, split.keychain_login)
+        report = run_restore_keychain(ClaudeAccountSwitcher(), name)
+        assert report["error"]["type"] == "unmanaged"
+        assert ACTIVE_ITEM not in split.security.items
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "claude-code-credentials.backup-none",
+            "account-1-a@example.com",
+            "slot-1-a@example.com.backup-20260101T000000Z",
+        ],
+    )
     def test_unknown_or_non_backup_name_refuses(self, split, name):
+        split.security.items[("claude-swap", "slot-1-a@example.com.backup-20260101T000000Z")] = (
+            split.slot_1_item
+        )
         before = dict(split.security.items)
         report = run_restore_keychain(ClaudeAccountSwitcher(), name)
         assert report["error"]["type"] == "backup_not_found"

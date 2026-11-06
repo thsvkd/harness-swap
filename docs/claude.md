@@ -450,6 +450,8 @@ Keepalive and keychain-required mode keep a ledger of tokens in `cache/consumed_
 
 A copy on the ledger never wins over a working copy, and a copy recorded for another account never overwrites the current account's store. An older copy that replaces a spent one is itself treated as spent only when both are proven to be this account's, because it was then very likely spent to make that one; another account's spent token, or a winner of unknown identity, leaves the ledger alone.
 
+Known limit: in a rare recovery case, a stale stash entry adopted through the Keychain or the file can overwrite a newer login in the slot's backup. `keepalive` then reports `relogin_required`, and the newer login survives only in the backup's `.prev`, which later runs do not adopt. Log in again with `/login`, then run `hswap claude add`. This is accepted on purpose: telling a good slot copy from one whose token was spent outside hswap would need evidence hswap does not have, and presenting a spent token can revoke the whole login.
+
 After every write, `keepalive` reads the file back when it should hold the login, retries once, and otherwise reports `refresh_failed` with "file store could not be updated". The Keychain and the slot still hold the login in that case, and the next run repairs the file.
 
 It refuses to run with `CLAUDE_CONFIG_DIR` or `CLAUDE_SECURESTORAGE_CONFIG_DIR` set to anything, even the default directory, because Claude Code then uses a differently named Keychain item; the LaunchAgent above sets neither. It always needs the login keychain on macOS, even with the setting off, and never falls back to the file. On Linux and Windows there is no Keychain: it refreshes the file only.

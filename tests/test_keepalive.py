@@ -40,7 +40,14 @@ from claude_swap.models import Platform
 from claude_swap.settings import set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
 
-from .keychain_helpers import ACTIVE_ITEM, creds, macos_store, snapshot
+from .keychain_helpers import (
+    ACTIVE_ITEM,
+    FakeSecurity,
+    creds,
+    macos_store,
+    snapshot,
+    written_last,
+)
 
 SLOT = ("1", "a@example.com")
 IDENTITY = {"1": ("a@example.com", "")}
@@ -197,6 +204,7 @@ class TestSync:
         file_copy = creds("sk-win", "rt-win", expires_in_s=7200)
         env.active(keychain_copy)
         env.file.write_text(file_copy, encoding="utf-8")
+        written_last(env.keychain, env.file, "file")
         monkeypatch.setattr(
             env.store._store,
             "_write_unclaimed_credential",
@@ -1123,25 +1131,30 @@ class TestOrdinaryRotationR7:
             lambda token: pytest.fail("no probe needed") if token == "AT-0" else OWN_ACCOUNT,
         )
 
-    def _assert_plain_sync(self, env, report):
+    def _assert_synced_keeping_the_loser(self, env, report, loser):
+        """Not a split, but the CTO's round 9 rule: a differing copy is always kept."""
         assert report["action"] == "synced-file"
         assert report["note"] is None
-        assert env.store._store._list_unclaimed_credentials() == {}
+        rows = env.store._store._list_unclaimed_credentials()
+        assert [env.store._store._read_unclaimed_credential(i)[0] for i in rows] == [loser]
         assert env.file.read_text(encoding="utf-8") == env.keychain_value()
 
     def test_R7_probe_says_same_account(self, env, monkeypatch):
+        loser = creds("AT-0", "RT-0", expires_in_s=7000)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
-        env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000), encoding="utf-8")
+        env.file.write_text(loser, encoding="utf-8")
+        written_last(env.keychain, env.file, "keychain")
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
-        self._assert_plain_sync(env, env.run())
+        self._assert_synced_keeping_the_loser(env, env.run(), loser)
 
     def test_R7_loser_lineage_is_the_slot_backup(self, env, monkeypatch):
         older = creds("AT-0", "RT-0", expires_in_s=7000)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
         env.file.write_text(older, encoding="utf-8")
+        written_last(env.keychain, env.file, "keychain")
         env.store._write_account_credentials(*SLOT, older)
         self._loser_needs_no_probe(monkeypatch)
-        self._assert_plain_sync(env, env.run())
+        self._assert_synced_keeping_the_loser(env, env.run(), older)
 
     def test_R7_loser_lineage_is_on_the_consumed_ledger(self, env, monkeypatch):
         older = creds("AT-0", "RT-0", expires_in_s=7000)
@@ -1149,13 +1162,14 @@ class TestOrdinaryRotationR7:
         env.file.write_text(older, encoding="utf-8")
         consumed_grants.record(oauth.credential_fingerprint(older), IDENTITY["1"], consumed_grants.CONSUMED)
         self._loser_needs_no_probe(monkeypatch)
-        self._assert_plain_sync(env, env.run())
+        self._assert_synced_keeping_the_loser(env, env.run(), older)
 
     def test_expired_token_proves_nothing_so_the_copy_is_stashed(self, env, monkeypatch):
         """Round 2, finding 3: its refresh token may be the only live one anywhere."""
         loser = creds("AT-0", "RT-0", expires_in_s=-60)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
         env.file.write_text(loser, encoding="utf-8")
+        written_last(env.keychain, env.file, "keychain")
         monkeypatch.setattr(
             oauth, "fetch_oauth_profile",
             lambda token: pytest.fail("an expired token cannot be probed") if token == "AT-0" else None,
@@ -1175,7 +1189,9 @@ class TestOrdinaryRotationR7:
         b = creds("AT-B", "RT-B", expires_in_s=7200)
         s._write_account_credentials("2", "b@example.com", b)
         block_real_keychain.data[ACTIVE_ITEM] = a
-        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(b, encoding="utf-8")
+        written_last(block_real_keychain, file_path, "file")
         report = run_keepalive(s)
         assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-B"
         assert report["action"] == "synced-keychain"
@@ -1183,16 +1199,19 @@ class TestOrdinaryRotationR7:
         assert [s._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
 
     @pytest.mark.parametrize("state", ["consumed", "reserved"])
-    def test_a_copy_on_the_ledger_needs_no_stash_once_the_winner_is_attributed(
+    def test_a_spent_copy_loses_without_the_signals_and_is_still_kept(
         self, env, monkeypatch, state
     ):
+        """The ledger already proves it is not the way on, so nothing else is needed."""
         loser = creds("AT-0", "RT-0", expires_in_s=-60)
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
         env.file.write_text(loser, encoding="utf-8")
         consumed_grants.record(oauth.credential_fingerprint(loser), IDENTITY["1"], state)
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
-        env.run()
-        assert env.store._store._list_unclaimed_credentials() == {}
+        report = env.run()
+        assert report["ok"] is True and report["action"] == "synced-file"
+        rows = env.store._store._list_unclaimed_credentials()
+        assert [env.store._store._read_unclaimed_credential(i)[0] for i in rows] == [loser]
 
     def test_a_copy_on_the_ledger_is_kept_while_the_winner_is_unknown(self, env):
         loser = creds("AT-0", "RT-0", expires_in_s=-60)
@@ -1211,18 +1230,20 @@ class TestOrdinaryRotationR7:
         env.run()
         assert env.store._store._list_unclaimed_credentials() == {}
 
-    def test_R7_rotations_do_not_grow_the_stash_over_runs(self, env, monkeypatch):
+    def test_R7_each_rotation_keeps_its_loser_once(self, env, monkeypatch):
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
         for i in range(3):
             env.active(creds(f"AT{i + 1}", f"RT{i + 1}", expires_in_s=7200 + 100 * i))
             env.file.write_text(creds(f"AT{i}", f"RT{i}", expires_in_s=7000 + 100 * i), encoding="utf-8")
+            written_last(env.keychain, env.file, "keychain")
             assert env.run()["note"] is None
-        assert env.store._store._list_unclaimed_credentials() == {}
+        assert len(env.store._store._list_unclaimed_credentials()) == 3  # until they lapse
 
     def test_R7_unattributable_live_copy_is_kept_without_the_note(self, env):
         loser = creds("AT-0", "RT-0", expires_in_s=7000)  # the probe answers nothing
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
         env.file.write_text(loser, encoding="utf-8")
+        written_last(env.keychain, env.file, "keychain")
         report = env.run()
         assert report["action"] == "synced-file" and report["note"] is None
         stash = env.store._store._list_unclaimed_credentials()
@@ -1234,6 +1255,7 @@ class TestOrdinaryRotationR7:
         for _ in range(3):
             env.active(creds("AT-1", "RT-1", expires_in_s=7200))
             env.file.write_text(loser, encoding="utf-8")
+            written_last(env.keychain, env.file, "keychain")
             env.run()
         assert len(env.store._store._list_unclaimed_credentials()) == 1
 
@@ -2659,6 +2681,7 @@ class TestLoserIsKeptUnlessTheWinnerIsProven:
         block_real_keychain.data[ACTIVE_ITEM] = a
         file_path = temp_home / ".claude" / ".credentials.json"
         file_path.write_text(unknown, encoding="utf-8")
+        written_last(block_real_keychain, file_path, "file")
         monkeypatch.setattr(
             oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT if token == "AT-A" else None
         )
@@ -2703,17 +2726,20 @@ class TestLoserIsKeptUnlessTheWinnerIsProven:
     def test_an_unattributed_loser_claims_no_identity(self, env):
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
         env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000), encoding="utf-8")
+        written_last(env.keychain, env.file, "keychain")
         env.run()
         row = next(iter(env.store._store._list_unclaimed_credentials().values()))
         assert (row["email"], row["organizationUuid"]) == ("", "")
 
-    def test_both_proven_is_a_plain_sync(self, env, monkeypatch):
+    def test_both_proven_still_keeps_a_copy_from_the_other_store(self, env, monkeypatch):
+        """Round 9: a same-account shortcut is what lost B in the review's scenario."""
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
         env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000), encoding="utf-8")
+        written_last(env.keychain, env.file, "keychain")
         monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: OWN_ACCOUNT)
         report = env.run()
-        assert report["action"] == "synced-file"
-        assert env.store._store._list_unclaimed_credentials() == {}
+        assert report["action"] == "synced-file" and report["note"] is None
+        assert len(env.store._store._list_unclaimed_credentials()) == 1
 
 
 class TestUnknownWinnerStaysOffTheLedger:
@@ -2801,3 +2827,227 @@ class TestAnotherAccountsSpentTokenSaysNothing:
         )
         run_keepalive(s)
         assert consumed_grants.entry(oauth.credential_fingerprint(good)) is None
+
+
+class TestTwoSignalsPickTheWinner:
+    """Round 9: Claude Code refreshed the file A -> B while the Keychain and slot hold A."""
+
+    @pytest.fixture
+    def store(self, temp_home, block_real_keychain, rotating):
+        return macos_store(temp_home)
+
+    def _a_and_b(self, s, home, keychain, *, b_expires, a_expires=20000):
+        a = creds("AT-A", "RT-A", expires_in_s=a_expires)
+        b = creds("AT-B", "RT-B", expires_in_s=b_expires)
+        keychain.data[ACTIVE_ITEM] = a
+        s._write_account_credentials(*SLOT, a)
+        file_path = home / ".claude" / ".credentials.json"
+        file_path.write_text(b, encoding="utf-8")
+        return a, b, file_path
+
+    @pytest.mark.parametrize(
+        "b_expires",
+        [20000, 20030, 19970, 7200],
+        ids=["equal", "later-within-60s", "earlier-within-60s", "earlier"],
+    )
+    @pytest.mark.parametrize("ahead", [None, 30000], ids=["not-due", "due"])
+    def test_codex_scenario_writes_nothing_posts_nothing(
+        self, store, temp_home, block_real_keychain, rotating, b_expires, ahead
+    ):
+        a, b, file_path = self._a_and_b(store, temp_home, block_real_keychain, b_expires=b_expires)
+        written_last(block_real_keychain, file_path, "file")  # the file really is newer
+        before = snapshot(temp_home, block_real_keychain)
+        kwargs = {"ahead": ahead} if ahead else {}
+        report = run_keepalive(new_process(), **kwargs)
+        assert rotating.posts == []
+        assert report["ok"] is False and report["error"]["type"] == "split_brain"
+        assert "/login" in report["error"]["message"] and "hswap claude add" in report["error"]["message"]
+        assert file_path.read_text(encoding="utf-8") == b  # B, byte-identical
+        assert block_real_keychain.data[ACTIVE_ITEM] == a
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_the_report_repeats_until_someone_logs_in_and_auto_stays_refused(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        a, _, file_path = self._a_and_b(store, temp_home, block_real_keychain, b_expires=7200)
+        written_last(block_real_keychain, file_path, "file")
+        for _ in range(3):
+            assert run_keepalive(new_process())["error"]["type"] == "split_brain"
+        set_setting(store.backup_dir, "credentials.requireKeychain", "true")
+        outcome = new_process().post_refresh(IDENTITY["1"], a, locks_held=True)
+        assert outcome.error == "transient" and rotating.posts == []
+
+    def test_both_signals_on_b_adopt_it_and_it_refreshes_once_when_due(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        a, b, file_path = self._a_and_b(
+            store, temp_home, block_real_keychain, a_expires=7000, b_expires=7200
+        )
+        written_last(block_real_keychain, file_path, "file")
+        report = run_keepalive(new_process())
+        assert report["ok"] is True and report["action"] == "synced-keychain"
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+        assert file_path.read_text(encoding="utf-8") == b
+        assert rotating.posts == []
+        rows = store._store._list_unclaimed_credentials()
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
+        assert next(iter(rows.values()))["email"] == "a@example.com"
+
+        report = run_keepalive(new_process(), ahead=7300)
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert rotating.posts == ["RT-B"]
+
+    def test_both_signals_on_the_keychain_replace_the_file(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        _, b, file_path = self._a_and_b(store, temp_home, block_real_keychain, b_expires=7000)
+        written_last(block_real_keychain, file_path, "keychain")
+        report = run_keepalive(new_process())
+        assert report["ok"] is True and report["action"] == "synced-file"
+        rows = store._store._list_unclaimed_credentials()
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [b]
+
+    @pytest.mark.parametrize(
+        "b_expires, written",
+        [(7000, "file"), (28000, "keychain")],
+        ids=["keychain-expires-later-file-written-later", "file-expires-later-keychain-written-later"],
+    )
+    def test_signals_that_disagree_write_nothing(
+        self, store, temp_home, block_real_keychain, rotating, b_expires, written
+    ):
+        _, _, file_path = self._a_and_b(store, temp_home, block_real_keychain, b_expires=b_expires)
+        written_last(block_real_keychain, file_path, written)
+        before = snapshot(temp_home, block_real_keychain)
+        report = run_keepalive(new_process(), ahead=40000)
+        assert report["error"]["type"] == "split_brain"
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert rotating.posts == []
+
+    def test_a_slot_outranking_the_proven_winner_writes_nothing(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        """The signals chose between the stores; a later slot expiry alone proves nothing."""
+        _, _, file_path = self._a_and_b(
+            store, temp_home, block_real_keychain, a_expires=7000, b_expires=7200
+        )
+        store._write_account_credentials(*SLOT, creds("AT-P", "RT-P", expires_in_s=28000))
+        written_last(block_real_keychain, file_path, "file")
+        before = snapshot(temp_home, block_real_keychain)
+        report = run_keepalive(new_process(), ahead=40000)
+        assert report["error"]["type"] == "split_brain"
+        assert snapshot(temp_home, block_real_keychain) == before
+        assert rotating.posts == []
+
+    def test_a_write_time_tie_writes_nothing(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        _, _, file_path = self._a_and_b(store, temp_home, block_real_keychain, b_expires=28000)
+        whole_second = int(time.time()) - 60  # `mdat` has no fraction; the mtime here does
+        block_real_keychain.modified[ACTIVE_ITEM] = float(whole_second)
+        os.utime(file_path, (whole_second, whole_second + 0.7))
+        before = snapshot(temp_home, block_real_keychain)
+        assert run_keepalive(new_process())["error"]["type"] == "split_brain"
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_an_unavailable_mdat_writes_nothing(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        self._a_and_b(store, temp_home, block_real_keychain, b_expires=28000)
+        before = snapshot(temp_home, block_real_keychain)
+        assert run_keepalive(new_process())["error"]["type"] == "split_brain"
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_an_expiry_that_cannot_be_read_writes_nothing(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        a, _, file_path = self._a_and_b(store, temp_home, block_real_keychain, b_expires=28000)
+        data = json.loads(a)
+        del data["claudeAiOauth"]["expiresAt"]
+        block_real_keychain.data[ACTIVE_ITEM] = json.dumps(data)
+        written_last(block_real_keychain, file_path, "file")
+        before = snapshot(temp_home, block_real_keychain)
+        assert run_keepalive(new_process())["error"]["type"] == "split_brain"
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_dry_run_reports_the_same_and_writes_nothing(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        _, _, file_path = self._a_and_b(store, temp_home, block_real_keychain, b_expires=7200)
+        written_last(block_real_keychain, file_path, "file")
+        process = new_process()
+        before = snapshot(temp_home, block_real_keychain)
+        assert run_keepalive(process, dry_run=True)["error"]["type"] == "split_brain"
+        assert snapshot(temp_home, block_real_keychain) == before
+
+    def test_the_same_refresh_token_needs_no_signals(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        """Nothing can be spent or lost between two copies of one token."""
+        block_real_keychain.data[ACTIVE_ITEM] = creds("AT-new", "RT-same", expires_in_s=7200)
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(creds("AT-old", "RT-same", expires_in_s=3700), encoding="utf-8")
+        report = run_keepalive(new_process())
+        assert report["ok"] is True and report["action"] == "synced-file"
+        assert store._store._list_unclaimed_credentials() == {}
+
+    def test_healthy_identical_stores_post_once_when_due_and_need_no_signals(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        near = creds("AT-A", "RT-A", expires_in_s=NEAR)
+        block_real_keychain.data[ACTIVE_ITEM] = near
+        store._write_account_credentials(*SLOT, near)
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(near, encoding="utf-8")
+        report = run_keepalive(new_process())
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert rotating.posts == ["RT-A"]
+        assert access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
+        assert access_token(file_path.read_text(encoding="utf-8")) == "AT-1"
+
+
+@pytest.mark.no_keychain_fake
+class TestUnreadableMdatThroughTheRealWrapper:
+    @pytest.mark.parametrize(
+        "attributes",
+        [
+            "",
+            'attributes:\n    "mdat"<timedate>=<NULL>\n',
+            'attributes:\n    "mdat"<timedate>=0x3230  "garbage"\n',
+            'attributes:\n    "mdat"<timedate>=0x3230  "20261399999999Z\\000"\n',
+        ],
+        ids=["empty", "null", "garbage", "impossible-date"],
+    )
+    def test_no_write_and_no_post(self, temp_home, rotating, monkeypatch, attributes):
+        monkeypatch.setattr(macos_keychain, "keychain_reachable", lambda *a, **kw: True)
+        fake = FakeSecurity()
+        fake.attributes = attributes
+        monkeypatch.setattr("claude_swap.macos_keychain.subprocess.run", fake)
+        s = macos_store(temp_home)
+        a = creds("AT-A", "RT-A", expires_in_s=7000)
+        b = creds("AT-B", "RT-B", expires_in_s=28000)
+        fake.items[ACTIVE_ITEM] = a
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(b, encoding="utf-8")
+        report = run_keepalive(s)
+        assert report["error"]["type"] == "split_brain"
+        assert fake.items[ACTIVE_ITEM] == a and fake.written == []
+        assert file_path.read_text(encoding="utf-8") == b
+        assert rotating.posts == []
+
+    def test_a_real_mdat_line_lets_the_signals_agree(self, temp_home, rotating, monkeypatch):
+        monkeypatch.setattr(macos_keychain, "keychain_reachable", lambda *a, **kw: True)
+        fake = FakeSecurity()
+        stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime(time.time() - 3600))
+        fake.attributes = (
+            'keychain: "/Users/me/Library/Keychains/login.keychain-db"\n'
+            'attributes:\n'
+            f'    "mdat"<timedate>=0x{stamp.encode().hex().upper()}5A00  "{stamp}Z\\000"\n'
+        )
+        monkeypatch.setattr("claude_swap.macos_keychain.subprocess.run", fake)
+        s = macos_store(temp_home)
+        b = creds("AT-B", "RT-B", expires_in_s=28000)
+        fake.items[ACTIVE_ITEM] = creds("AT-A", "RT-A", expires_in_s=7000)
+        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
+        report = run_keepalive(s)
+        assert report["ok"] is True and report["action"] == "synced-keychain"
+        assert fake.items[ACTIVE_ITEM] == b

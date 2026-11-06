@@ -29,7 +29,7 @@ from claude_swap.settings import (
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
 
-from .keychain_helpers import ACTIVE_ITEM, FakeSecurity, creds, macos_store, snapshot
+from .keychain_helpers import ACTIVE_ITEM, FakeSecurity, creds, macos_store, snapshot, written_last
 
 LOGIN = "/Users/me/Library/Keychains/login.keychain-db"
 
@@ -1020,6 +1020,7 @@ class TestRequiredModeReadsTheFileBeforeAnActivePost:
         b = creds("AT-B", "RT-B", expires_in_s=28000)
         file_path = temp_home / ".claude" / ".credentials.json"
         file_path.write_text(b, encoding="utf-8")
+        written_last(block_real_keychain, file_path, "file")
         ledger_before = consumed_grants.in_use()
 
         real_set = block_real_keychain.set_password
@@ -1041,7 +1042,9 @@ class TestRequiredModeReadsTheFileBeforeAnActivePost:
     ):
         self._a_in_keychain_and_slot(store, block_real_keychain, -60)
         b = creds("AT-B", "RT-B", expires_in_s=28000)
-        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(b, encoding="utf-8")
+        written_last(block_real_keychain, file_path, "file")
         _main(["auto", "--once", "--json"], capsys)
         assert endpoint.posts == []
         report = run_keepalive(ClaudeAccountSwitcher())

@@ -73,6 +73,12 @@ _MESSAGES = {
     "unmanaged": "The active login matches no managed account; add it to back it up.",
 }
 _FILE_NOT_UPDATED = "file store could not be updated"
+_UNPROVEN_WINNER = (
+    "The Keychain and the file hold different logins and nothing proves which is newer; "
+    "nothing was changed. Log in again with /login, then run hswap claude add."
+)
+# Below this, two expiries say nothing about which login came first.
+_EXPIRY_MARGIN_MS = 60_000
 _LEDGER_UNREADABLE = "consumed-grant ledger unreadable"
 _UNCERTAIN_REFRESH = (
     "The last refresh had an uncertain outcome, so its token will not be sent "
@@ -421,13 +427,16 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
             verdicts[creds] = _belongs(active, creds, backup, probe=drifted)
         return verdicts[creds]
 
+    stores_differ = bool(keychain and file_creds) and drifted
+    loser = _unproven_rival(active, keychain, file_creds, belongs) if stores_differ else None
+
     # Another account's copy never wins: a switch this run did not see must not be
     # undone by a stale, longer-lived copy. The slot competes too, since it holding
     # a newer generation means a live store was stranded on the consumed one (a
     # write that failed after a refresh), which `_fetch_active_usage` restores as
     # well. With every live copy foreign, overwriting a login takes a slot copy
     # that can still work: a duplicated lineage can look foreign too.
-    candidates = [creds for creds in live if belongs(creds) is not False]
+    candidates = [creds for creds in live if creds != loser and belongs(creds) is not False]
     if _oauth_payload(backup).get("refreshToken") and (
         candidates or (not _is_expired(backup) and not _is_spent(backup))
     ):
@@ -441,6 +450,11 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
         return (_is_working(creds), credential_generation(creds))
 
     authoritative = max(candidates, key=rank)
+    # candidates[0] is the store the signals chose; a slot has no such proof to outrank it.
+    if loser and oauth.credential_fingerprint(authoritative) != oauth.credential_fingerprint(
+        candidates[0]
+    ):
+        raise _Stop("split_brain", _UNPROVEN_WINNER)
     generation = credential_generation(authoritative)
     # Only this account's: another account's spent token says nothing about this one.
     spent_newer = [
@@ -458,17 +472,18 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
         )
 
     fingerprint = oauth.credential_fingerprint(authoritative)
-    for loser in dict.fromkeys(live):
-        if loser == authoritative or oauth.credential_fingerprint(loser) == fingerprint:
+    for stale in dict.fromkeys(live):
+        if stale == authoritative or oauth.credential_fingerprint(stale) == fingerprint:
             continue
-        verdict = belongs(loser)
-        same_account = verdict is True and belongs(authoritative) is True
-        if loser not in spent_newer and (same_account or _is_wiped(loser)):
+        verdict = belongs(stale)
+        # With the two stores apart, the older-looking one may be the only live copy.
+        same_account = verdict is True and belongs(authoritative) is True and not stores_differ
+        if stale not in spent_newer and (same_account or _is_wiped(stale)):
             continue  # a stale generation of this login is not a split
         if verdict is False:
             report["note"] = "split_brain"
         if not dry_run:
-            _stash_loser(active, loser, verdict)
+            _stash_loser(active, stale, verdict)
 
     # The engine's composition with the Keychain as the live store: it wins the
     # machine-shared fields (mcpOAuth, ...), the login comes from the winner.
@@ -497,6 +512,38 @@ def _sync(active, report, keychain, file_creds, backup, ensure_file, dry_run) ->
         report["action"] = "synced-file" if file_creds else "created-file"
     _report_expiry(report, composed)
     return composed
+
+
+def _unproven_rival(active, keychain: str, file_creds: str, belongs) -> str | None:
+    """Which of two live refresh tokens of this account lost, on two agreeing signals:
+    a later expiry and a more recent write. Either alone can mislead: a refresh can
+    issue a shorter lifetime, and a clock can move. Without both, the older-looking
+    copy may be the only live one and the other already spent, so nothing is overwritten
+    and nothing is POSTed. Returns the loser, or None when these are not two such rivals.
+    """
+    for creds in (keychain, file_creds):
+        if (
+            belongs(creds) is False
+            or not _oauth_payload(creds).get("refreshToken")
+            or _is_spent(creds)  # the ledger already proves this one is not the way on
+        ):
+            return None
+    keychain_exp, file_exp = _expires_at(keychain), _expires_at(file_creds)
+    keychain_at = macos_keychain.item_modified_at(
+        CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
+    )
+    try:
+        # Whole seconds like `mdat`, so that a write in the same second stays a tie.
+        file_at = int(get_credentials_path().stat().st_mtime)
+    except OSError:
+        file_at = None
+    if None in (keychain_exp, file_exp, keychain_at, file_at):
+        raise _Stop("split_brain", _UNPROVEN_WINNER)
+    if keychain_exp - file_exp > _EXPIRY_MARGIN_MS and keychain_at > file_at:
+        return file_creds
+    if file_exp - keychain_exp > _EXPIRY_MARGIN_MS and file_at > keychain_at:
+        return keychain
+    raise _Stop("split_brain", _UNPROVEN_WINNER)
 
 
 def _is_spent(credentials: str) -> bool:

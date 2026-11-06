@@ -4,6 +4,7 @@ keychain-required and keepalive tests. Tokens are synthetic."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -33,6 +34,13 @@ def creds(
         },
         **siblings,
     })
+
+
+def written_last(keychain, file_path: Path, store: str) -> None:
+    """Set the second signal: "keychain" or "file" holds the most recent write."""
+    now = time.time()
+    keychain.modified[ACTIVE_ITEM] = now - (120 if store == "file" else 60)
+    os.utime(file_path, (now, now - (60 if store == "file" else 120)))
 
 
 def macos_store(home: Path, *, active: str = "a@example.com") -> ClaudeAccountSwitcher:
@@ -129,6 +137,7 @@ class FakeSecurity:
         self.mangle = mangle or (lambda value: value)
         self.write_rc = write_rc
         self.delete_rc = delete_rc
+        self.attributes = ""  # what an attribute-only find prints
 
     def _completed(self, args, rc, stdout=""):
         return subprocess.CompletedProcess(args, rc, stdout=stdout, stderr="")
@@ -151,6 +160,8 @@ class FakeSecurity:
             value = self.items.get(key)
             if value is None:
                 return self._completed(args, 44)
+            if "-w" not in args:
+                return self._completed(args, 0, self.attributes)
             # keychain_find.c: hex for the whole value if any byte fails isprint.
             raw = value.encode()
             printable = all(0x20 <= byte <= 0x7e for byte in raw)

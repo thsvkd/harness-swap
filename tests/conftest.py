@@ -450,6 +450,7 @@ class _KeychainStore:
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], str] = {}
         self.reachable = True  # what the keychain preflight answers
+        self.modified: dict[tuple[str, str], float] = {}  # items' mdat, when a test sets one
 
     # Mirrors the ``macos_keychain`` (security CLI) contract.
     def get_password(self, service: str, account: str) -> str | None:
@@ -466,6 +467,9 @@ class _KeychainStore:
 
     def keychain_reachable(self, runner=None, *, platform=None) -> bool:
         return self.reachable
+
+    def item_modified_at(self, service: str, account: str) -> float | None:
+        return self.modified.get((service, account))
 
 
 def _make_fake_keyring() -> types.ModuleType:
@@ -567,6 +571,7 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "set_password", store.set_password)
     monkeypatch.setattr(_macos_keychain, "delete_password", store.delete_password)
     monkeypatch.setattr(_macos_keychain, "keychain_reachable", store.keychain_reachable)
+    monkeypatch.setattr(_macos_keychain, "item_modified_at", store.item_modified_at)
     monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
     yield store
 

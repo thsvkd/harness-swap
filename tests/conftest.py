@@ -532,7 +532,7 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     # hswap and the harnesses it manages: every location must resolve under
     # the isolated $HOME unless a test sets it explicitly.
-    for name in ("HSWAP_HOME", "HSWAP_TRUSTED_PLUGINS", "HSWAP_REQUIRE_KEYCHAIN", "CODEX_HOME", "GROK_HOME"):
+    for name in ("HSWAP_HOME", "HSWAP_TRUSTED_PLUGINS", "HSWAP_REQUIRE_KEYCHAIN", "HSWAP_CREDENTIALS_STORE", "CODEX_HOME", "GROK_HOME"):
         monkeypatch.delenv(name, raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home

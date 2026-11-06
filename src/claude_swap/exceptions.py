@@ -43,6 +43,11 @@ COPIES_DISAGREE_MESSAGE = (
     "different token, or cannot be read, and no record shows it is older; nothing was "
     "sent. Log in again with /login and run hswap claude add."
 )
+KEYCHAIN_ITEM_PRESENT_MESSAGE = (
+    "keychain_item_present: the login keychain holds a Claude Code credential item, or the "
+    "check for one failed, so the file's token may be spent. Nothing was changed or sent. "
+    "Repair with hswap claude migrate-store --to file --keep keychain."
+)
 RELOGIN_REQUIRED_MESSAGE = (
     "This login's token is already spent, or another copy of it holds a different token "
     "and no record shows which is newer; nothing was sent. Log in again with /login and "
@@ -71,10 +76,15 @@ class RequiredModeUnsupportedError(ClaudeSwitchError):
 
     json_type = "required_mode_unsupported"
 
-    def __init__(self, command: str):
+    def __init__(self, command: str, *, file_store: bool = False):
+        mode, setting = (
+            ("file-store", "credentials.store=file")
+            if file_store
+            else ("keychain-required", "credentials.requireKeychain")
+        )
         super().__init__(
-            f"required_mode_unsupported: {command} is not supported in keychain-required "
-            "mode. Turn off credentials.requireKeychain temporarily to use it, or use "
+            f"required_mode_unsupported: {command} is not supported in {mode} "
+            f"mode. Turn off {setting} temporarily to use it, or use "
             "/login and hswap claude add."
         )
 
@@ -82,11 +92,12 @@ class RequiredModeUnsupportedError(ClaudeSwitchError):
 class SessionProfilesExistError(RequiredModeUnsupportedError):
     """Keychain-required mode does not cover session profiles, so it stops at any."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, file_store: bool = False):
+        setting = "credentials.store=file" if file_store else "credentials.requireKeychain"
         ClaudeSwitchError.__init__(
             self,
             "required_mode_unsupported: session profiles exist (from hswap claude run); "
-            f"remove {path} or turn off credentials.requireKeychain.",
+            f"remove {path} or turn off {setting}.",
         )
 
 
@@ -106,6 +117,28 @@ class ConfigError(ClaudeSwitchError):
     """Error related to configuration operations."""
 
     pass
+
+
+class ConfigConflictError(ConfigError):
+    """credentials.store=file and credentials.requireKeychain cannot both be on."""
+
+    json_type = "config_conflict"
+
+    def __init__(self):
+        super().__init__(
+            "config_conflict: credentials.store=file and credentials.requireKeychain (or "
+            "HSWAP_CREDENTIALS_STORE and HSWAP_REQUIRE_KEYCHAIN) cannot both be on. Nothing "
+            "was changed. Turn one off with hswap claude config unset, or unset the variable."
+        )
+
+
+class KeychainItemPresentError(CredentialError):
+    """File store: a Claude Code item in the login keychain may hold a newer token."""
+
+    json_type = "keychain_item_present"
+
+    def __init__(self):
+        super().__init__(KEYCHAIN_ITEM_PRESENT_MESSAGE)
 
 
 class SwitchError(ClaudeSwitchError):

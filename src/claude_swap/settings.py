@@ -21,7 +21,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap.exceptions import ConfigError
+from claude_swap.exceptions import ConfigConflictError, ConfigError
 from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
@@ -99,9 +99,11 @@ class UpdateSettings:
 class CredentialSettings:
     """Credential store policy (``credentials`` section). ``require_keychain``
     refuses to work from a process that cannot reach the macOS login keychain,
-    instead of falling back to the plaintext file and ``.enc`` backups."""
+    instead of falling back to the plaintext file and ``.enc`` backups. ``store``
+    ``file`` keeps the macOS login in the plaintext file and ``.enc`` backups only."""
 
     require_keychain: bool = False
+    store: str = "auto"
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -197,6 +199,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "credentials", "requireKeychain", "require_keychain", "bool",
             help="macOS: refuse credential writes unless the login keychain is reachable (HSWAP_REQUIRE_KEYCHAIN=1 forces it on)",
+        ),
+        SettingSpec(
+            "credentials", "store", "store", "choice", choices=("auto", "file"),
+            help="macOS: file keeps logins in the file and .enc only, for SSH-only machines (HSWAP_CREDENTIALS_STORE=file forces it on)",
         ),
     )
 }
@@ -345,10 +351,14 @@ def load_update_settings(backup_root: Path) -> UpdateSettings:
 def load_credential_settings(backup_root: Path) -> CredentialSettings:
     """Load the credentials section; missing/corrupt file or non-bool → default."""
     section = _read_raw(settings_path(backup_root)).get("credentials")
-    value = section.get("requireKeychain") if isinstance(section, dict) else None
-    if not isinstance(value, bool):
+    if not isinstance(section, dict):
         return CredentialSettings()
-    return CredentialSettings(require_keychain=value)
+    value = section.get("requireKeychain")
+    store = section.get("store", "auto")
+    if store not in SETTING_SPECS["credentials.store"].choices:
+        _logger.warning("settings.json: unsupported credentials.store %r; using 'auto'", store)
+        store = "auto"
+    return CredentialSettings(require_keychain=value if isinstance(value, bool) else False, store=store)
 
 
 def require_keychain(backup_root: Path) -> bool:
@@ -359,6 +369,24 @@ def require_keychain(backup_root: Path) -> bool:
         os.environ.get("HSWAP_REQUIRE_KEYCHAIN") == "1"
         or load_credential_settings(backup_root).require_keychain
     )
+
+
+def credentials_store(backup_root: Path) -> str:
+    """``auto`` or ``file``. Like ``require_keychain``, the env may only tighten:
+    ``HSWAP_CREDENTIALS_STORE=file`` forces it on, and no other value turns it off."""
+    if os.environ.get("HSWAP_CREDENTIALS_STORE") == "file":
+        return "file"
+    return load_credential_settings(backup_root).store
+
+
+def strict_mode(backup_root: Path) -> bool:
+    """The protections keychain-required mode and the file store share."""
+    return require_keychain(backup_root) or credentials_store(backup_root) == "file"
+
+
+def store_conflict(backup_root: Path) -> bool:
+    """One mode forbids the file and the other forbids the Keychain."""
+    return require_keychain(backup_root) and credentials_store(backup_root) == "file"
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -493,6 +521,12 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     """
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
+    if (spec.dotted == "credentials.store" and value == "file" and require_keychain(backup_root)) or (
+        spec.dotted == "credentials.requireKeychain"
+        and value is True
+        and credentials_store(backup_root) == "file"
+    ):
+        raise ConfigConflictError()
     path = settings_path(backup_root)
     raw = _read_raw_for_write(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)

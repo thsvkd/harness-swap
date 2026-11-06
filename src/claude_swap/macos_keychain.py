@@ -57,6 +57,9 @@ SECURITY_STDIN_LINE_LIMIT = 4096 - 64
 
 _NOT_FOUND_RC = 44  # errSecItemNotFound surfaced by find/delete-generic-password
 
+# Claude Code's active OAuth item; a custom profile's carries a `-<hash>` suffix.
+CREDENTIAL_SERVICE = "Claude Code-credentials"
+
 # Bound every ``security`` spawn so a wedged Keychain (a locked login keychain
 # prompting for an unlock that never comes on a headless/SSH host) can't hang the
 # CLI. 5s, deliberately short: a credential op that has to fall back to the file
@@ -77,6 +80,10 @@ _UNLOCK_STATE_STATUS = 1  # kSecUnlockStateStatus
 _SELFTEST_VALUE = json.dumps(
     {"a": "b\"c \\ 'd' $HOME %s é", "pad": "AbC-_.~09" * 240}, ensure_ascii=False
 )
+
+
+# One attribute line of `dump-keychain`: `"svce"<blob>="name"`, or with a hex form first.
+_DUMP_ATTRIBUTE = re.compile(r'(?m)^\s*"(svce|acct)"<blob>=(?:0x[0-9A-Fa-f]+\s+)?"(.*)"\s*$')
 
 
 class KeychainError(Exception):
@@ -278,6 +285,54 @@ def delete_password(service: str, account: str) -> None:
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
     )
+
+
+def login_keychain_file() -> str:
+    """Named outright: a daemon's search list lacks the login keychain, and there an
+    unqualified lookup answers rc 44 for an item that exists."""
+    return str(Path.home() / "Library" / "Keychains" / "login.keychain-db")
+
+
+def _run_metadata(args: list[str]) -> subprocess.CompletedProcess:
+    # Attributes can hold any bytes, and one odd account name must not read as a failure.
+    return spawn.run(
+        [_SECURITY, *args], capture_output=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT
+    )
+
+
+def credential_items() -> list[tuple[str, str]]:
+    """(service, account) of every Claude Code credential item in the login keychain.
+
+    Attributes only, never `-d`, so this decrypts nothing and answers while the keychain
+    is locked. Matches on the service attribute: hswap's own `claude-swap` items may
+    carry the name elsewhere. Raises when `security` fails.
+    """
+    result = _run_metadata(["dump-keychain", login_keychain_file()])
+    if result.returncode != 0:
+        raise KeychainError(f"security dump-keychain failed (rc={result.returncode})")
+    items = []
+    for record in re.split(r"(?m)^keychain: ", result.stdout):
+        if 'class: "genp"' not in record:
+            continue
+        attributes = dict(_DUMP_ATTRIBUTE.findall(record))
+        service = attributes.get("svce", "")
+        if service == CREDENTIAL_SERVICE or service.startswith(f"{CREDENTIAL_SERVICE}-"):
+            items.append((service, attributes.get("acct", "")))
+    return items
+
+
+def credential_item_present() -> bool:
+    """Does the login keychain hold a Claude Code credential item? A check that fails
+    answers True: the caller is deciding whether a refresh token may be spent."""
+    try:
+        found = _run_metadata(
+            ["find-generic-password", "-s", CREDENTIAL_SERVICE, login_keychain_file()]
+        )
+        if found.returncode != _NOT_FOUND_RC:
+            return True  # rc 0 is the item; anything else is a failed check
+        return bool(credential_items())
+    except (*KEYCHAIN_ERRORS, ValueError):
+        return True
 
 
 def selftest() -> bool:

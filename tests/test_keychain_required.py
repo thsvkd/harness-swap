@@ -17,11 +17,13 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli, consumed_grants, macos_keychain, oauth
+from claude_swap.autoswitch import AutoSwitchEngine, TickOutcome
 from claude_swap.exceptions import ClaudeSwitchError, KeychainUnavailableError
 from claude_swap.keepalive import run_keepalive
 from claude_swap.models import Platform
 from claude_swap.settings import (
     SETTING_SPECS,
+    AutoSwitchSettings,
     load_credential_settings,
     require_keychain,
     set_setting,
@@ -735,15 +737,20 @@ class TestRequiredModeFetchPathR10:
         assert not list(s.credentials_dir.glob(".creds-*.enc"))
         assert not (s.home / ".claude" / ".credentials.json").exists()
 
-        # The next pass, on the same path, adopts it instead of posting again.
+        # The next pass, on the same path, adopts it into the slot instead of posting
+        # again, and leaves the live stores to keepalive, which moves them with no POST.
         monkeypatch.setattr(macos_keychain, "set_password", real_set)
         fresh = ClaudeAccountSwitcher()
         fresh.platform = Platform.MACOS
         fresh._fetch_active_usage("1", "a@example.com", expired, "")
         assert endpoint.posts == ["RT-0"]
-        assert oauth.extract_access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
+        assert block_real_keychain.data[ACTIVE_ITEM] == expired
         assert oauth.extract_access_token(fresh._read_account_credentials("1", "a@example.com")) == "AT-1"
         assert fresh._store._list_unclaimed_credentials() == {}
+
+        assert run_keepalive(fresh)["ok"] is True
+        assert endpoint.posts == ["RT-0"]
+        assert oauth.extract_access_token(block_real_keychain.data[ACTIVE_ITEM]) == "AT-1"
 
     def test_R10_keepalive_adopts_what_the_fetch_path_parked(
         self, setup, block_real_keychain, monkeypatch
@@ -1159,3 +1166,249 @@ class TestRequiredModeReadsTheFileBeforeAnActivePost:
         )
         assert self._post(s, creds("AT-K", "RT-K"), locks_held=False).error is None
         assert endpoint.posts == ["RT-K"]
+
+
+class TestOnlyKeepaliveReconcilesTheActiveStores:
+    """Codex round 10's open item: `auto` restored a slot copy over agreeing stores."""
+
+    @pytest.fixture
+    def endpoint(self, monkeypatch):
+        fake = _TokenAndUsage()
+        monkeypatch.setattr("claude_swap.oauth.urllib.request.urlopen", fake)
+        return fake
+
+    @pytest.fixture
+    def store(self, temp_home, block_real_keychain, endpoint):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "credentials.requireKeychain", "true")
+        set_setting(s.backup_dir, "updates.check", "false")
+        return s
+
+    COMMANDS = pytest.mark.parametrize(
+        "command",
+        [["auto", "--once", "--json"], ["list", "--json"]],
+        ids=["auto", "list"],
+    )
+
+    def _stores_on_b_and_slot_on_a(self, s, home, keychain, *, b_expires=-60, with_file=True):
+        a = creds("AT-A", "RT-A", expires_in_s=28000)
+        b = creds("AT-B", "RT-B", expires_in_s=b_expires)
+        s._write_account_credentials("1", "a@example.com", a)
+        keychain.data[ACTIVE_ITEM] = b
+        file_path = home / ".claude" / ".credentials.json"
+        if with_file:
+            file_path.write_text(b, encoding="utf-8")
+        return a, b, file_path
+
+    @COMMANDS
+    @pytest.mark.parametrize("with_file", [True, False], ids=["file", "no-file"])
+    @pytest.mark.parametrize("b_expires", [-60, 3600], ids=["expired", "refused-by-the-server"])
+    def test_a_valid_slot_copy_is_not_restored_or_posted(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, command, with_file, b_expires
+    ):
+        a, b, file_path = self._stores_on_b_and_slot_on_a(
+            store, temp_home, block_real_keychain, b_expires=b_expires, with_file=with_file
+        )
+        for _ in range(2):
+            _main(command, capsys)
+        assert endpoint.posts == []
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+        assert file_path.exists() is with_file
+        if with_file:
+            assert file_path.read_text(encoding="utf-8") == b
+        assert store._read_account_credentials("1", "a@example.com") == a
+
+    @COMMANDS
+    def test_keepalive_afterwards_sends_the_live_token_and_keeps_the_slot_copy(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, command
+    ):
+        a, _, file_path = self._stores_on_b_and_slot_on_a(store, temp_home, block_real_keychain)
+        _main(command, capsys)
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert endpoint.posts == ["RT-B"]
+        for stored in (block_real_keychain.data[ACTIVE_ITEM], file_path.read_text(encoding="utf-8")):
+            assert oauth.extract_access_token(stored) == "AT-1"
+        slot = oauth.extract_access_token(store._read_account_credentials("1", "a@example.com"))
+        assert slot == "AT-1"
+        rows = store._store._list_unclaimed_credentials()
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
+
+    @COMMANDS
+    @pytest.mark.parametrize("file_copy", [creds("AT-F", "RT-F", expires_in_s=28000), "not json"], ids=["other-token", "garbled"])
+    def test_stores_that_disagree_get_no_write_and_no_post(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, command, file_copy
+    ):
+        a = creds("AT-A", "RT-A", expires_in_s=28000)
+        k = creds("AT-K", "RT-K", expires_in_s=-60)
+        store._write_account_credentials("1", "a@example.com", a)
+        block_real_keychain.data[ACTIVE_ITEM] = k
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(file_copy, encoding="utf-8")
+        _main(command, capsys)
+        assert endpoint.posts == []
+        assert block_real_keychain.data[ACTIVE_ITEM] == k
+        assert file_path.read_text(encoding="utf-8") == file_copy
+        assert store._read_account_credentials("1", "a@example.com") == a
+
+    def test_a_cleared_keychain_is_not_refilled_from_the_slot(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        a = creds("AT-A", "RT-A", expires_in_s=28000)
+        store._write_account_credentials("1", "a@example.com", a)
+        _main(["auto", "--once", "--json"], capsys)
+        assert ACTIVE_ITEM not in block_real_keychain.data
+        assert endpoint.posts == []
+
+    @COMMANDS
+    def test_a_stash_adoption_here_leaves_keepalive_the_evidence(
+        self, store, temp_home, block_real_keychain, endpoint, capsys, command
+    ):
+        """The row is retired here and the stores still hold X, with no ledger row."""
+        x = creds("AT-X", "RT-X", expires_in_s=-60)
+        y = creds("AT-Y", "RT-Y", expires_in_s=28000)
+        store._write_account_credentials("1", "a@example.com", x)
+        store.stash_consumed_successor(
+            "1", ("a@example.com", ""), y, oauth.credential_fingerprint(x), "keepalive-live-write-failed"
+        )
+        block_real_keychain.data[ACTIVE_ITEM] = x
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(x, encoding="utf-8")
+        _main(command, capsys)
+        assert block_real_keychain.data[ACTIVE_ITEM] == x  # keepalive's to move
+        report = run_keepalive(ClaudeAccountSwitcher())
+        assert report["ok"] is True
+        assert endpoint.posts == []
+        assert block_real_keychain.data[ACTIVE_ITEM] == y
+        assert file_path.read_text(encoding="utf-8") == y
+
+    def _verified_drift(self, s, home, keychain, file_copy):
+        a = creds("AT-A", "RT-A", expires_in_s=28000)
+        b = creds("AT-B", "RT-B", expires_in_s=7200)
+        s._write_account_credentials("1", "a@example.com", a)
+        keychain.data[ACTIVE_ITEM] = b
+        (home / ".claude" / ".credentials.json").write_text(file_copy or b, encoding="utf-8")
+        key = s._lineage_key("1", "a@example.com", oauth.credential_fingerprint(b))
+        s._probe_verdicts[key] = True
+        return a, b
+
+    def test_a_resync_from_agreeing_stores_keeps_the_slot_copy_first(
+        self, store, temp_home, block_real_keychain
+    ):
+        a, b = self._verified_drift(store, temp_home, block_real_keychain, None)
+        store._resync_rotated_backup("1", "a@example.com", "", b)
+        assert store._read_account_credentials("1", "a@example.com") == b
+        rows = store._store._list_unclaimed_credentials()
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
+        row = next(iter(rows.values()))
+        assert (row["email"], row["organizationUuid"]) == ("a@example.com", "")
+
+    def test_a_stash_that_fails_stops_the_resync(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        a, b = self._verified_drift(store, temp_home, block_real_keychain, None)
+        monkeypatch.setattr(
+            store._store, "_write_unclaimed_credential",
+            lambda *args: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        store._resync_rotated_backup("1", "a@example.com", "", b)
+        assert store._read_account_credentials("1", "a@example.com") == a
+
+    def test_no_resync_while_the_stores_disagree(self, store, temp_home, block_real_keychain):
+        a, b = self._verified_drift(
+            store, temp_home, block_real_keychain, creds("AT-F", "RT-F", expires_in_s=7200)
+        )
+        store._resync_rotated_backup("1", "a@example.com", "", b)
+        assert store._read_account_credentials("1", "a@example.com") == a
+        assert store._store._list_unclaimed_credentials() == {}
+
+    def test_a_rotation_seen_mid_pass_with_the_stores_apart_writes_no_slot(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        a, b = self._verified_drift(
+            store, temp_home, block_real_keychain, creds("AT-F", "RT-F", expires_in_s=7200)
+        )
+        store._fetch_active_usage("1", "a@example.com", creds("AT-old", "RT-old", expires_in_s=-60), "")
+        assert store._read_account_credentials("1", "a@example.com") == a
+        assert block_real_keychain.data[ACTIVE_ITEM] == b
+
+    def test_a_stash_row_is_not_adopted_while_the_stores_are_apart(
+        self, store, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        x = creds("AT-X", "RT-X", expires_in_s=-60)
+        y = creds("AT-Y", "RT-Y", expires_in_s=28000)
+        store._write_account_credentials("1", "a@example.com", x)
+        store.stash_consumed_successor(
+            "1", ("a@example.com", ""), y, oauth.credential_fingerprint(x), "keepalive-live-write-failed"
+        )
+        block_real_keychain.data[ACTIVE_ITEM] = x
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            creds("AT-F", "RT-F", expires_in_s=7200), encoding="utf-8"
+        )
+        _main(["auto", "--once", "--json"], capsys)
+        assert store._read_account_credentials("1", "a@example.com") == x
+        assert len(store._store._list_unclaimed_credentials()) == 1
+        assert endpoint.posts == []
+
+    def test_a_rotation_seen_mid_pass_keeps_the_slot_copy_before_following(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        a, b = self._verified_drift(store, temp_home, block_real_keychain, None)
+        store._fetch_active_usage("1", "a@example.com", creds("AT-old", "RT-old", expires_in_s=-60), "")
+        assert store._read_account_credentials("1", "a@example.com") == b
+        rows = store._store._list_unclaimed_credentials()
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
+
+    def test_a_post_of_the_attributed_live_token_keeps_the_slot_copy(
+        self, store, temp_home, block_real_keychain, endpoint
+    ):
+        a = creds("AT-A", "RT-A", expires_in_s=-3600)
+        b = creds("AT-B", "RT-B", expires_in_s=-60)
+        store._write_account_credentials("1", "a@example.com", a)
+        block_real_keychain.data[ACTIVE_ITEM] = b
+        (temp_home / ".claude" / ".credentials.json").write_text(b, encoding="utf-8")
+        key = store._lineage_key("1", "a@example.com", oauth.credential_fingerprint(b))
+        store._probe_verdicts[key] = True
+        store._fetch_active_usage("1", "a@example.com", b, "")
+        assert endpoint.posts == ["RT-B"]
+        assert oauth.extract_access_token(store._read_account_credentials("1", "a@example.com")) == "AT-1"
+        rows = store._store._list_unclaimed_credentials()
+        assert [store._store._read_unclaimed_credential(i)[0] for i in rows] == [a]
+
+    def test_stores_on_the_same_token_are_not_a_disagreement(
+        self, store, temp_home, block_real_keychain
+    ):
+        k = creds("AT-K", "RT-K")
+        block_real_keychain.data[ACTIVE_ITEM] = k
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(k, encoding="utf-8")
+        assert store.active_stores_disagree() is False
+        file_path.write_text(creds("AT-F", "RT-F"), encoding="utf-8")
+        assert store.active_stores_disagree() is True
+
+    def test_auto_does_not_switch_accounts_while_the_stores_disagree(
+        self, store, temp_home, block_real_keychain, monkeypatch
+    ):
+        store._write_account_credentials("2", "b@example.com", creds("AT-2", "RT-2"))
+        k = creds("AT-K", "RT-K")
+        block_real_keychain.data[ACTIVE_ITEM] = k
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(creds("AT-F", "RT-F"), encoding="utf-8")
+        events = []
+        engine = AutoSwitchEngine(store, AutoSwitchSettings(), events.append)
+        monkeypatch.setattr(
+            store, "switch_to", lambda *a, **kw: pytest.fail("the stores would be overwritten")
+        )
+        outcome = engine._perform("2", "b@example.com", "failover", (None, float("inf")))
+        assert outcome == TickOutcome.NO_ACTION
+        assert [event.reason for event in events] == ["stores-disagree"]
+
+    def test_default_mode_still_restores_the_slot_copy(
+        self, temp_home, block_real_keychain, endpoint, capsys
+    ):
+        s = macos_store(temp_home)
+        set_setting(s.backup_dir, "updates.check", "false")
+        a, _, _ = self._stores_on_b_and_slot_on_a(s, temp_home, block_real_keychain)
+        _main(["auto", "--once", "--json"], capsys)
+        assert block_real_keychain.data[ACTIVE_ITEM] == a
+        assert endpoint.posts == []

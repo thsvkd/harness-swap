@@ -2478,6 +2478,12 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
+            # shortcut: checked before the switch takes its locks, so a refresh landing
+            # in between goes unseen; move it under them if that window ever matters.
+            if self.switcher.active_stores_disagree():
+                self._emit(NoSwitchEvent(reason="stores-disagree"))
+                return TickOutcome.NO_ACTION
+
             result = self.switcher.switch_to(number, json_output=True)
             if not result or not result.get("switched"):
                 self._emit(

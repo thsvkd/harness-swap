@@ -720,6 +720,43 @@ class ClaudeAccountSwitcher:
             return False
         return spent_here and credential_generation(credentials) > credential_generation(file_creds)
 
+    def active_stores_disagree(self) -> bool:
+        """Required mode: the rule `post_refresh` applies to a POST, for anything else
+        that would write the active login's stores. Only keepalive reconciles them."""
+        if not self._store._keychain_is_required():
+            return False
+        live = self._read_credentials()
+        return live is None or not self._file_permits_post(live)
+
+    def _keep_slot_copy_before_overwrite(
+        self, account_num: str, email: str, org_uuid: str, live: str
+    ) -> None:
+        """Required mode: a slot copy of another lineage is kept before the live login
+        replaces it. Raises when it cannot be, which must stop the overwrite."""
+        if not self._store._keychain_is_required():
+            return
+        copy, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            raise CredentialReadError(f"account {account_num}'s stored credential is unreadable")
+        fingerprint = oauth.credential_fingerprint(copy)
+        if not copy or fingerprint == oauth.credential_fingerprint(live):
+            return
+        if any(
+            row.get("fingerprint") == fingerprint
+            for row in self._store._list_unclaimed_credentials().values()
+        ):
+            return
+        self._store._write_unclaimed_credential(
+            copy,
+            {
+                "reason": "slot-replaced-by-live",
+                "configSlot": account_num,
+                "email": email,
+                "organizationUuid": org_uuid or "",
+                "fingerprint": fingerprint,
+            },
+        )
+
     def stash_consumed_successor(
         self,
         account_num: str,
@@ -2972,6 +3009,13 @@ class ClaudeAccountSwitcher:
             # here made this one call site safe and left the other two — the
             # resync and the post-POST persist — carrying the defect.
             chain, creds = self.stash_chain_terminal(manifest, is_ours, entry_id, creds, cur_fp)
+            successor_fp = oauth.credential_fingerprint(creds)
+            if self._store._keychain_is_required() and successor_fp != cur_fp:
+                # The row is retired below and the stores still hold the spent token;
+                # keepalive reads two agreeing stores as unspent unless this says not.
+                consumed_grants.record(
+                    cur_fp, (email, own_org), consumed_grants.CONSUMED, successor=successor_fp
+                )
             self._write_account_credentials(account_num, email, creds)
             # The stash holds the only sure copy until the slot provably does.
             if self._store._read_account_credentials(account_num, email) != creds:
@@ -4780,6 +4824,10 @@ class ClaudeAccountSwitcher:
                 #   backup.
                 if not self._live_identity_matches(email, org_uuid):
                     return _defer(force_refresh)
+                # Required mode: only keepalive reconciles the two stores.
+                required = self._store._keychain_is_required()
+                if required and not self._file_permits_post(live):
+                    return _defer(force_refresh)
                 # A successor an earlier pass could not persist: nothing below
                 # may POST past it, the generation it supersedes is spent.
                 for held in (backup, live):
@@ -4844,6 +4892,9 @@ class ClaudeAccountSwitcher:
                         oauth.credential_fingerprint(live) == backup_fp
                     ):
                         try:
+                            self._keep_slot_copy_before_overwrite(
+                                account_num, email, org_uuid, live
+                            )
                             self._write_account_credentials(
                                 account_num, email, live
                             )
@@ -4942,6 +4993,10 @@ class ClaudeAccountSwitcher:
                         # Live moved mid-flight to bytes that are neither
                         # what the collector read nor the backup's lineage —
                         # another actor is mutating the store; defer.
+                        return _defer(force_refresh)
+                    # Required mode: a slot copy never replaces the live stores,
+                    # restored or refreshed. keepalive brings the slot to them.
+                    if required and refresh_input != live:
                         return _defer(force_refresh)
                     input_oauth = oauth.extract_oauth_data(refresh_input)
                     if (
@@ -5056,6 +5111,9 @@ class ClaudeAccountSwitcher:
                     backup_ok = live_ok = True
                     if restore_source is None:
                         try:
+                            self._keep_slot_copy_before_overwrite(
+                                account_num, email, org_uuid, refresh_input
+                            )
                             self._write_account_credentials(
                                 account_num, email, working
                             )
@@ -5258,6 +5316,12 @@ class ClaudeAccountSwitcher:
                     == oauth.credential_fingerprint(creds)
                 ):
                     return
+                if (
+                    self._store._keychain_is_required()
+                    and not self._file_permits_post(live)
+                ):
+                    return
+                self._keep_slot_copy_before_overwrite(account_num, email, org_uuid, live)
                 self._write_account_credentials(account_num, email, live)
                 self._logger.info(
                     "Resynced account %s's backup to the rotated live "

@@ -514,13 +514,6 @@ def _reconcile(
         _report_expiry(report, login)
         return login, backup, True
     if successor:
-        successor_fp = oauth.credential_fingerprint(successor)
-        if successor_fp != fingerprint and not dry_run:
-            # Outlives the stash entry just retired, in case a store write fails below.
-            consumed_grants.record(
-                fingerprint, active.identity or ("", ""), consumed_grants.CONSUMED,
-                successor=successor_fp,
-            )
         login = successor
         backup = successor if active.slot else backup
     _refuse_spent(login)
@@ -823,10 +816,10 @@ def _refresh(active, report, current, backup, ensure_file) -> tuple[str, dict | 
     return final, outcome.token_account
 
 
-def _keep_slot_copy_before_it_follows(active, final: str) -> None:
+def _let_the_slot_follow(active, final: str) -> None:
     """Required mode: the live stores are authoritative, so the slot follows them,
-    whatever its expiry says. Its copy is kept first. Only a token proven to be
-    another account's leaves the slot alone. Decides the verdict the resync acts on.
+    whatever its expiry says, and the resync keeps its copy first. Only a token proven
+    to be another account's leaves the slot alone. Decides the verdict the resync acts on.
     """
     switcher = active.switcher
     copy = _read_slot(active)
@@ -836,8 +829,6 @@ def _keep_slot_copy_before_it_follows(active, final: str) -> None:
     key = switcher._lineage_key(active.slot, active.identity[0], fingerprint)
     if switcher._probe_verdicts.get(key) is None:
         switcher._probe_verdicts[key] = _belongs(active, final, copy, probe=True) is not False
-    if switcher._probe_verdicts[key] and not _is_empty(copy):
-        _stash_loser(active, copy, True)
 
 
 def _settle_slot(active, report, final, token_account) -> None:
@@ -859,7 +850,7 @@ def _settle_slot(active, report, final, token_account) -> None:
         if match is not None:
             switcher._probe_verdicts[switcher._lineage_key(slot, email, fingerprint)] = match
     if switcher.platform == Platform.MACOS:
-        _keep_slot_copy_before_it_follows(active, final)
+        _let_the_slot_follow(active, final)
     switcher._resync_rotated_backup(slot, email, org_uuid, final)
     if switcher._probe_verdicts.get(switcher._lineage_key(slot, email, fingerprint)) is False:
         report["error"] = _error("unmanaged")

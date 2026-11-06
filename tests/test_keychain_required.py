@@ -29,7 +29,7 @@ from claude_swap.settings import (
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
 
-from .keychain_helpers import ACTIVE_ITEM, FakeSecurity, creds, macos_store, snapshot, written_last
+from .keychain_helpers import ACTIVE_ITEM, FakeSecurity, creds, macos_store, snapshot
 
 LOGIN = "/Users/me/Library/Keychains/login.keychain-db"
 
@@ -1014,20 +1014,16 @@ class TestRequiredModeReadsTheFileBeforeAnActivePost:
     def test_codex_scenario_auto_does_not_post_the_keychain_predecessor(
         self, store, temp_home, block_real_keychain, endpoint, monkeypatch, capsys, expires_in_s
     ):
-        """Claude Code refreshed A -> B in the file. keepalive sees B, but its Keychain
-        write fails, and then `auto --once` runs on Keychain A."""
+        """Claude Code refreshed A -> B in the file. keepalive refuses to pick a side,
+        and then `auto --once` runs on Keychain A anyway."""
         a = self._a_in_keychain_and_slot(store, block_real_keychain, expires_in_s)
         b = creds("AT-B", "RT-B", expires_in_s=28000)
         file_path = temp_home / ".claude" / ".credentials.json"
         file_path.write_text(b, encoding="utf-8")
-        written_last(block_real_keychain, file_path, "file")
         ledger_before = consumed_grants.in_use()
 
-        real_set = block_real_keychain.set_password
-        monkeypatch.setattr(macos_keychain, "set_password", _failing_set(None))
         report = run_keepalive(store)
-        assert report["ok"] is False and report["error"]["type"] == "keychain_unavailable"
-        monkeypatch.setattr(macos_keychain, "set_password", real_set)
+        assert report["ok"] is False and report["error"]["type"] == "split_brain"
 
         _main(["auto", "--once", "--json"], capsys)
 
@@ -1037,18 +1033,18 @@ class TestRequiredModeReadsTheFileBeforeAnActivePost:
         assert file_path.read_text(encoding="utf-8") == b
         assert block_real_keychain.data[ACTIVE_ITEM] == a
 
-    def test_keepalive_then_reconciles_with_no_post_of_the_predecessor(
+    def test_a_person_then_reconciles_with_no_post_of_the_predecessor(
         self, store, temp_home, block_real_keychain, endpoint, monkeypatch, capsys
     ):
         self._a_in_keychain_and_slot(store, block_real_keychain, -60)
         b = creds("AT-B", "RT-B", expires_in_s=28000)
         file_path = temp_home / ".claude" / ".credentials.json"
         file_path.write_text(b, encoding="utf-8")
-        written_last(block_real_keychain, file_path, "file")
         _main(["auto", "--once", "--json"], capsys)
         assert endpoint.posts == []
-        report = run_keepalive(ClaudeAccountSwitcher())
-        assert report["ok"] is True and report["action"] == "synced-keychain"
+        assert run_keepalive(ClaudeAccountSwitcher())["error"]["type"] == "split_brain"
+        report = run_keepalive(ClaudeAccountSwitcher(), adopt="file")
+        assert report["ok"] is True and report["action"] == "adopted"
         assert block_real_keychain.data[ACTIVE_ITEM] == b
         assert endpoint.posts == []
 

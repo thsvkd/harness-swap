@@ -110,14 +110,17 @@ def _rewrite(mutate) -> None:
         raise LedgerUnreadable(f"{FILENAME} cannot be written") from None
 
 
-def _row(identity: tuple[str, str], state: str) -> dict:
+def _row(identity: tuple[str, str], state: str, successor: str | None = None) -> dict:
     # The account, not the slot: `move` and `swap` renumber slots.
-    return {
+    row = {
         "state": state,
         "email": identity[0],
         "organizationUuid": identity[1] or "",
         "at": time.time(),
     }
+    if successor:
+        row["successorFp"] = successor
+    return row
 
 
 def reserve(fingerprint: str, identity: tuple[str, str]) -> bool:
@@ -140,12 +143,16 @@ def reserve(fingerprint: str, identity: tuple[str, str]) -> bool:
     return claimed
 
 
-def record(fingerprint: str, identity: tuple[str, str], state: str) -> None:
-    """Settle a row. Raises :class:`LedgerUnreadable`."""
+def record(
+    fingerprint: str, identity: tuple[str, str], state: str, successor: str | None = None
+) -> None:
+    """Settle a row. ``successor`` is the fingerprint this token was exchanged for,
+    the evidence keepalive needs to tell a successor from a rival. Raises
+    :class:`LedgerUnreadable`."""
 
     def mutate(rows: dict) -> None:
         rows.pop(fingerprint, None)
-        rows[fingerprint] = _row(identity, state)
+        rows[fingerprint] = _row(identity, state, successor)
 
     _rewrite(mutate)
 

@@ -997,7 +997,8 @@ def _keychain_selftest_command(argv: list[str]) -> None:
 
 
 def _keepalive_command(argv: list[str]) -> None:
-    """Handle `cswap keepalive [--ahead SECONDS] [--ensure-file] [--dry-run] [--json]`.
+    """Handle `cswap keepalive [--ahead SECONDS] [--ensure-file] [--dry-run]
+    [--adopt {file,keychain}] [--json]`.
 
     Pre-dispatched before the main parser for the same reason as `auto`.
     """
@@ -1030,12 +1031,23 @@ def _keepalive_command(argv: list[str]) -> None:
         help="Report what would happen; change nothing but keepalive.json",
     )
     parser.add_argument(
+        "--adopt",
+        choices=("file", "keychain"),
+        help=(
+            "When the stores disagree: copy this store over the other and the slot, "
+            "keeping what it replaces, with no refresh. Pick the store whose writer "
+            "refreshed last"
+        ),
+    )
+    parser.add_argument(
         "--json", action="store_true", help="Print the report as JSON on stdout"
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
     if not (math.isfinite(args.ahead) and args.ahead >= 0):
         parser.error("--ahead must be a non-negative number of seconds")
+    if args.adopt and args.dry_run:
+        parser.error("--adopt cannot be combined with --dry-run")
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -1045,6 +1057,7 @@ def _keepalive_command(argv: list[str]) -> None:
             ahead=args.ahead,
             ensure_file=args.ensure_file,
             dry_run=args.dry_run,
+            adopt=args.adopt,
         )
     except ClaudeSwitchError as e:
         if args.json:

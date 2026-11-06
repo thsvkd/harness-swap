@@ -238,7 +238,10 @@ def try_refresh_oauth_credentials(
     if ledger_identity is not None:
         try:
             if outcome.fate == GRANT_SPENT:
-                consumed_grants.record(fingerprint, ledger_identity, consumed_grants.CONSUMED)
+                consumed_grants.record(
+                    fingerprint, ledger_identity, consumed_grants.CONSUMED,
+                    successor=credential_fingerprint(outcome.credentials),
+                )
             elif outcome.fate == GRANT_UNCHANGED:
                 consumed_grants.release(fingerprint)
         except consumed_grants.LedgerUnreadable:

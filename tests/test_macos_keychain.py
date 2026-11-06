@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import subprocess
 import traceback
-from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -281,37 +280,6 @@ class TestCredentialJsonIsStoredReadable:
             with pytest.raises(macos_keychain.KeychainError):
                 macos_keychain.set_password("svc", "acct", '{"a": "é"}')
         assert fake.items[("svc", "acct")] == "previous"
-
-
-class TestItemModifiedAt:
-    STAMP = "20261106030234"
-    LINE = f'    "mdat"<timedate>=0x{STAMP.encode().hex().upper()}5A00  "{STAMP}Z\\000"\n'
-
-    def _read(self, fake):
-        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=fake) as run:
-            value = macos_keychain.item_modified_at("svc", "acct")
-        return value, run
-
-    def test_reads_the_attribute_line_as_utc_and_asks_for_no_secret(self):
-        fake = FakeSecurity()
-        fake.items[("svc", "acct")] = "SECRET"
-        fake.attributes = 'class: "genp"\nattributes:\n' + self.LINE
-        value, run = self._read(fake)
-        assert value == datetime(2026, 11, 6, 3, 2, 34, tzinfo=UTC).timestamp()
-        assert "-w" not in run.call_args.args[0] and "-g" not in run.call_args.args[0]
-
-    def test_a_missing_item_is_unknown(self):
-        assert self._read(FakeSecurity())[0] is None
-
-    @pytest.mark.parametrize("failure", [subprocess.TimeoutExpired("x", 5), OSError("no binary")])
-    def test_a_security_that_cannot_run_is_unknown(self, failure):
-        with patch("claude_swap.macos_keychain.subprocess.run", side_effect=failure):
-            assert macos_keychain.item_modified_at("svc", "acct") is None
-
-    def test_a_failing_exit_is_unknown_even_with_the_line(self):
-        with patch("claude_swap.macos_keychain.subprocess.run") as run:
-            run.return_value = _completed(51, stdout=self.LINE)
-            assert macos_keychain.item_modified_at("svc", "acct") is None
 
 
 class TestPreviousValueIsRestored:

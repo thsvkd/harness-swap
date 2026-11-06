@@ -45,7 +45,6 @@ import secrets
 import subprocess
 import sys
 from collections.abc import Callable
-from datetime import UTC, datetime
 from pathlib import Path
 
 from claude_swap import spawn
@@ -174,31 +173,6 @@ def item_exists(service: str, account: str) -> bool:
     except (subprocess.TimeoutExpired, OSError):
         return False
     return result.returncode == 0
-
-
-def item_modified_at(service: str, account: str) -> float | None:
-    """When a generic-password item was last written (epoch seconds, whole seconds),
-    or ``None`` when that cannot be told. Attribute-only, like :func:`item_exists`:
-    nothing is decrypted. The line reads ``"mdat"<timedate>=0x...  "20261106030234Z\\000"``.
-    """
-    try:
-        result = spawn.run(
-            [_SECURITY, "find-generic-password", "-a", account, "-s", service],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_TIMEOUT,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    found = re.search(r'"mdat"<timedate>=0x[0-9A-Fa-f]+\s+"(\d{14})Z', result.stdout or "")
-    if result.returncode != 0 or not found:
-        return None
-    try:
-        return datetime.strptime(found[1], "%Y%m%d%H%M%S").replace(tzinfo=UTC).timestamp()
-    except ValueError:
-        return None
 
 
 def _readable_form(value: str) -> str:

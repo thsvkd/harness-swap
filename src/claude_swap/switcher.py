@@ -2556,14 +2556,26 @@ class ClaudeAccountSwitcher:
                         prof_oauth = oauth.extract_oauth_data(profile)
                         cur_exp = (input_oauth or {}).get("expiresAt") or 0
                         prof_exp = (prof_oauth or {}).get("expiresAt") or 0
-                        if (
+                        profile_differs = (
                             prof_oauth
                             and prof_oauth.get("accessToken")
                             and prof_oauth.get("refreshToken")
                             and oauth.credential_fingerprint(profile)
                             != oauth.credential_fingerprint(refresh_input)
-                            and prof_exp > cur_exp
+                        )
+                        if (
+                            profile_differs
+                            and global_lock_held
+                            and self._store._keychain_is_required()
                         ):
+                            # Keepalive orders nothing by expiry: the session may
+                            # have spent this token, or may hold an older one.
+                            self._logger.info(
+                                "Account %s's session profile holds another token; "
+                                "deferring the refresh.", account_num,
+                            )
+                            return oauth.RefreshOutcome(None, "transient")
+                        if profile_differs and prof_exp > cur_exp:
                             # The profile holds the newer generation: the
                             # backup rt is already consumed. Resync so the
                             # slot's stored credential is the live lineage,

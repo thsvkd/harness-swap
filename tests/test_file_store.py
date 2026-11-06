@@ -42,6 +42,9 @@ ACTIVE_ITEM = (SERVICE, ACCOUNT)
 SLOT_1 = ("1", "a@example.com")
 SLOT_2 = ("2", "b@example.com")
 NEAR = 600  # inside keepalive's default --ahead
+# Off macOS with this store's root: LINUX would move to the XDG root, which on a Windows
+# runner migrates the legacy directory out from under its open log file.
+OFF_MACOS = Platform.UNKNOWN
 
 
 @pytest.fixture(autouse=True)
@@ -338,10 +341,7 @@ class TestConfigConflictAtRuntime:
         assert run_cli(["list", "--json"], capsys)[0] == 0
 
     def test_off_macos_neither_setting_means_anything(self, conflict, capsys):
-        with (
-            patch("claude_swap.models.Platform.detect", return_value=Platform.LINUX),
-            patch("claude_swap.cli.paths.get_backup_root", return_value=conflict.root),
-        ):
+        with patch("claude_swap.models.Platform.detect", return_value=OFF_MACOS):
             assert run_cli(["config", "path"], capsys)[0] == 0
             assert ClaudeAccountSwitcher()._store._file_store() is False
 
@@ -445,10 +445,7 @@ class TestInvalidPolicy:
 
     def test_off_macos_a_bad_value_is_inert(self, env, capsys):
         self._break(env, json.dumps({"credentials": {"store": "fil"}}))
-        with (
-            patch("claude_swap.models.Platform.detect", return_value=Platform.LINUX),
-            patch("claude_swap.cli.paths.get_backup_root", return_value=env.root),
-        ):
+        with patch("claude_swap.models.Platform.detect", return_value=OFF_MACOS):
             assert ClaudeAccountSwitcher()._store._file_store() is False
             cli._refuse_config_conflict(["list"])
 
@@ -463,7 +460,8 @@ class TestHealthy:
         assert healthy.endpoint.posts[0]["refresh_token"] == "RT-1"
         assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-NEW"
         assert oauth.extract_oauth_data(healthy.read_enc(SLOT_1))["refreshToken"] == "RT-NEW"
-        assert stat.S_IMODE(healthy.file.stat().st_mode) == 0o600
+        if os.name == "posix":
+            assert stat.S_IMODE(healthy.file.stat().st_mode) == 0o600
         assert healthy.security.items == {}
         assert healthy.security.non_guard_calls() == []
 
@@ -956,7 +954,8 @@ class TestMigrateStore:
         report = self._run(split, "keychain")
         assert report["ok"] is True
         assert split.file.read_text() == split.keychain_login
-        assert stat.S_IMODE(split.file.stat().st_mode) == 0o600
+        if os.name == "posix":
+            assert stat.S_IMODE(split.file.stat().st_mode) == 0o600
         assert ACTIVE_ITEM not in split.security.items
         assert split.stored_setting() == "file"
         # Both logins survive: the file it replaced may have been the live one.
@@ -1001,8 +1000,8 @@ class TestMigrateStore:
         # Slot items stay; file mode never reads them.
         assert split.security.items[("claude-swap", "account-1-a@example.com")] == split.slot_1_item
         assert split.security.items[("claude-swap", "account-2-b@example.com")] == split.slot_2_item
-        mode = stat.S_IMODE(split.enc_path(SLOT_2).stat().st_mode)
-        assert mode == 0o600
+        if os.name == "posix":
+            assert stat.S_IMODE(split.enc_path(SLOT_2).stat().st_mode) == 0o600
 
     def test_no_lineage_and_no_stash(self, split):
         self._run(split, "file")

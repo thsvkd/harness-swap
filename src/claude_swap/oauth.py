@@ -238,9 +238,9 @@ def try_refresh_oauth_credentials(
     if ledger_identity is not None:
         try:
             if outcome.fate == GRANT_SPENT:
-                consumed_grants.record(
-                    fingerprint, ledger_identity, consumed_grants.CONSUMED,
-                    successor=credential_fingerprint(outcome.credentials),
+                consumed_grants.record_lineage(
+                    fingerprint, credential_fingerprint(outcome.credentials),
+                    ledger_identity, consumed_grants.OBSERVED_POST,
                 )
             elif outcome.fate == GRANT_UNCHANGED:
                 consumed_grants.release(fingerprint)

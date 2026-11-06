@@ -87,8 +87,7 @@ _UNLINKED_STORES = (
     "The Keychain and the credentials file hold different logins and no record links "
     "them; nothing was changed. Run hswap claude keepalive --adopt file|keychain, "
     "naming the store whose writer refreshed last. If you cannot tell, log in again "
-    "with /login and run hswap claude add, removing the credentials file first if "
-    "that login left it behind."
+    "with /login and adopt the store that login wrote."
 )
 _ADOPT_NEEDS_KEYCHAIN = "--adopt needs the macOS Keychain and a real run; nothing was changed."
 _LEDGER_UNREADABLE = "consumed-grant ledger unreadable"
@@ -525,17 +524,14 @@ def _adopt(active, report, choice: str) -> str:
     fingerprint = oauth.credential_fingerprint(chosen)
     identity = active.identity or ("", "")
     # Decided before anything below adds to what the stash knows.
-    new_login = switcher.is_provably_new_login(chosen, active.slot, identity[0])
+    new_login = switcher.is_provably_new_login(
+        chosen, active.slot, identity[0], stores_must_agree=False
+    )
     for stale in (keychain, file_creds):
         if not holds_no_login(stale) and oauth.credential_fingerprint(stale) != fingerprint:
-            verdict = _belongs(active, stale, backup, probe=True)
-            _stash_loser(active, stale, verdict)
-            # The tie-break settles the two stores. Another account's copy says nothing.
-            if verdict is not False:
-                consumed_grants.record(
-                    oauth.credential_fingerprint(stale), identity, consumed_grants.CONSUMED,
-                    successor=fingerprint,
-                )
+            # In this login's stores, so this login's unless proven another's: a copy with
+            # no identity would be invisible to the check before the next refresh.
+            _stash_loser(active, stale, _belongs(active, stale, backup, probe=True) is not False)
     # Kept before the writes below replace them. They stay rivals unless this login is new.
     held = switcher._stored_copies(active.slot, identity[0]) if active.slot else []
     for stale in held:

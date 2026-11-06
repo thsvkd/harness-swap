@@ -286,7 +286,8 @@ class TestRefresh:
         assert env.post.posts == []
         assert snapshot(env.home, env.keychain) == before
 
-    def test_a_slot_on_another_lineage_follows_while_nothing_is_due(self, env):
+    def test_a_slot_on_another_lineage_follows_but_stays_a_rival(self, env):
+        """Rule L: the sync keeps its copy and records nothing about it."""
         env.active(creds("sk-live", "rt-live", expires_in_s=7200))
         old = creds("sk-old", "rt-old", expires_in_s=-100)
         env.store._write_account_credentials(*SLOT, old)
@@ -294,9 +295,10 @@ class TestRefresh:
         assert access_token(env.backup()) == "sk-live"
         rows = env.store._store._list_unclaimed_credentials()
         assert [env.store._store._read_unclaimed_credential(i)[0] for i in rows] == [old]
+        assert consumed_grants.entry(oauth.credential_fingerprint(old)) is None
 
-        assert env.run(ahead=7300)["action"] == "refreshed"
-        assert [post["refresh_token"] for post in env.post.posts] == ["rt-live"]
+        assert env.run(ahead=7300)["error"]["type"] == "split_brain"
+        assert env.post.posts == []
 
     def test_token_answering_as_another_account_is_reported(self, env):
         near = creds("sk-live", "rt-live", expires_in_s=NEAR)
@@ -1123,7 +1125,7 @@ class TestStoresThatDifferWithNoRecordedLink:
         before = snapshot(env.home, env.keychain)
         report = env.run(ahead=9000)
         assert report["ok"] is False and report["error"]["type"] == "split_brain"
-        for needle in ("Keychain", "credentials file", "--adopt file|keychain", "/login", "hswap claude add"):
+        for needle in ("Keychain", "credentials file", "--adopt file|keychain", "/login"):
             assert needle in report["error"]["message"]
         assert snapshot(env.home, env.keychain) == before
         assert env.store._store._list_unclaimed_credentials() == {}
@@ -1808,7 +1810,6 @@ class TestEveryPostGoesThroughTheHelper:
         "_delete_account_files",
         "_write_unclaimed_credential",
         "_remove_unclaimed_credential",
-        "_keep_slot_copy_before_overwrite",
         "supersede_stashed_copies",
         "_bootstrap",
     })
@@ -1896,6 +1897,68 @@ class TestEveryPostGoesThroughTheHelper:
             "_move_command",
             "_run_command",
         } <= gated
+
+    def test_rule_l_only_two_things_write_lineage(self):
+        """Our own POST that returned the successor, and a provably new login."""
+        assert self._functions_calling("record_lineage") == {
+            ("oauth.py", "try_refresh_oauth_credentials"),
+            ("switcher.py", "supersede_stashed_copies"),
+        }
+        assert self._functions_calling("supersede_stashed_copies") == {
+            ("switcher.py", "_add_may_take_login"),
+            ("keepalive.py", "_adopt"),
+        }
+        assert self._functions_calling("_stash_observed_successor") == {
+            ("switcher.py", "stash_consumed_successor"),
+            ("switcher.py", "stash_successor"),
+            ("switcher.py", "_consume_backup_grant_locked"),
+        }
+        assert self._functions_calling("stash_consumed_successor") == {
+            ("keepalive.py", "_refresh"),
+            ("switcher.py", "_fetch_active_usage"),
+        }
+
+    def test_rule_l_nothing_writes_the_ledger_or_a_link_directly(self):
+        root = Path(claude_swap.__file__).parent
+        direct, reservers, writers = [], set(), {"consumedFp": set(), "successorFp": set()}
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(fn):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "record"
+                        and getattr(node.func.value, "id", "") == "consumed_grants"
+                    ):
+                        direct.append((path.name, fn.name))
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "reserve"
+                        and getattr(node.func.value, "id", "") == "consumed_grants"
+                    ):
+                        reservers.add((path.name, fn.name))
+                    if isinstance(node, ast.Dict):
+                        for key in node.keys:
+                            if getattr(key, "value", None) in writers:
+                                writers[key.value].add(fn.name)
+                    if (
+                        isinstance(node, ast.Subscript)
+                        and isinstance(node.ctx, ast.Store)
+                        and getattr(node.slice, "value", None) in writers
+                    ):
+                        writers[node.slice.value].add(fn.name)
+        assert direct == []
+        # Keepalive's `_sync` runs only where there is no Keychain and no rule L.
+        assert reservers == {
+            ("oauth.py", "try_refresh_oauth_credentials"),
+            ("keepalive.py", "_sync"),
+        }
+        assert writers["consumedFp"] == {"_stash_observed_successor"}
+        assert writers["successorFp"] == {"_row"}
 
     def test_the_unreserved_oauth_paths_have_no_production_caller(self):
         assert self._functions_calling("refresh_oauth_credentials") == set()
@@ -2498,9 +2561,10 @@ class TestAdoptionFollowsTheChain:
         block_real_keychain.data[ACTIVE_ITEM] = a
         (temp_home / ".claude" / ".credentials.json").write_text(a, encoding="utf-8")
         s._write_account_credentials(*SLOT, a)
-        for spent in (a, b):
+        for spent, next_one in ((a, b), (b, c)):
             consumed_grants.record(
-                oauth.credential_fingerprint(spent), IDENTITY["1"], consumed_grants.CONSUMED
+                oauth.credential_fingerprint(spent), IDENTITY["1"], consumed_grants.CONSUMED,
+                successor=oauth.credential_fingerprint(next_one),
             )
         self._link(s, b, a)
         self._link(s, c, b)
@@ -2714,12 +2778,13 @@ class TestAdoptKeepsEveryLoserWithItsIdentity:
         row = next(iter(s._store._list_unclaimed_credentials().values()))
         assert (row["email"], row["organizationUuid"]) == ("a@example.com", "")
 
-    def test_an_unattributed_loser_claims_no_identity(self, env):
+    def test_a_store_copy_nothing_attributes_counts_as_this_logins(self, env):
+        """With no identity it would be invisible to the check before the next refresh."""
         env.active(creds("AT-1", "RT-1", expires_in_s=7200))
         env.file.write_text(creds("AT-0", "RT-0", expires_in_s=7000), encoding="utf-8")
         env.run(adopt="keychain")
         row = next(iter(env.store._store._list_unclaimed_credentials().values()))
-        assert (row["email"], row["organizationUuid"]) == ("", "")
+        assert (row["email"], row["organizationUuid"]) == IDENTITY["1"]
 
 
 class TestAnotherAccountsSpentTokenSaysNothing:
@@ -2792,9 +2857,9 @@ class TestEvidenceOnlyDecisionTable:
         row = next(iter(store._store._list_unclaimed_credentials().values()))
         assert (row["email"], row["organizationUuid"]) == IDENTITY["1"]
 
-        report = run_keepalive(new_process(), ahead=7300)
-        assert report["ok"] is True and report["action"] == "refreshed"
-        assert rotating.posts == ["RT-B"]
+        # The slot's copy stays unexplained, so neither token goes.
+        assert run_keepalive(new_process(), ahead=7300)["error"]["type"] == "split_brain"
+        assert rotating.posts == []
 
     def test_round_10_finding_1_when_due_at_once_nothing_goes_until_someone_chooses(
         self, store, temp_home, block_real_keychain, rotating
@@ -2936,30 +3001,48 @@ class TestEvidenceOnlyDecisionTable:
         assert run_keepalive(new_process())["error"]["type"] == "split_brain"
         assert block_real_keychain.data[ACTIVE_ITEM] == x
 
-    def test_a_write_that_fails_after_adopting_from_the_stash_never_replays_the_predecessor(
-        self, store, temp_home, block_real_keychain, rotating, monkeypatch
-    ):
-        """The adoption retires the stash row, so the ledger must carry the link: with
-        neither, the next run would read the stores as agreeing on an unspent token."""
+    def _adopt_then_keychain_fails(self, store, temp_home, keychain, monkeypatch, *, on_ledger):
         x = creds("AT-X", "RT-X", expires_in_s=NEAR)
         y = creds("AT-Y", "RT-Y", expires_in_s=7200)
         x_fp = oauth.credential_fingerprint(x)
         store._write_account_credentials(*SLOT, x)
+        if on_ledger:
+            consumed_grants.record(
+                x_fp, IDENTITY["1"], consumed_grants.CONSUMED,
+                successor=oauth.credential_fingerprint(y),
+            )
         store.stash_consumed_successor("1", IDENTITY["1"], y, x_fp, "keepalive-live-write-failed")
-        block_real_keychain.data[ACTIVE_ITEM] = x
-        monkeypatch.setattr(
-            macos_keychain, "set_password", _active_item_write_fails(block_real_keychain)
-        )
+        keychain.data[ACTIVE_ITEM] = x
+        monkeypatch.setattr(macos_keychain, "set_password", _active_item_write_fails(keychain))
         assert run_keepalive(new_process())["ok"] is False
-        assert block_real_keychain.data[ACTIVE_ITEM] == x
+        assert keychain.data[ACTIVE_ITEM] == x
         assert store._read_account_credentials(*SLOT) == y
+        monkeypatch.setattr(macos_keychain, "set_password", keychain.set_password)
+        return x, y
 
-        monkeypatch.setattr(macos_keychain, "set_password", block_real_keychain.set_password)
-        report = run_keepalive(new_process())
-        assert report["ok"] is True
+    def test_a_write_that_fails_after_adopting_is_finished_from_the_posts_own_record(
+        self, store, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        _, y = self._adopt_then_keychain_fails(
+            store, temp_home, block_real_keychain, monkeypatch, on_ledger=True
+        )
+        assert run_keepalive(new_process())["ok"] is True
         assert block_real_keychain.data[ACTIVE_ITEM] == y
-        assert store._read_account_credentials(*SLOT) == y
         assert rotating.posts == []
+
+    def test_with_no_such_record_it_stops_rather_than_replay_the_predecessor(
+        self, store, temp_home, block_real_keychain, rotating, monkeypatch
+    ):
+        """Moving the stash row's link to the ledger would be a third writer of lineage.
+        The successor stays in the slot, where rule U sees it."""
+        x, y = self._adopt_then_keychain_fails(
+            store, temp_home, block_real_keychain, monkeypatch, on_ledger=False
+        )
+        assert consumed_grants.entry(oauth.credential_fingerprint(x)) is None
+        report = run_keepalive(new_process(), ahead=40000)
+        assert report["error"]["type"] == "split_brain"
+        assert rotating.posts == []
+        assert store._read_account_credentials(*SLOT) == y
 
     def test_a_link_followed_past_the_other_store_reaches_the_terminal(
         self, store, temp_home, block_real_keychain, rotating
@@ -3090,18 +3173,34 @@ class TestAdopt:
         run_keepalive(new_process())
         assert rotating.posts == ["RT-B"]
 
-    def test_a_slot_on_a_third_token_stays_a_rival_until_a_real_login(
+    def test_a_token_new_here_clears_a_slot_on_a_third_token(
         self, store, temp_home, block_real_keychain, rotating
     ):
-        a, b, file_path = self._split(store, temp_home, block_real_keychain)
+        a, b, _ = self._split(store, temp_home, block_real_keychain)
         slot_copy = store._read_account_credentials(*SLOT)
         report = run_keepalive(new_process(), adopt="file")
         assert report["ok"] is True and report["action"] == "adopted"
         assert store._read_account_credentials(*SLOT) == b
         rows = store._store._list_unclaimed_credentials()
         assert sorted(store._store._read_unclaimed_credential(i)[0] for i in rows) == sorted([a, slot_copy])
+        assert run_keepalive(new_process(), ahead=7100)["action"] == "refreshed"
+        assert rotating.posts == ["RT-B"]
 
-        assert run_keepalive(new_process(), ahead=7100)["error"]["type"] == "split_brain"
+    def test_a_known_token_stays_blocked_until_a_real_login(
+        self, store, temp_home, block_real_keychain, rotating
+    ):
+        """The Keychain's token is the slot's, so nothing shows the file's is behind it."""
+        a = creds("AT-A", "RT-A", expires_in_s=20000)
+        b = creds("AT-B", "RT-B", expires_in_s=7000)
+        store._write_account_credentials(*SLOT, a)
+        block_real_keychain.data[ACTIVE_ITEM] = a
+        file_path = temp_home / ".claude" / ".credentials.json"
+        file_path.write_text(b, encoding="utf-8")
+
+        assert run_keepalive(new_process(), adopt="keychain")["action"] == "adopted"
+        assert file_path.read_text(encoding="utf-8") == a
+        assert consumed_grants.entry(oauth.credential_fingerprint(b)) is None
+        assert run_keepalive(new_process(), ahead=40000)["error"]["type"] == "split_brain"
         assert rotating.posts == []
 
         fresh = creds("AT-N", "RT-N", expires_in_s=NEAR)

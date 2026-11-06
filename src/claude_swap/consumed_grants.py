@@ -34,6 +34,8 @@ CONSUMED_RETENTION_S = 400 * 24 * 3600
 MAX_BYTES = 8 * 1024 * 1024
 RESERVED = "reserved"
 CONSUMED = "consumed"
+OBSERVED_POST = "observed-post"
+NEW_LOGIN = "new-login"
 
 
 class LedgerUnreadable(ClaudeSwitchError):
@@ -155,6 +157,18 @@ def record(
         rows[fingerprint] = _row(identity, state, successor)
 
     _rewrite(mutate)
+
+
+def record_lineage(
+    predecessor: str, successor: str | None, identity: tuple[str, str], because: str
+) -> None:
+    """Rule L, the one writer of "this token is spent, and that one came from it":
+    our own POST of it (``OBSERVED_POST``), or a provably new login (``NEW_LOGIN``).
+    Nothing else may record it: a slot sync or a cleanup that invents this record lets
+    a spent token through the next refresh. Raises :class:`LedgerUnreadable`."""
+    if because not in (OBSERVED_POST, NEW_LOGIN):
+        raise ValueError(f"not a source of lineage: {because}")
+    record(predecessor, identity, CONSUMED, successor)
 
 
 def release(fingerprint: str) -> None:

@@ -10,11 +10,7 @@ import re
 import sys
 
 from claude_swap import __version__, macos_keychain, paths, printer
-from claude_swap.exceptions import (
-    ClaudeSwitchError,
-    ConfigConflictError,
-    RequiredModeUnsupportedError,
-)
+from claude_swap.exceptions import ClaudeSwitchError, RequiredModeUnsupportedError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import (
     ACCOUNT_PRIORITY_MAX,
@@ -36,8 +32,8 @@ from claude_swap.settings import (
     load_run_settings,
     load_ui_settings,
     load_update_settings,
+    credential_policy_error,
     credentials_store,
-    store_conflict,
     strict_mode,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -294,10 +290,11 @@ def _refuse_config_conflict(argv: list[str]) -> None:
         argv[:1] == ["config"]
         or {"-h", "--help", "--version"} & set(argv)
         or Platform.detect() != Platform.MACOS
-        or not store_conflict(paths.get_backup_root())
     ):
         return
-    conflict = ConfigConflictError()
+    conflict = credential_policy_error(paths.get_backup_root())
+    if conflict is None:
+        return
     if "--json" in argv:
         print(json.dumps(error_envelope(conflict)))
     else:
@@ -1111,6 +1108,11 @@ def _migrate_store_command(argv: list[str]) -> None:
             "good, also run: config unset credentials.store",
         )
     report = run_migrate_store(switcher, args.keep, dry_run=args.dry_run)
+    if report["storesDiffer"] and not args.json:
+        warning(
+            f"WARNING: {report['warning']} (file {report['fileFingerprint']}, "
+            f"keychain {report['keychainFingerprint']})"
+        )
     if args.dry_run:
         finish(report, "\n".join(report.get("plan", [])))
     finish(report, f"Migrated: the {args.keep} login is kept and credentials.store is file.")

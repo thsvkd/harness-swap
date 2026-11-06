@@ -120,11 +120,20 @@ class ConfigError(ClaudeSwitchError):
 
 
 class ConfigConflictError(ConfigError):
-    """credentials.store=file and credentials.requireKeychain cannot both be on."""
+    """credentials.store=file and credentials.requireKeychain cannot both be on, or the
+    credential policy cannot be read at all, so nothing can say which rules apply."""
 
     json_type = "config_conflict"
 
-    def __init__(self):
+    def __init__(self, *, invalid: bool = False):
+        if invalid:
+            super().__init__(
+                "config_conflict: invalid credentials.store value, or settings.json, "
+                "credentials.requireKeychain or HSWAP_CREDENTIALS_STORE cannot be understood. "
+                "Nothing was changed. Fix the file with hswap claude config or by hand, or fix "
+                "the variable."
+            )
+            return
         super().__init__(
             "config_conflict: credentials.store=file and credentials.requireKeychain (or "
             "HSWAP_CREDENTIALS_STORE and HSWAP_REQUIRE_KEYCHAIN) cannot both be on. Nothing "

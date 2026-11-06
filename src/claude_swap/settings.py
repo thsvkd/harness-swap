@@ -384,9 +384,25 @@ def strict_mode(backup_root: Path) -> bool:
     return require_keychain(backup_root) or credentials_store(backup_root) == "file"
 
 
-def store_conflict(backup_root: Path) -> bool:
-    """One mode forbids the file and the other forbids the Keychain."""
-    return require_keychain(backup_root) and credentials_store(backup_root) == "file"
+def credential_policy_error(backup_root: Path) -> ConfigConflictError | None:
+    """Why no command may run, if any. The lenient loaders above read a bad value as `auto`,
+    which here would drop every protection, so `auto` means only an absent key. One mode
+    forbids the file and the other the Keychain, so both on is refused too."""
+    if os.environ.get("HSWAP_CREDENTIALS_STORE") not in (None, "", "auto", "file"):
+        return ConfigConflictError(invalid=True)
+    try:
+        section = _read_raw_for_write(settings_path(backup_root)).get("credentials", {})
+    except ConfigError:
+        return ConfigConflictError(invalid=True)
+    if (
+        not isinstance(section, dict)
+        or section.get("store", "auto") not in SETTING_SPECS["credentials.store"].choices
+        or not isinstance(section.get("requireKeychain", False), bool)
+    ):
+        return ConfigConflictError(invalid=True)
+    if require_keychain(backup_root) and credentials_store(backup_root) == "file":
+        return ConfigConflictError()
+    return None
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:

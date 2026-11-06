@@ -236,12 +236,6 @@ class TestConfig:
         assert (code, out.strip()) == (0, "file")
         assert run_cli(["config", "set", "credentials.store", "elsewhere"], capsys)[0] == 1
 
-    def test_a_garbled_value_reads_as_auto(self, temp_home):
-        root = temp_home / "root"
-        root.mkdir()
-        (root / "settings.json").write_text(json.dumps({"credentials": {"store": "fil"}}))
-        assert credentials_store(root) == "auto"
-
     def test_require_keychain_still_loads_alongside(self, temp_home):
         root = temp_home / "root"
         set_setting(root, "credentials.requireKeychain", "true")
@@ -350,6 +344,113 @@ class TestConfigConflictAtRuntime:
         ):
             assert run_cli(["config", "path"], capsys)[0] == 0
             assert ClaudeAccountSwitcher()._store._file_store() is False
+
+
+BAD_SETTINGS = {
+    "store-typo": json.dumps({"credentials": {"store": "fil"}}),
+    "store-null": json.dumps({"credentials": {"store": None}}),
+    "store-number": json.dumps({"credentials": {"store": 1}}),
+    "require-not-bool": json.dumps({"credentials": {"requireKeychain": "yes"}}),
+    "section-not-object": json.dumps({"credentials": "file"}),
+    "not-an-object": "[]",
+    "corrupt": "{not json",
+    "not-utf8": b"\xff\xfe{}",
+}
+POLICY_COMMANDS = [
+    ["list", "--json"],
+    ["switch", "2", "--json"],
+    ["auto", "--once", "--json"],
+    ["keepalive", "--json"],
+    ["keychain-selftest", "--json"],
+    ["migrate-store", "--to", "file", "--keep", "file", "--json"],
+]
+
+
+class TestInvalidPolicy:
+    def _break(self, env, content):
+        env.write_file(creds())
+        path = env.root / "settings.json"
+        path.write_bytes(content if isinstance(content, bytes) else content.encode())
+        env.security.calls.clear()
+
+    def _assert_refused(self, env, capsys, argv):
+        before = env.snapshot()
+        code, out, _ = run_cli(argv, capsys)
+        assert code == 1
+        error = json.loads(out)["error"]
+        assert error["type"] == "config_conflict"
+        assert "invalid credentials.store value" in error["message"]
+        assert env.snapshot() == before
+        assert env.security.calls == [] and env.endpoint.posts == []
+
+    @pytest.mark.parametrize("content", BAD_SETTINGS.values(), ids=BAD_SETTINGS.keys())
+    @pytest.mark.parametrize("argv", POLICY_COMMANDS, ids=lambda argv: argv[0])
+    def test_a_bad_settings_file_refuses_before_any_side_effect(self, env, capsys, content, argv):
+        self._break(env, content)
+        self._assert_refused(env, capsys, argv)
+
+    @pytest.mark.parametrize("value", ["File", "keychain", " file", "0"])
+    @pytest.mark.parametrize("argv", POLICY_COMMANDS, ids=lambda argv: argv[0])
+    def test_a_bad_variable_refuses(self, env, capsys, monkeypatch, value, argv):
+        env.write_file(creds())
+        env.security.calls.clear()
+        monkeypatch.setenv("HSWAP_CREDENTIALS_STORE", value)
+        self._assert_refused(env, capsys, argv)
+
+    def test_an_empty_variable_counts_as_unset(self, env, capsys, monkeypatch):
+        monkeypatch.setenv("HSWAP_CREDENTIALS_STORE", "")
+        assert run_cli(["list", "--json"], capsys)[0] == 0
+
+    @pytest.mark.parametrize("content", ["{}", json.dumps({"credentials": {}})], ids=["no-section", "no-key"])
+    def test_auto_is_the_default_only_when_the_key_is_absent(self, env, capsys, content):
+        self._break(env, content)
+        assert run_cli(["list", "--json"], capsys)[0] == 0
+
+    def test_no_settings_file_is_auto(self, env, capsys):
+        assert not (env.root / "settings.json").exists()
+        assert run_cli(["list", "--json"], capsys)[0] == 0
+
+    def test_the_switcher_refuses_too(self, env):
+        self._break(env, "{not json")
+        with pytest.raises(ConfigConflictError, match="invalid credentials.store value"):
+            ClaudeAccountSwitcher()
+
+    def test_help_version_and_config_still_run(self, env, capsys):
+        self._break(env, json.dumps({"credentials": {"store": "fil"}}))
+        assert run_cli(["--version"], capsys)[0] == 0
+        assert run_cli(["--help"], capsys)[0] == 0
+        assert run_cli(["list", "--help"], capsys)[0] == 0
+        assert run_cli(["config", "path"], capsys)[0] == 0
+        assert run_cli(["list", "--json"], capsys)[0] == 1
+        assert run_cli(["config", "set", "credentials.store", "file"], capsys)[0] == 0
+        assert run_cli(["list", "--json"], capsys)[0] == 0
+
+    def test_a_corrupt_file_can_be_repaired_by_hand(self, env, capsys):
+        self._break(env, "{not json")
+        assert run_cli(["config", "path"], capsys)[0] == 0
+        assert run_cli(["config", "set", "credentials.store", "file"], capsys)[0] == 1
+        (env.root / "settings.json").unlink()
+        assert run_cli(["list", "--json"], capsys)[0] == 0
+
+    def test_a_running_loop_stops_when_the_file_goes_bad(self, healthy):
+        s = ClaudeAccountSwitcher()
+        events = []
+        engine = AutoSwitchEngine(s, AutoSwitchSettings(), events.append)
+        (healthy.root / "settings.json").write_text("{not json")
+        before = healthy.credential_files()
+        assert engine.tick() is TickOutcome.ERROR
+        assert "invalid credentials.store value" in events[-1].message
+        assert s.post_refresh(("b@example.com", ""), creds()).error == "transient"
+        assert healthy.endpoint.posts == [] and healthy.credential_files() == before
+
+    def test_off_macos_a_bad_value_is_inert(self, env, capsys):
+        self._break(env, json.dumps({"credentials": {"store": "fil"}}))
+        with (
+            patch("claude_swap.models.Platform.detect", return_value=Platform.LINUX),
+            patch("claude_swap.cli.paths.get_backup_root", return_value=env.root),
+        ):
+            assert ClaudeAccountSwitcher()._store._file_store() is False
+            cli._refuse_config_conflict(["list"])
 
 
 class TestHealthy:
@@ -1113,7 +1214,7 @@ class TestMigrateStore:
         assert code == 0
         report = json.loads(out)
         assert report["ok"] is True
-        restored = report["backups"][0]
+        restored = report["backups"][-1]  # the Keychain item's, now the file's token too
         code, restore_out, restore_err = run_cli(
             ["migrate-store", "--restore-keychain", restored, "--json"], capsys
         )
@@ -1140,6 +1241,43 @@ class TestMigrateStore:
         assert code == 0 and "credentials.store=file" in out
         assert split.stored_setting() is None
 
+    @pytest.mark.parametrize("flags", [["--dry-run"], []], ids=["dry-run", "real"])
+    def test_differing_stores_are_reported_with_both_fingerprints(self, split, capsys, flags):
+        code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file", *flags, "--json"], capsys)
+        assert code == 0
+        report = json.loads(out)
+        assert report["storesDiffer"] is True
+        assert report["warning"] == (
+            "file and keychain hold different logins; the one you do not keep is backed up but "
+            "may be the newer one — if the kept one is spent, Claude will need /login."
+        )
+        assert report["fileFingerprint"] and report["keychainFingerprint"]
+        assert report["fileFingerprint"] != report["keychainFingerprint"]
+
+    def test_the_text_output_shows_the_warning_and_fingerprints(self, split, capsys):
+        code, out, err = run_cli(["migrate-store", "--to", "file", "--keep", "keychain", "--dry-run"], capsys)
+        report = run_migrate_store(ClaudeAccountSwitcher(), "keychain", dry_run=True)
+        assert code == 0
+        assert "WARNING: file and keychain hold different logins" in out + err
+        assert report["fileFingerprint"] in out + err and report["keychainFingerprint"] in out + err
+
+    def test_a_refusal_still_shows_the_warning(self, split, capsys):
+        ClaudeAccountSwitcher()
+        consumed_grants.reserve(oauth.credential_fingerprint(split.file_login), ("a@example.com", ""))
+        code, out, err = run_cli(["migrate-store", "--to", "file", "--keep", "file"], capsys)
+        assert code == 1 and "WARNING: file and keychain" in out + err
+
+    @pytest.mark.parametrize("same", [True, False], ids=["same-login", "only-file"])
+    def test_no_warning_unless_two_tokens_differ(self, split, capsys, same):
+        if same:
+            split.security.items[ACTIVE_ITEM] = creds("AT-F2", "RT-F")
+        else:
+            del split.security.items[ACTIVE_ITEM]
+        code, out, err = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--dry-run"], capsys)
+        assert code == 0 and "WARNING" not in out + err
+        report = run_migrate_store(ClaudeAccountSwitcher(), "file", dry_run=True)
+        assert report["storesDiffer"] is False and report["warning"] is None
+
     def test_cli_needs_to_and_keep(self, env, capsys):
         assert run_cli(["migrate-store", "--keep", "file"], capsys)[0] == 2
         assert run_cli(["migrate-store", "--to", "file"], capsys)[0] == 2
@@ -1153,10 +1291,14 @@ class TestMigrateStore:
         assert code == 1 and json_error_type(out) == "unsupported"
 
 
+def backup_of(env, login):
+    return next(name for name, value in backups(env).items() if value == login)
+
+
 class TestRestoreKeychain:
     def test_round_trip(self, split):
-        report = run_migrate_store(ClaudeAccountSwitcher(), "file")
-        name = next(iter(backups(split)))
+        report = run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
         restored = run_restore_keychain(ClaudeAccountSwitcher(), name)
         assert restored["ok"] is True and restored["restored"] == name
         assert split.security.items[ACTIVE_ITEM] == split.keychain_login
@@ -1164,15 +1306,15 @@ class TestRestoreKeychain:
         assert report["keychainFingerprint"] == restored["fingerprint"]
 
     def test_the_item_is_written_through_stdin_only(self, split):
-        run_migrate_store(ClaudeAccountSwitcher(), "file")
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
         split.security.calls.clear()
-        run_restore_keychain(ClaudeAccountSwitcher(), next(iter(backups(split))))
+        run_restore_keychain(ClaudeAccountSwitcher(), backup_of(split, split.keychain_login))
         assert ["-i"] in split.security.calls
         assert not any("RT-K" in " ".join(call) for call in split.security.calls)
 
     def test_an_item_already_there_is_kept_first(self, split):
-        run_migrate_store(ClaudeAccountSwitcher(), "file")
-        name = next(iter(backups(split)))
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
         newer = creds("AT-N", "RT-N")
         split.security.items[ACTIVE_ITEM] = newer
         restored = run_restore_keychain(ClaudeAccountSwitcher(), name)
@@ -1180,13 +1322,13 @@ class TestRestoreKeychain:
         assert split.security.items[("claude-swap", restored["backups"][0])] == newer
 
     def test_a_restored_item_trips_the_guard_until_the_setting_is_off(self, split):
-        run_migrate_store(ClaudeAccountSwitcher(), "file")
-        run_restore_keychain(ClaudeAccountSwitcher(), next(iter(backups(split))))
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        run_restore_keychain(ClaudeAccountSwitcher(), backup_of(split, split.keychain_login))
         assert split.keepalive()["error"]["type"] == "keychain_item_present"
 
     def test_a_spent_backup_refuses(self, split):
-        run_migrate_store(ClaudeAccountSwitcher(), "file")
-        name = next(iter(backups(split)))
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
         consumed_grants.reserve(
             oauth.credential_fingerprint(split.keychain_login), ("a@example.com", "")
         )
@@ -1196,7 +1338,7 @@ class TestRestoreKeychain:
 
     def test_another_accounts_backup_refuses(self, split):
         run_migrate_store(ClaudeAccountSwitcher(), "file")
-        name = next(iter(backups(split)))
+        name = backup_of(split, split.keychain_login)
         split.write_enc(SLOT_2, split.keychain_login)
         report = run_restore_keychain(ClaudeAccountSwitcher(), name)
         assert report["error"]["type"] == "unmanaged"
@@ -1226,12 +1368,103 @@ class TestRestoreKeychain:
         assert split.security.items[ACTIVE_ITEM] == split.keychain_login
 
     def test_a_failed_read_back_reports_it(self, split):
-        run_migrate_store(ClaudeAccountSwitcher(), "file")
-        name = next(iter(backups(split)))
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
         split.security.mangle = lambda value: value[:-1]
         report = run_restore_keychain(ClaudeAccountSwitcher(), name)
         assert report["ok"] is False
         assert split.security.items[("claude-swap", name)] == split.keychain_login
+
+    def test_identical_token_with_other_fields_changed_is_allowed(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        split.write_file(creds("AT-LATER", "RT-K"))
+        assert run_restore_keychain(
+            ClaudeAccountSwitcher(), backup_of(split, split.keychain_login)
+        )["ok"] is True
+
+    def _assert_refused(self, env, name):
+        report = run_restore_keychain(ClaudeAccountSwitcher(), name)
+        assert report["ok"] is False and report["error"]["type"] == "relogin_required"
+        assert "spent predecessor" in report["error"]["message"]
+        assert "/login in the screen session" in report["error"]["message"]
+        assert ACTIVE_ITEM not in env.security.items
+
+    def test_a_file_rotated_since_the_backup_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        # Claude Code rotated the file, and the ledger never heard of it.
+        split.write_file(creds("AT-K2", "RT-K2"))
+        self._assert_refused(split, backup_of(split, split.keychain_login))
+
+    def test_the_login_that_lost_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "file")
+        self._assert_refused(split, backup_of(split, split.keychain_login))
+
+    def test_a_file_with_no_login_in_it_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        split.write_file(json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}))
+        self._assert_refused(split, backup_of(split, split.keychain_login))
+
+    def test_no_file_and_no_other_copy_is_allowed(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        split.file.unlink()
+        assert split.read_enc(SLOT_1) == split.keychain_login  # the same token is no rival
+        report = run_restore_keychain(ClaudeAccountSwitcher(), name)
+        assert report["ok"] is True
+        assert split.security.items[ACTIVE_ITEM] == split.keychain_login
+
+    def test_no_file_and_no_enc_at_all_is_allowed(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        split.file.unlink()
+        split.enc_path(SLOT_1).unlink()
+        assert run_restore_keychain(ClaudeAccountSwitcher(), name)["ok"] is True
+
+    def test_no_file_but_the_slot_enc_differs_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        split.file.unlink()
+        split.write_enc(SLOT_1, creds("AT-E", "RT-E"))
+        self._assert_refused(split, name)
+
+    def test_no_file_but_a_stash_copy_differs_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        split.file.unlink()
+        rival = creds("AT-R", "RT-R")
+        ClaudeAccountSwitcher()._store._write_unclaimed_credential(rival, {
+            "reason": "keepalive-split-brain", "configSlot": "1",
+            "email": "a@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(rival),
+        })
+        self._assert_refused(split, name)
+
+    def test_no_file_and_another_accounts_stash_copy_is_allowed(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        split.file.unlink()
+        other = creds("AT-O", "RT-O")
+        ClaudeAccountSwitcher()._store._write_unclaimed_credential(other, {
+            "reason": "keepalive-split-brain", "configSlot": "2",
+            "email": "b@example.com", "organizationUuid": "",
+            "fingerprint": oauth.credential_fingerprint(other),
+        })
+        assert run_restore_keychain(ClaudeAccountSwitcher(), name)["ok"] is True
+
+    def test_no_file_and_an_unreadable_manifest_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        split.file.unlink()
+        (split.root / "credentials" / ".unclaimed-manifest.json").write_text("{nope")
+        self._assert_refused(split, name)
+
+    def test_no_file_and_no_identity_refuses(self, split):
+        run_migrate_store(ClaudeAccountSwitcher(), "keychain")
+        name = backup_of(split, split.keychain_login)
+        split.file.unlink()
+        split.enc_path(SLOT_1).unlink()
+        (split.home / ".claude.json").unlink()
+        self._assert_refused(split, name)
 
 
 def test_module_is_free_of_machine_specific_values():

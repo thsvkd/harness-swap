@@ -25,7 +25,12 @@ from datetime import UTC, datetime
 from claude_swap import consumed_grants, macos_keychain, oauth
 from claude_swap.claude_locks import claude_credentials_lock
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, SECURITY_SERVICE
-from claude_swap.exceptions import ClaudeSwitchError, ConfigConflictError, LockError
+from claude_swap.exceptions import (
+    ClaudeSwitchError,
+    ConfigConflictError,
+    CopiesDisagreeError,
+    LockError,
+)
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.keepalive import (
     _LEDGER_UNREADABLE,
@@ -48,6 +53,14 @@ _NEEDS_KEYCHAIN = (
 _STEP_FAILED = (
     "A Keychain or file step failed ({}). Items are deleted only after every backup "
     "verified, and credentials.store is set only at the end; see the report for what ran."
+)
+_STORES_DIFFER_WARNING = (
+    "file and keychain hold different logins; the one you do not keep is backed up but may "
+    "be the newer one — if the kept one is spent, Claude will need /login."
+)
+_RESTORE_UNPROVEN = (
+    "The backup may be a spent predecessor of the current login, so it was not restored and "
+    "nothing was changed. Use /login in the screen session instead."
 )
 _UNSUPPORTED_STORE = (
     "CLAUDE_CONFIG_DIR or CLAUDE_SECURESTORAGE_CONFIG_DIR names a credential store "
@@ -141,6 +154,8 @@ def run_migrate_store(switcher, keep: str, *, dry_run: bool = False) -> dict:
         "backups": [],
         "slotsMigrated": [],
         "itemAbsent": False,
+        "storesDiffer": False,
+        "warning": None,
         "error": None,
     }
     if dry_run:
@@ -209,6 +224,14 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
     )
     report["fileFingerprint"] = _refresh_fingerprint(file_creds)
     report["keychainFingerprint"] = _refresh_fingerprint(keychain_creds)
+    # Before any refusal below, since the choice of --keep is what this warns about.
+    if (
+        report["fileFingerprint"]
+        and report["keychainFingerprint"]
+        and not _same_login(file_creds, keychain_creds)
+    ):
+        report["storesDiffer"] = True
+        report["warning"] = _STORES_DIFFER_WARNING
     kept = file_creds if keep == "file" else keychain_creds
     if not _oauth_payload(kept).get("refreshToken"):
         raise _Stop("no_credentials", f"The {keep} store holds no refresh token; nothing was changed.")
@@ -254,6 +277,26 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
     set_setting(switcher.backup_dir, "credentials.store", "file")
 
 
+def _restore_is_safe(switcher, active, value: str) -> bool:
+    """Claude Code rotates the file without telling the ledger, so a backup that differs
+    from it may be its spent predecessor. Only the same token, or no other copy, is safe."""
+    try:
+        file_creds = get_credentials_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        file_creds = ""
+    if file_creds.strip():
+        return _same_login(file_creds, value)
+    if not active.identity:
+        return False  # nothing names the account whose copies would have to agree
+    email, org_uuid = active.identity
+    enc = switcher._store._leftover_backup_enc(active.slot, email) if active.slot else ""
+    try:
+        stash = switcher._stash_fingerprints(email, org_uuid)
+    except CopiesDisagreeError:
+        return False
+    return stash <= {oauth.credential_fingerprint(value)} and (not enc or _same_login(enc, value))
+
+
 def run_restore_keychain(switcher, backup_account: str) -> dict:
     """The rollback: a backup goes back as the Claude Code item and stays where it is. An
     item already there is backed up first, since it may be a newer login. Backups stop at
@@ -284,6 +327,8 @@ def run_restore_keychain(switcher, backup_account: str) -> dict:
             active = _read_active(switcher)
             if _belongs(active, value, _read_slot(active), probe=True) is False:
                 raise _Stop("unmanaged", "That backup is another account's; nothing was changed.")
+            if not _restore_is_safe(switcher, active, value):
+                raise _Stop("relogin_required", _RESTORE_UNPROVEN)
             current = macos_keychain.get_password(CLAUDE_CODE_KEYCHAIN_SERVICE, account)
             if current and current != value:
                 _back_up(CREDENTIALS_BACKUP, current, report)

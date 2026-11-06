@@ -27,7 +27,6 @@ from claude_swap.exceptions import (
     CredentialWriteError,
     KeychainItemPresentError,
     KeychainUnavailableError,
-    ConfigConflictError,
     ConfigError,
     CredentialReadError,
     LockError,
@@ -114,11 +113,11 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import (
+    credential_policy_error,
     load_settings,
     parse_model_names,
     require_keychain,
     settings_path,
-    store_conflict,
 )
 from claude_swap.usage_store import (
     FetchRecord,
@@ -380,9 +379,11 @@ class ClaudeAccountSwitcher:
         self.home = Path.home()
         self.platform = Platform.detect()
         self.backup_dir = get_backup_root()
-        config_conflict = self.platform == Platform.MACOS and store_conflict(self.backup_dir)
-        if config_conflict and check_config:
-            raise ConfigConflictError()
+        policy_error = (
+            credential_policy_error(self.backup_dir) if self.platform == Platform.MACOS else None
+        )
+        if policy_error and check_config:
+            raise policy_error
 
         # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
         # before any logger or directory setup writes to the new location.
@@ -461,7 +462,7 @@ class ClaudeAccountSwitcher:
         # aborts construction. No-op on fresh installs / once recorded.
         from claude_swap.migrations import run_migrations
 
-        if not config_conflict and not self.keychain_gate_closed():
+        if not policy_error and not self.keychain_gate_closed():
             run_migrations(self)
 
     def _is_running_in_container(self) -> bool:
@@ -707,6 +708,8 @@ class ClaudeAccountSwitcher:
 
     def refuse_if_keychain_unavailable(self) -> None:
         """The first step of every command that can write a credential."""
+        if self.platform == Platform.MACOS and (error := credential_policy_error(self.backup_dir)):
+            raise error  # a long-running loop outlives the check at its start
         if self.keychain_gate_closed(fresh=True):
             raise KeychainUnavailableError(KEYCHAIN_UNAVAILABLE_MESSAGE)
         self.refuse_session_profiles()
@@ -764,6 +767,8 @@ class ClaudeAccountSwitcher:
 
         ``locks_held``: the caller holds Claude Code's credential locks.
         """
+        if self.platform == Platform.MACOS and credential_policy_error(self.backup_dir):
+            return oauth.RefreshOutcome(None, "transient")
         if self.keychain_gate_closed(fresh=True):
             return oauth.RefreshOutcome(None, "transient")
         if self._store._file_store() and macos_keychain.credential_item_present():
@@ -908,6 +913,12 @@ class ClaudeAccountSwitcher:
             for creds in copies
             if creds.strip() and not holds_no_login(creds)
         }
+        return found | self._stash_fingerprints(email, org_uuid)
+
+    def _stash_fingerprints(self, email: str, org_uuid: str) -> set[str]:
+        """Every stash entry of this account. Raises CopiesDisagreeError when one, or the
+        manifest, cannot be read."""
+        found: set[str] = set()
         manifest, verdict = self._store._read_stash_manifest_ex()
         if verdict != "ok":
             raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)

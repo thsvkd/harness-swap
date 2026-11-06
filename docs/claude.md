@@ -536,9 +536,13 @@ Restart every running Claude Code afterwards: one that saw the Keychain item bef
 
 This step records no lineage, and it puts no Keychain copy in the stash as a rival. You are the tie-break and the kept login is canonical, as with `keepalive --adopt`. What lost is safe in the backups, where rule U does not look. A stash entry for the account that was already there is not touched and stays a rival, so if `keepalive` reports `split_brain` afterwards, run `/login` and `hswap claude add`.
 
-`--json` prints `ok`, `kept`, `fileFingerprint` and `keychainFingerprint` (the first 6 hex digits of each refresh token's SHA-256), `backups` (the backup account names), `slotsMigrated`, `itemAbsent` and `error`. It never prints a token.
+`--json` prints `ok`, `kept`, `fileFingerprint` and `keychainFingerprint` (the first 6 hex digits of each refresh token's SHA-256), `backups` (the backup account names), `slotsMigrated`, `itemAbsent`, `storesDiffer`, `warning` and `error`. It never prints a token.
+
+When the file and the Keychain hold different refresh tokens, `--dry-run` and the real run both set `storesDiffer` and print a warning with both fingerprints, because the login you do not keep is backed up but may be the newer one. If the kept one is spent, Claude will need `/login`. Compare the fingerprints and read the warning before you choose `--keep`.
 
 **What file mode does.** The active login is the file alone, slot backups are `.enc` files alone, and hswap does not read, write or delete a Keychain credential item or call `security` for one, with two exceptions: the guard below and `migrate-store`. Set it by hand with `hswap claude config set credentials.store file`, or force it with `HSWAP_CREDENTIALS_STORE=file`. The variable can only tighten: no other value turns off a configured `file`. It cannot be combined with `credentials.requireKeychain` or `HSWAP_REQUIRE_KEYCHAIN`, since one forbids the file and the other the Keychain. `config set` refuses the second one, and with both on through the environment or a hand edit, every command except `config` stops with `config_conflict` before it does anything.
+
+The same stop applies on macOS, whatever the store, when the policy cannot be understood: a `credentials.store` other than `auto` or `file`, a `credentials.requireKeychain` that is not true or false, a `HSWAP_CREDENTIALS_STORE` other than `auto` or `file` (empty counts as unset), or a `settings.json` that cannot be read or parsed. `auto` is the default only when the key is absent, since falling back to it would silently drop these protections. `config`, `--help` and `--version` still run so you can repair it, and `keepalive` writes no `keepalive.json` in this state, so a watcher should act on the exit code too.
 
 Every protection of [keychain-required mode](#keeping-a-headless-machine-logged-in-macos) applies, with the file as the only live store, so the Keychain and the file cannot disagree: the one locked gate, *every copy must agree*, *a copy is kept before it is replaced*, what says one token came before another, the ledger, Claude Code's locks held, `stash_manifest_corrupt` and the stop at session profiles. A slot's `.enc` holding a token no record links to the file's is `split_brain`, and nothing is sent. The commands keychain-required mode refuses are refused here too, with `required_mode_unsupported`. So are `keepalive --adopt`, `keepalive --ensure-file` and `keychain-selftest`.
 
@@ -563,9 +567,11 @@ hswap claude config unset credentials.store
 hswap claude migrate-store --restore-keychain claude-code-credentials.backup-<UTC time>
 ```
 
-The restore writes the backup back as `Claude Code-credentials` with a read-back, and first backs up any item already there. It does not delete the backup. It takes only a `claude-code-credentials.backup-*` name, and it refuses a backup whose token the ledger lists as spent (`relogin_required`) or that is another account's (`unmanaged`). A backup is frozen at the migration, so after any refresh in file mode it is probably spent, and it can be out of date in ways the ledger cannot see. With the setting left on, the restored item makes every command stop with `keychain_item_present`.
+The restore writes the backup back as `Claude Code-credentials` with a read-back, and first backs up any item already there. It does not delete the backup. It takes only a `claude-code-credentials.backup-*` name.
 
-If the restore refuses, or if `keepalive` then reports `split_brain`, finish from the GUI session with `/login` and `hswap claude add`. `--adopt` does not settle this: it keeps the losing copies as rivals.
+A backup is frozen at the migration, and Claude Code rotates the file without telling the ledger, so a backup that differs from the file may be its spent predecessor. The restore therefore works only when the backup holds the same refresh token as the file, or when there is no file and neither the active slot's `.enc` nor a stash entry of the account holds a different one. Otherwise it stops with `relogin_required` and changes nothing, as it does for a token the ledger lists as spent. It also refuses another account's backup (`unmanaged`). With the setting left on, the restored item makes every command stop with `keychain_item_present`.
+
+If the restore refuses, or if `keepalive` then reports `split_brain`, finish in the screen session with `/login` and `hswap claude add`. `--adopt` does not settle this: it keeps the losing copies as rivals.
 
 ## Uninstall
 

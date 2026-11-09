@@ -6557,6 +6557,7 @@ class ClaudeAccountSwitcher:
                         oauth.login_expires_at_iso(creds)
                         if creds else entry.login_expires_at
                     ),
+                    plan=oauth.plan_fields(creds) if creds else None,
                 )
             )
         payload = {

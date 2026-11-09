@@ -286,6 +286,34 @@ class TestListJson:
         assert "loginExpiresAt" not in by_num[1]
         assert by_num[2]["loginExpiresAt"] == "2026-10-08T01:06:36Z"
 
+    def test_list_payload_reports_plan_kind_only(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """``plan``/``rateLimitTier`` are the two kind strings; a login without them
+        omits both keys and no token reaches the row."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-backup", "subscriptionType": "max",
+            "rateLimitTier": "default_claude_max_20x",
+        }})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert "plan" not in by_num[1] and "rateLimitTier" not in by_num[1]
+        assert (by_num[2]["plan"], by_num[2]["rateLimitTier"]) == ("max", "default_claude_max_20x")
+        assert "sk-" not in json.dumps(payload)
+
     def test_usage_status_no_credentials_and_unavailable(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,

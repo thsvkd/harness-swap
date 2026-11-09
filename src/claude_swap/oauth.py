@@ -84,6 +84,22 @@ def access_token_fingerprint(credentials: str) -> str | None:
     return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
 
 
+def plan_fields(credentials: str) -> dict[str, str]:
+    """``{"plan", "rateLimitTier"}`` from the stored login, only those present.
+
+    Claude Code records ``subscriptionType`` ("max", "pro", "team", ...) and
+    ``rateLimitTier`` ("default_claude_max_20x") next to the tokens. Only these
+    two kind-strings leave this function, never a token or the raw credential.
+    """
+    data = extract_oauth_data(credentials) or {}
+    out = {}
+    for key, name in (("subscriptionType", "plan"), ("rateLimitTier", "rateLimitTier")):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            out[name] = value.strip()
+    return out
+
+
 def login_expires_at_iso(credentials: str) -> str | None:
     """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
 

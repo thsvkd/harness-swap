@@ -225,6 +225,22 @@ open(os.path.join(os.environ["CODEX_HOME"], "auth.json"), "w").write({json.dumps
 
 
 @posix_only
+def test_add_login_email_must_match_the_signed_in_account(codex, tmp_path):
+    adapter, _home = codex
+    new_auth = codex_auth("new@x.com", "user-n", "acct-n")
+    exe = fake_executable(
+        tmp_path / "bin",
+        "codex",
+        f'open(os.path.join(os.environ["CODEX_HOME"], "auth.json"), "w").write({json.dumps(new_auth)!r})',
+    )
+    adapter._installation = Installation(True, str(exe), "codex-cli 0.166.0")
+    with pytest.raises(HswapError, match="not other@x.com"):
+        adapter.add_account(login=True, email="other@x.com")
+    assert adapter.list_accounts() == []
+    assert adapter.add_account(login=True, email="NEW@x.com").label == "new@x.com"
+
+
+@posix_only
 def test_failed_login_adds_nothing(codex, tmp_path):
     adapter, _home = codex
     exe = fake_executable(tmp_path / "bin", "codex", "sys.exit(3)")

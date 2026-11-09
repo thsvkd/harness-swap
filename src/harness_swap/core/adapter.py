@@ -58,10 +58,12 @@ class HarnessAdapter(Protocol):
 @runtime_checkable
 class AccountAdder(Protocol):
     def add_account(
-        self, *, alias: str | None = None, provider: str | None = None, login: bool = False
+        self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
+        email: str | None = None,
     ) -> Account:
         """Register an account. ``login`` runs the harness's own sign-in first,
-        isolated so the current login is never replaced or revoked."""
+        isolated so the current login is never replaced or revoked. ``email``
+        (with ``login``) refuses the sign-in unless it ended on that account."""
         ...
 
 

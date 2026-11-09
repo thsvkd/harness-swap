@@ -79,6 +79,7 @@ def _harness_parser(adapter: HarnessAdapter) -> argparse.ArgumentParser:
     sp = cmd("add", "add the current login (or sign in a new one with --login)")
     sp.add_argument("--alias")
     sp.add_argument("--login", action="store_true", help="run the harness's own sign-in without touching the current login")
+    sp.add_argument("--email", help="with --login: refuse the sign-in unless it ended on this account")
     provider(sp)
     sp = cmd("remove", "forget a stored account", "rm")
     sp.add_argument("account", metavar="SLOT|ALIAS|EMAIL")
@@ -182,8 +183,12 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
             for acc in active:
                 print(f"{adapter.display_name}:{output.account_line(acc, _shows_provider(adapter))}")
     elif verb == "add":
+        if args.email and not args.login:
+            raise HswapError("--email only applies with --login")
         known = {a.key for a in adapter.list_accounts()}
-        acc = service.add(adapter, alias=args.alias, provider=args.provider, login=args.login)
+        acc = service.add(
+            adapter, alias=args.alias, provider=args.provider, login=args.login, email=args.email
+        )
         added = [a for a in adapter.list_accounts() if a.key not in known] or [acc]
         for new in added:
             if new.key in known:

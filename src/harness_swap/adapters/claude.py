@@ -327,7 +327,8 @@ class ClaudeAdapter:
         return usage_from_row(row)
 
     def add_account(
-        self, *, alias: str | None = None, provider: str | None = None, login: bool = False
+        self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
+        email: str | None = None,
     ) -> Account:
         if login:
             raise UnsupportedOperation(

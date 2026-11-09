@@ -151,18 +151,19 @@ class FileCredentialAdapter:
     # --- adding / removing -------------------------------------------------------
 
     def add_account(
-        self, *, alias: str | None = None, provider: str | None = None, login: bool = False
+        self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
+        email: str | None = None,
     ) -> Account:
         if login:
             if alias is not None:
                 alias = self.store.check_new_alias(alias)  # fail before the user signs in
-            results = self._login_isolated(alias=alias, provider=provider)
+            results = self._login_isolated(alias=alias, provider=provider, email=email)
         else:
             results = self.credentials.add_current(alias=alias, provider=provider)
         slot = results[0][0].slot
         return next(a for a in self.list_accounts() if a.slot == slot)
 
-    def _login_isolated(self, *, alias: str | None, provider: str | None):
+    def _login_isolated(self, *, alias: str | None, provider: str | None, email: str | None = None):
         """Run the harness's own sign-in in a throwaway home, then import it.
 
         The default login is never replaced (so never revoked or logged out);
@@ -183,6 +184,13 @@ class FileCredentialAdapter:
                 doc = json.loads((tmp / self.credential_file).read_text(encoding="utf-8"))
             except (FileNotFoundError, ValueError):
                 raise CredentialError("sign-in finished but wrote no usable credentials") from None
+            if email:  # the harness's own login cannot preselect an account, so check after
+                got = [i.label for i in self.credentials._identities(doc).values()]
+                if email.casefold() not in (g.casefold() for g in got):
+                    raise HswapError(
+                        f"Signed in as {', '.join(got) or 'an unknown account'}, not {email}; nothing added. "
+                        "Pick the right account on the login page and retry."
+                    )
             return self.credentials.import_document(doc, alias=alias, only_provider=provider)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

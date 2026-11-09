@@ -410,7 +410,8 @@ class OpenCodeAdapter:
         return self._native_accounts()
 
     def add_account(
-        self, *, alias: str | None = None, provider: str | None = None, login: bool = False
+        self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
+        email: str | None = None,
     ) -> Account:
         if self._require_mode() == LEGACY:
             if login:
@@ -418,6 +419,8 @@ class OpenCodeAdapter:
                     "account_add", "OpenCode 1.x has no isolated sign-in; run `opencode auth login`, then `add`"
                 )
             return self._legacy.add_account(alias=alias, provider=provider)
+        if email:
+            raise UnsupportedOperation("account_add", "`opencode auth login` cannot be checked against --email")
         before = {a.key for a in self._native_accounts()}
         code = self._run("auth", "login", *([provider] if provider else []), capture=False).returncode
         if code != 0:

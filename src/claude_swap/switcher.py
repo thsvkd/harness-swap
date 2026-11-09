@@ -4352,6 +4352,55 @@ class ClaudeAccountSwitcher:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
 
+    def login_and_add_account(
+        self,
+        email: str | None = None,
+        org: str | None = None,
+        sso: bool = False,
+        console: bool = False,
+        slot: int | None = None,
+        alias: str | None = None,
+    ) -> None:
+        """Run ``claude auth login`` (browser URL), then add the new login.
+
+        ``claude auth login`` cannot preselect an organization, so ``org`` is
+        checked after the sign-in: on a mismatch nothing is added.
+        """
+        import subprocess
+
+        self._refuse_session_shell()
+        self._setup_directories()
+        self._init_sequence_file()
+        current = self._get_current_identity_triple()
+        if current is not None and not self._account_exists(current[0], current[1]):
+            # The sign-in replaces the live login; an unmanaged one would be lost.
+            raise ConfigError(
+                f"The current login ({current[0]}) is not managed yet. "
+                "Run 'add' first so signing in another account does not lose it."
+            )
+        claude_bin = shutil.which("claude")
+        if claude_bin is None:
+            raise ConfigError("'claude' was not found on PATH.")
+        cmd = [claude_bin, "auth", "login"]
+        if email:
+            cmd += ["--email", email]
+        if sso:
+            cmd.append("--sso")
+        if console:
+            cmd.append("--console")
+        if subprocess.run(cmd).returncode != 0:
+            raise ConfigError("'claude auth login' did not complete; nothing was added.")
+        if org:
+            data = self._read_json(self._get_claude_config_path()) or {}
+            oauth_account = data.get("oauthAccount") or {}
+            got = (oauth_account.get("organizationName") or "", oauth_account.get("organizationUuid") or "")
+            if org.casefold() not in (got[0].casefold(), got[1].casefold()):
+                raise ValidationError(
+                    f"Signed in to organization '{got[0] or 'personal'}', not '{org}'; nothing was added. "
+                    "Choose the right organization on the login page and retry."
+                )
+        self.add_account(slot=slot, alias=alias)
+
     @_gated_in_required_mode
     def add_account(
         self,

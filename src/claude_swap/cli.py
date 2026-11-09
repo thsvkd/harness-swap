@@ -1516,6 +1516,7 @@ Commands:
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
+  %(prog)s add --login [--email E] [--org O] [--sso]  sign in a new account, then add it
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
@@ -1631,6 +1632,18 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "carry no real email metadata."
         ),
     )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="With 'add': sign in a new account through 'claude auth login' (prints the login URL), then add it",
+    )
+    parser.add_argument(
+        "--org",
+        metavar="NAME|UUID",
+        help="With 'add --login': require this organization; nothing is added if the sign-in lands elsewhere",
+    )
+    parser.add_argument("--sso", action="store_true", help="With 'add --login': force the SSO flow")
+    parser.add_argument("--console", action="store_true", help="With 'add --login': Console (API billing) login")
     parser.add_argument(
         "--account",
         metavar="NUM|EMAIL",
@@ -1834,8 +1847,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
-    if args.email is not None and args.add_token is None:
-        parser.error("--email can only be used with 'add-token'")
+    if args.email is not None and args.add_token is None and not args.login:
+        parser.error("--email can only be used with 'add-token' or 'add --login'")
+
+    if (args.login or args.org or args.sso or args.console) and not args.add_account:
+        parser.error("--login, --org, --sso and --console can only be used with 'add'")
+
+    if (args.org or args.sso or args.console or args.email) and args.add_account and not args.login:
+        parser.error("--email, --org, --sso and --console need 'add --login'")
 
     if args.account is not None and not args.export:
         parser.error("--account can only be used with 'export'")
@@ -1902,7 +1921,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
-        if args.add_account:
+        if args.add_account and args.login:
+            switcher.login_and_add_account(
+                email=args.email, org=args.org, sso=args.sso,
+                console=args.console, slot=args.slot, alias=args.alias,
+            )
+        elif args.add_account:
             switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
             switcher.add_account_from_token(

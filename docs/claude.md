@@ -356,6 +356,21 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 `hswap claude auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
+### Sign in a new account and add it in one step
+
+```bash
+hswap claude add --login --email me@corp.com            # login page with the email filled in
+hswap claude add --login --email me@corp.com --sso      # force SSO
+hswap claude add --login --email me@corp.com --org Acme # refuse the sign-in if it lands in another org
+```
+
+This runs `claude auth login`, which opens the browser, and then adds the new login
+the way `add` does, so its usage is tracked. The current login must already be
+managed (run `add` first), because the sign-in replaces it. `claude auth login`
+cannot preselect an organization: choose it on the login page. `--org` (a name or
+UUID) is checked afterward, and nothing is added on a mismatch. `--console` signs in
+to the Console (API billing) instead, which has no subscription usage to track.
+
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)

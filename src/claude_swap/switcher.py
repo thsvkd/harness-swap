@@ -4373,11 +4373,10 @@ class ClaudeAccountSwitcher:
         self._init_sequence_file()
         current = self._get_current_identity_triple()
         if current is not None and not self._account_exists(current[0], current[1]):
-            # The sign-in replaces the live login; an unmanaged one would be lost.
-            raise ConfigError(
-                f"The current login ({current[0]}) is not managed yet. "
-                "Run 'add' first so signing in another account does not lose it."
-            )
+            # The sign-in replaces the live login, so save the unmanaged one
+            # first; if saving fails this raises and nothing is replaced.
+            print(f"The current login ({current[0]}) is not managed yet; adding it first.")
+            self.add_account()
         claude_bin = shutil.which("claude")
         if claude_bin is None:
             raise ConfigError("'claude' was not found on PATH.")

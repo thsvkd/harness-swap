@@ -47,9 +47,21 @@ def test_org_mismatch_adds_nothing(temp_home: Path, mock_claude_config: Path):
     add.assert_not_called()
 
 
-def test_unmanaged_current_login_is_refused_before_signing_in(temp_home: Path, mock_claude_config: Path):
+def test_unmanaged_current_login_is_added_before_signing_in(temp_home: Path, mock_claude_config: Path):
     s = _switcher({"emailAddress": "old@x.com", "organizationUuid": ""})
-    with patch("shutil.which", return_value="/bin/claude"), patch("subprocess.run") as run:
+    order = []
+    run = _login(s, {"emailAddress": "a@x.com"})
+    with patch("shutil.which", return_value="/bin/claude"), \
+         patch("subprocess.run", lambda cmd: (order.append("login"), run(cmd))[1]), \
+         patch.object(s, "add_account", side_effect=lambda **kw: order.append("add")):
+        s.login_and_add_account()
+    assert order == ["add", "login", "add"]
+
+
+def test_unmanaged_login_that_cannot_be_saved_is_never_replaced(temp_home: Path, mock_claude_config: Path):
+    s = _switcher({"emailAddress": "old@x.com", "organizationUuid": ""})
+    with patch("shutil.which", return_value="/bin/claude"), patch("subprocess.run") as run, \
+         patch.object(s, "add_account", side_effect=ConfigError("cannot save")):
         with pytest.raises(ConfigError):
             s.login_and_add_account()
     run.assert_not_called()

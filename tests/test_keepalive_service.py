@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import plistlib
 import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -50,6 +51,7 @@ def test_plist_is_periodic_marked_and_runs_keepalive(tmp_path):
     assert doc["EnvironmentVariables"]["HSWAP_SERVICE"] == "keepalive"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="runs /bin/sh")
 def test_then_auto_runs_auto_only_after_keepalive_succeeds(tmp_path):
     args = plistlib.loads(ks.build(PROGRAM, 7200, True, tmp_path))["ProgramArguments"]
     assert args[:2] == ["/bin/sh", "-c"] and args[3:] == PROGRAM

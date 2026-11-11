@@ -154,3 +154,33 @@ def test_other_options_rewrite_and_reload(tmp_path):
         result = ks.install(ahead=1234567, then_auto=False, home=tmp_path, uid=UID, program=PROGRAM)
     assert result["action"] == "updated" and result["ahead"] == 1234567
     assert any(c[1] == "bootstrap" for c in calls)
+
+
+def test_plist_watches_both_stores(tmp_path):
+    doc = plistlib.loads(ks.build(PROGRAM, 7200, False, tmp_path))
+    assert doc["WatchPaths"] == [
+        str(tmp_path / "Library/Keychains/login.keychain-db"),
+        str(tmp_path / ".claude/.credentials.json"),
+    ]
+
+
+@pytest.mark.parametrize("then_auto", [False, True])
+def test_a_plist_without_watch_paths_is_outdated_and_reinstall_updates_it(tmp_path, then_auto):
+    with _launchctl(loaded=False):
+        _install(tmp_path, then_auto=then_auto)
+    with _launchctl(loaded=True):
+        assert ks.status(tmp_path, UID)["outdated"] is False
+    path = launch_agent.plist_path(ks.LABEL, tmp_path)
+    doc = plistlib.loads(path.read_bytes())
+    del doc["WatchPaths"]  # the 0.2.8 shape
+    path.write_bytes(plistlib.dumps(doc))
+    with _launchctl(loaded=True):
+        st = ks.status(tmp_path, UID)
+        assert st["outdated"] is True and st["ahead"] == 7200 and st["thenAuto"] is then_auto
+        assert _install(tmp_path, then_auto=then_auto)["action"] == "updated"
+        assert ks.status(tmp_path, UID)["outdated"] is False
+
+
+def test_outdated_is_null_without_a_managed_plist(tmp_path):
+    with _launchctl(loaded=False):
+        assert ks.status(tmp_path, UID)["outdated"] is None

@@ -42,15 +42,34 @@ def _argv(program: list[str], ahead: float, then_auto: bool) -> list[str]:
     return ["/bin/sh", "-c", script, *program]
 
 
+def _watch_paths(home: Path | None) -> list[str]:
+    """Wake on a write to either store, not only every INTERVAL_S.
+
+    launchd does not pass the installing shell's CLAUDE_CONFIG_DIR to the job,
+    so the job syncs ~/.claude; watch that. keepalive writes only a store that
+    differs, so its own write wakes it once more and that run writes nothing;
+    launchd's default ThrottleInterval (10s) spaces any burst.
+    """
+    h = home or Path.home()
+    return [
+        str(h / "Library" / "Keychains" / "login.keychain-db"),
+        str(h / ".claude" / ".credentials.json"),
+    ]
+
+
 def build(program: list[str], ahead: float, then_auto: bool, home: Path | None = None) -> bytes:
-    return launch_agent.build_plist(
-        program,
-        LABEL,
-        home,
-        argv=_argv(program, ahead, then_auto),
-        interval=INTERVAL_S,
-        extra_env=dict([_MARKER]),
+    doc = plistlib.loads(
+        launch_agent.build_plist(
+            program,
+            LABEL,
+            home,
+            argv=_argv(program, ahead, then_auto),
+            interval=INTERVAL_S,
+            extra_env=dict([_MARKER]),
+        )
     )
+    doc["WatchPaths"] = _watch_paths(home)
+    return plistlib.dumps(doc)
 
 
 def _read(home: Path | None) -> dict | None:
@@ -83,6 +102,22 @@ def _settings(doc: dict | None) -> tuple[float | None, bool | None]:
     return ahead, then_auto
 
 
+def _outdated(doc: dict | None, home: Path | None) -> bool | None:
+    """Our plist differs from what this hswap would write for its own program,
+    ahead and thenAuto: a reinstall with those settings brings it up to date."""
+    ahead, then_auto = _settings(doc)
+    if ahead is None:
+        return None
+    args = doc.get("ProgramArguments") or []
+    if then_auto:
+        program = args[3:]
+    else:
+        program = args[: args.index("keepalive")] if "keepalive" in args else []
+    if not program:
+        return None
+    return _job(doc) != _job(plistlib.loads(build(program, ahead, then_auto, home)))
+
+
 def status(home: Path | None = None, uid: int | None = None) -> dict:
     out_log, err_log = launch_agent.log_paths(LABEL, home)
     plist = launch_agent.plist_path(LABEL, home)
@@ -100,12 +135,14 @@ def status(home: Path | None = None, uid: int | None = None) -> dict:
         "intervalSeconds": doc.get("StartInterval") if _managed(doc) else None,
         "ahead": None,
         "thenAuto": None,
+        "outdated": None,
         "plist": str(plist),
         "stderrLog": str(err_log),
     }
     if sys.platform != "darwin":
         return base
     base["ahead"], base["thenAuto"] = _settings(doc)
+    base["outdated"] = _outdated(doc, home)
     base["domainAvailable"] = launch_agent.domain_available(uid)
     st = launch_agent.status(LABEL, uid, home)
     base.update(loaded=st["loaded"], state=st["state"], pid=st["pid"], lastExitCode=st["last_exit_code"])
@@ -121,7 +158,7 @@ def _require_macos() -> None:
 
 
 def _job(doc: dict) -> tuple:
-    return (doc.get("ProgramArguments"), doc.get("StartInterval"), _managed(doc))
+    return (doc.get("ProgramArguments"), doc.get("StartInterval"), doc.get("WatchPaths"), _managed(doc))
 
 
 def _refuse_foreign(home: Path | None, uid: int | None) -> dict | None:

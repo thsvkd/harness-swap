@@ -460,7 +460,7 @@ hswap claude keepalive --service-status [--json]
 hswap claude keepalive --uninstall-service
 ```
 
-The agent is `~/Library/LaunchAgents/dev.hswap.keepalive.plist` (StartInterval 300, RunAtLoad), stdout goes nowhere (`keepalive.json` is the record) and stderr to `~/Library/Logs/dev.hswap.keepalive.err`. Re-running `--install-service` with the same options changes nothing; other options rewrite and reload it. hswap marks its plist with `HSWAP_SERVICE=keepalive`, and a plist under that label without the mark (one you wrote) is never overwritten or removed: install and uninstall refuse with `ForeignService`. Without a GUI login (SSH, a LaunchDaemon) the plist is written but not loaded, and launchd loads it at the next login. Root is refused. Exit codes: 0 done, 1 refused or failed, 3 written but not loaded yet.
+The agent is `~/Library/LaunchAgents/dev.hswap.keepalive.plist` (StartInterval 300, RunAtLoad, and WatchPaths on `~/Library/Keychains/login.keychain-db` and `~/.claude/.credentials.json`, so a login written to one store reaches the other within seconds instead of up to five minutes), stdout goes nowhere (`keepalive.json` is the record) and stderr to `~/Library/Logs/dev.hswap.keepalive.err`. Re-running `--install-service` with the same options changes nothing; other options rewrite and reload it. hswap marks its plist with `HSWAP_SERVICE=keepalive`, and a plist under that label without the mark (one you wrote) is never overwritten or removed: install and uninstall refuse with `ForeignService`. Without a GUI login (SSH, a LaunchDaemon) the plist is written but not loaded, and launchd loads it at the next login. Root is refused. Exit codes: 0 done, 1 refused or failed, 3 written but not loaded yet.
 
 `--json` prints `{"schemaVersion": 1, "ok": true, "action": …}` plus the status fields, `action` being `installed`, `updated`, `unchanged`, `deferred`, `removed` or `absent`; a refusal is the usual error envelope. `--service-status --json` always exits 0:
 
@@ -468,11 +468,11 @@ The agent is `~/Library/LaunchAgents/dev.hswap.keepalive.plist` (StartInterval 3
 {"schemaVersion": 1, "label": "dev.hswap.keepalive", "platform": "launchd",
  "installed": true, "managed": true, "loaded": true, "domainAvailable": true,
  "state": "not running", "pid": null, "lastExitCode": 0,
- "intervalSeconds": 300, "ahead": 7200.0, "thenAuto": false,
+ "intervalSeconds": 300, "ahead": 7200.0, "thenAuto": false, "outdated": false,
  "plist": "…/dev.hswap.keepalive.plist", "stderrLog": "…/dev.hswap.keepalive.err"}
 ```
 
-`managed` is null when there is no plist and false for one hswap did not write (its `ahead`, `thenAuto` and `intervalSeconds` are then null). Off macOS `platform` is `unsupported` and install refuses with `UnsupportedPlatform`: there is no Keychain there, so run `hswap claude keepalive` from cron or any scheduler.
+`managed` is null when there is no plist and false for one hswap did not write (its `ahead`, `thenAuto` and `intervalSeconds` are then null). `outdated` is true when hswap's own plist differs from what this hswap writes for the same program, `ahead` and `thenAuto` (e.g. one from 0.2.8, before WatchPaths): re-run `--install-service` with those settings to update it. It is null when there is no managed plist. Off macOS `platform` is `unsupported` and install refuses with `UnsupportedPlatform`: there is no Keychain there, so run `hswap claude keepalive` from cron or any scheduler.
 
 Or write the agent yourself, e.g. as `~/Library/LaunchAgents/com.example.hswap-keepalive.plist` (do not run both):
 

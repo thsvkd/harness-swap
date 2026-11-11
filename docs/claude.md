@@ -371,6 +371,29 @@ cannot preselect an organization: choose it on the login page. `--org` (a name o
 UUID) is checked afterward, and nothing is added on a mismatch. `--console` signs in
 to the Console (API billing) instead, which has no subscription usage to track.
 
+**Driven by another program** (a web gateway): `hswap claude add --login --json`
+prints JSON Lines on stdout and nothing else; every other message goes to stderr.
+It never prompts (`--slot` is refused with it).
+
+```json
+{"type": "login_url", "harness": "claude", "url": "https://claude.com/cai/oauth/authorize?…", "awaitsCode": true}
+{"type": "added", "harness": "claude", "account": {…list --json row…}, "refreshed": false, "keepalive": {…}}
+```
+
+After `login_url`, write the code the login page shows, plus a newline, to hswap's
+stdin: `claude auth login` inherits it. `added` (exit 0) carries the new account's
+`list --json` row (cached usage only), `refreshed: true` when it was already managed,
+and on macOS the report of one `keepalive` run made right after the add (null
+elsewhere; a failed keepalive does not undo the add). A failure is
+`{"type": "error", "harness", "error": {"type", "message"}}` with exit 1 and nothing
+added; `type` is one of `login_failed`, `wrong_account`, `unsupported`,
+`not_installed`, `keychain_unavailable` or `error`. If no login URL is recognised
+within 60 seconds (the harness reworded its prompt), the sign-in is ended and reported
+as `login_failed`. SIGTERM ends `claude auth login` too; run `hswap` itself, not
+through `uv run`, which does not pass the signal on. The sign-in still replaces this machine's Claude Code login, and `claude auth
+login` may open a browser on this machine. `hswap codex|grok add --login --json` use
+the same events, with a device-code sign-in in a throwaway home instead (see the README).
+
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
@@ -428,7 +451,30 @@ A locked login keychain in the GUI session counts as unreachable, and the check 
 
 **Read-back.** `security -i` exits 0 whatever its quoting did to a value, so every Keychain write is read back through the normal read and compared, and a mismatch counts as a failed write. `security` prints a value holding any non-printable byte as hex, which no reader can use, so credential JSON with non-ASCII text is stored with `\uXXXX` escapes (the same data to any JSON reader), and any other such value fails the write. Run `hswap claude keychain-selftest [--json]` once from the GUI session before relying on this setup. It writes a throwaway `hswap-selftest-<random>` item of a real credential's size containing quotes, backslashes and non-ASCII JSON through the same code path, compares it and always deletes it. It reports `{"ok":true}` and exit 0 only if the value matched and the item is gone, and it refuses with `keychain_unavailable` when the login keychain is out of reach. A failed read-back writes the previous value back once. If that fails too, the item keeps what `security` stored rather than being deleted, because a concurrent writer may have just stored a newer token, so treat a `keepalive` that starts reporting `keychain_unavailable` right after an upgrade as urgent. Elsewhere than macOS it prints `unsupported` and exits 0.
 
-**2. Run one refresher from the GUI session.** Save as `~/Library/LaunchAgents/com.example.hswap-keepalive.plist`:
+**2. Run one refresher from the GUI session.** hswap installs it for you:
+
+```bash
+hswap claude keepalive --install-service --ahead 7200   # every 5 minutes, and at every login
+hswap claude keepalive --install-service --then-auto     # also `auto --once` after each successful run
+hswap claude keepalive --service-status [--json]
+hswap claude keepalive --uninstall-service
+```
+
+The agent is `~/Library/LaunchAgents/dev.hswap.keepalive.plist` (StartInterval 300, RunAtLoad), stdout goes nowhere (`keepalive.json` is the record) and stderr to `~/Library/Logs/dev.hswap.keepalive.err`. Re-running `--install-service` with the same options changes nothing; other options rewrite and reload it. hswap marks its plist with `HSWAP_SERVICE=keepalive`, and a plist under that label without the mark (one you wrote) is never overwritten or removed: install and uninstall refuse with `ForeignService`. Without a GUI login (SSH, a LaunchDaemon) the plist is written but not loaded, and launchd loads it at the next login. Root is refused. Exit codes: 0 done, 1 refused or failed, 3 written but not loaded yet.
+
+`--json` prints `{"schemaVersion": 1, "ok": true, "action": …}` plus the status fields, `action` being `installed`, `updated`, `unchanged`, `deferred`, `removed` or `absent`; a refusal is the usual error envelope. `--service-status --json` always exits 0:
+
+```json
+{"schemaVersion": 1, "label": "dev.hswap.keepalive", "platform": "launchd",
+ "installed": true, "managed": true, "loaded": true, "domainAvailable": true,
+ "state": "not running", "pid": null, "lastExitCode": 0,
+ "intervalSeconds": 300, "ahead": 7200.0, "thenAuto": false,
+ "plist": "…/dev.hswap.keepalive.plist", "stderrLog": "…/dev.hswap.keepalive.err"}
+```
+
+`managed` is null when there is no plist and false for one hswap did not write (its `ahead`, `thenAuto` and `intervalSeconds` are then null). Off macOS `platform` is `unsupported` and install refuses with `UnsupportedPlatform`: there is no Keychain there, so run `hswap claude keepalive` from cron or any scheduler.
+
+Or write the agent yourself, e.g. as `~/Library/LaunchAgents/com.example.hswap-keepalive.plist` (do not run both):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>

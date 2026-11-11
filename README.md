@@ -117,6 +117,12 @@ hswap grok switch 1          # leaves that login as the only scope; Grok hot-rel
 hswap grok run 2             # experimental isolated GROK_HOME session
 ```
 
+`hswap codex|grok add --login --json` is for a program driving the sign-in
+(a web gateway): it runs `login --device-auth` in the throwaway home and prints
+JSON Lines only, `{"type":"device_code","url",…,"userCode","expiresInSeconds"}`,
+then `{"type":"added","account",…}` (exit 0) or `{"type":"error","error":{"type",…}}`
+(exit 1). The events and error types are in [docs/claude.md](docs/claude.md#sign-in-a-new-account-and-add-it-in-one-step).
+
 ### Antigravity (`agy`)
 
 File-backed login only (`~/.gemini/antigravity-cli/antigravity-oauth-token`).
@@ -186,7 +192,7 @@ hswap tui
 hswap <harness> list [--json] [--no-usage] [--cached]
 hswap <harness> status | usage [ACCOUNT] [--json] [--cached]
 hswap <harness> auto [--once|--interval S] [--dry-run] [--json]   # opt-in
-hswap <harness> add [--alias A] [--provider P] [--login]
+hswap <harness> add [--alias A] [--provider P] [--login [--json]]
 hswap <harness> switch ACCOUNT [--provider P] [--force] [--json]
 hswap <harness> switch --strategy best|next-available
 hswap <harness> run ACCOUNT [-- harness args...]

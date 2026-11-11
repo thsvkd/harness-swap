@@ -19,14 +19,22 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TextIO
 
 from harness_swap.core import sessions
 from harness_swap.core.credentials import CredentialFormat, SnapshotCredentials
-from harness_swap.core.errors import CredentialError, HarnessNotInstalled, HswapError
+from harness_swap.core.errors import (
+    CredentialError,
+    HarnessNotInstalled,
+    HswapError,
+    LoginFailed,
+    UnsupportedOperation,
+    WrongAccount,
+)
 from harness_swap.core.models import Account, Installation, SwitchResult
 from harness_swap.core.paths import env_dir, harness_home
 from harness_swap.core.store import AccountStore, StoredAccount, mkdir_private
-from harness_swap.infrastructure import processes, spawn
+from harness_swap.infrastructure import login_events, processes, spawn
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
@@ -67,6 +75,8 @@ class FileCredentialAdapter:
     #: Default-home entries linked into an isolated session's home.
     shared_names: tuple[str, ...] = ()
     login_args: tuple[str, ...] = ("login",)
+    #: Sign-in for a remote browser (``add --login --json``); None: not offered.
+    device_login_args: tuple[str, ...] | None = None
     #: Running processes pick up a switched credential file by themselves.
     hot_reload = False
     fmt: CredentialFormat
@@ -152,24 +162,29 @@ class FileCredentialAdapter:
 
     def add_account(
         self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
-        email: str | None = None,
+        email: str | None = None, events: TextIO | None = None,
     ) -> Account:
         if login:
             if alias is not None:
                 alias = self.store.check_new_alias(alias)  # fail before the user signs in
-            results = self._login_isolated(alias=alias, provider=provider, email=email)
+            results = self._login_isolated(alias=alias, provider=provider, email=email, events=events)
         else:
             results = self.credentials.add_current(alias=alias, provider=provider)
         slot = results[0][0].slot
         return next(a for a in self.list_accounts() if a.slot == slot)
 
-    def _login_isolated(self, *, alias: str | None, provider: str | None, email: str | None = None):
+    def _login_isolated(
+        self, *, alias: str | None, provider: str | None, email: str | None = None,
+        events: TextIO | None = None,
+    ):
         """Run the harness's own sign-in in a throwaway home, then import it.
 
         The default login is never replaced (so never revoked or logged out);
         user configuration is linked in so SSO/OIDC settings still apply.
         """
         inst = self._require_installed()
+        if events is not None and self.device_login_args is None:
+            raise UnsupportedOperation("account_add", f"{self.display_name} has no device-code sign-in")
         for stale in self.store.root.glob("pending-login-*"):  # left by a killed sign-in
             if time.time() - stale.stat().st_mtime > 86400:
                 shutil.rmtree(stale, ignore_errors=True)
@@ -177,17 +192,24 @@ class FileCredentialAdapter:
         try:
             sessions.link_shared(tmp, self.home, self.login_shared_names())
             env_add, home_args = self.home_overrides(tmp)
-            code = subprocess.call([inst.executable, *home_args, *self.login_args], env={**os.environ, **env_add})
+            env = {**os.environ, **env_add}
+            if events is None:
+                code = subprocess.call([inst.executable, *home_args, *self.login_args], env=env)
+            else:
+                argv = [str(inst.executable), *home_args, *self.device_login_args]
+                code = login_events.drive(argv, env, self.id, events, device=True)
+                if code == login_events.NO_PROMPT:
+                    raise LoginFailed(f"{self.executable} printed no device-code prompt hswap recognises; nothing added")
             if code != 0:
-                raise HswapError(f"{self.executable} login exited with status {code}; nothing added")
+                raise LoginFailed(f"{self.executable} login exited with status {code}; nothing added")
             try:
                 doc = json.loads((tmp / self.credential_file).read_text(encoding="utf-8"))
             except (FileNotFoundError, ValueError):
-                raise CredentialError("sign-in finished but wrote no usable credentials") from None
+                raise LoginFailed("sign-in finished but wrote no usable credentials") from None
             if email:  # the harness's own login cannot preselect an account, so check after
                 got = [i.label for i in self.credentials._identities(doc).values()]
                 if email.casefold() not in (g.casefold() for g in got):
-                    raise HswapError(
+                    raise WrongAccount(
                         f"Signed in as {', '.join(got) or 'an unknown account'}, not {email}; nothing added. "
                         "Pick the right account on the login page and retry."
                     )

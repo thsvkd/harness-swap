@@ -21,6 +21,8 @@ docs/harness-compatibility.md):
 
 from __future__ import annotations
 
+from typing import TextIO
+
 import json
 import os
 import queue
@@ -213,7 +215,7 @@ class AgyAdapter(FileCredentialAdapter):
 
     def add_account(
         self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
-        email: str | None = None,
+        email: str | None = None, events: TextIO | None = None,
     ) -> Account:
         if login:
             raise UnsupportedOperation(str(Capability.ACCOUNT_ADD), _NO_LOGIN, "unavailable")

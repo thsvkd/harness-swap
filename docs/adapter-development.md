@@ -106,6 +106,7 @@ class AcmeAdapter(FileCredentialAdapter):
     harness_lock_name = None          # the harness's own lock file, if it has one
     shared_names = ("settings.toml",) # linked into isolated sessions and --login homes
     login_args = ("login",)           # what `hswap acme add --login` runs
+    device_login_args = ("login", "--device-auth")  # `add --login --json`; None (default) refuses it
     hot_reload = False                # do running processes re-read the login?
     fmt = AcmeCredentials()
 ```

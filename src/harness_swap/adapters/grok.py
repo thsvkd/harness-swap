@@ -169,6 +169,7 @@ class GrokAuthFormat:
 
 
 class GrokAdapter(FileCredentialAdapter):
+    device_login_args = ("login", "--device-auth")
     id = "grok"
     display_name = "Grok Build"
     providers = ("xai",)

@@ -213,3 +213,21 @@ class MigrationIncomplete(ClaudeSwitchError):
     """
 
     pass
+
+
+class LoginFailedError(ConfigError):
+    """``claude auth login`` did not finish; nothing was added."""
+
+    json_type = "login_failed"
+
+
+class WrongAccountError(ValidationError):
+    """The sign-in landed on another organization than ``--org``."""
+
+    json_type = "wrong_account"
+
+
+class ClaudeNotInstalledError(ConfigError):
+    """No ``claude`` on PATH."""
+
+    json_type = "not_installed"

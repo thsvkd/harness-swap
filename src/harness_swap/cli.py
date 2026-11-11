@@ -80,6 +80,10 @@ def _harness_parser(adapter: HarnessAdapter) -> argparse.ArgumentParser:
     sp.add_argument("--alias")
     sp.add_argument("--login", action="store_true", help="run the harness's own sign-in without touching the current login")
     sp.add_argument("--email", help="with --login: refuse the sign-in unless it ended on this account")
+    sp.add_argument(
+        "--json", action="store_true",
+        help="with --login: device-code sign-in reported as JSON Lines events, for a parent process",
+    )
     provider(sp)
     sp = cmd("remove", "forget a stored account", "rm")
     sp.add_argument("account", metavar="SLOT|ALIAS|EMAIL")
@@ -140,6 +144,28 @@ def _confirm(question: str) -> bool:
     return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
 
 
+def _add_login_json(adapter: HarnessAdapter, args) -> int:
+    """``add --login --json``: only login_events JSON Lines on stdout, whatever fails."""
+    from harness_swap.infrastructure import login_events
+
+    try:
+        if not args.login:
+            raise HswapError("--json applies to `add` only with --login")
+        if args.provider and adapter.providers and args.provider not in adapter.providers:
+            raise HswapError(f"{adapter.id} has no provider {args.provider!r}; known: {', '.join(adapter.providers)}")
+        known = {a.key for a in adapter.list_accounts()}
+        acc = service.add(
+            adapter, alias=args.alias, provider=args.provider, login=True, email=args.email, events=sys.stdout
+        )
+    except Exception as exc:  # every failure is an event
+        login_events.emit_error(sys.stdout, adapter.id, exc)
+        return 1
+    login_events.emit(
+        sys.stdout, adapter.id, "added", account=acc.to_json(), refreshed=acc.key in known, keepalive=None
+    )
+    return 0
+
+
 def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
     if isinstance(adapter, NativeCommandLine):
         return adapter.run_cli(argv)
@@ -155,6 +181,8 @@ def harness_command(adapter: HarnessAdapter, argv: list[str]) -> int:
     if extra:
         parser.error(f"unrecognized arguments: {' '.join(extra)}")
     as_json = getattr(args, "json", False)
+    if verb == "add" and as_json:
+        return _add_login_json(adapter, args)
     if getattr(args, "provider", None) and adapter.providers and args.provider not in adapter.providers:
         raise HswapError(f"{adapter.id} has no provider {args.provider!r}; known: {', '.join(adapter.providers)}")
 

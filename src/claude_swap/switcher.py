@@ -29,7 +29,9 @@ from claude_swap.exceptions import (
     KeychainUnavailableError,
     ConfigError,
     CredentialReadError,
+    ClaudeNotInstalledError,
     LockError,
+    LoginFailedError,
     RELOGIN_REQUIRED_MESSAGE,
     ReloginRequiredError,
     RequiredModeUnsupportedError,
@@ -40,6 +42,7 @@ from claude_swap.exceptions import (
     StoresDisagreeError,
     SwitchError,
     ValidationError,
+    WrongAccountError,
 )
 from claude_swap import consumed_grants, oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
@@ -4360,11 +4363,14 @@ class ClaudeAccountSwitcher:
         console: bool = False,
         slot: int | None = None,
         alias: str | None = None,
+        events=None,
     ) -> None:
         """Run ``claude auth login`` (browser URL), then add the new login.
 
         ``claude auth login`` cannot preselect an organization, so ``org`` is
-        checked after the sign-in: on a mismatch nothing is added.
+        checked after the sign-in: on a mismatch nothing is added. ``events``:
+        report the login URL on that stream as ``login_events`` JSON Lines
+        instead of letting claude print to the terminal (stdin stays inherited).
         """
         import subprocess
 
@@ -4379,7 +4385,7 @@ class ClaudeAccountSwitcher:
             self.add_account()
         claude_bin = shutil.which("claude")
         if claude_bin is None:
-            raise ConfigError("'claude' was not found on PATH.")
+            raise ClaudeNotInstalledError("'claude' was not found on PATH.")
         cmd = [claude_bin, "auth", "login"]
         if email:
             cmd += ["--email", email]
@@ -4387,14 +4393,24 @@ class ClaudeAccountSwitcher:
             cmd.append("--sso")
         if console:
             cmd.append("--console")
-        if subprocess.run(cmd).returncode != 0:
-            raise ConfigError("'claude auth login' did not complete; nothing was added.")
+        if events is None:
+            code = subprocess.run(cmd).returncode
+        else:
+            from harness_swap.infrastructure import login_events
+
+            if not console:
+                cmd.append("--claudeai")  # pinned for a parent that depends on it
+            code = login_events.drive(cmd, None, "claude", events, device=False)
+            if code == login_events.NO_PROMPT:
+                raise LoginFailedError("'claude auth login' printed no login URL hswap recognises; nothing was added.")
+        if code != 0:
+            raise LoginFailedError("'claude auth login' did not complete; nothing was added.")
         if org:
             data = self._read_json(self._get_claude_config_path()) or {}
             oauth_account = data.get("oauthAccount") or {}
             got = (oauth_account.get("organizationName") or "", oauth_account.get("organizationUuid") or "")
             if org.casefold() not in (got[0].casefold(), got[1].casefold()):
-                raise ValidationError(
+                raise WrongAccountError(
                     f"Signed in to organization '{got[0] or 'personal'}', not '{org}'; nothing was added. "
                     "Choose the right organization on the login page and retry."
                 )

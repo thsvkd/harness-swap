@@ -13,6 +13,14 @@ class HswapError(Exception):
     """Base class for every deliberate hswap failure."""
 
 
+class LoginFailed(HswapError):
+    """The harness's own sign-in did not finish with a usable login."""
+
+
+class WrongAccount(HswapError):
+    """The sign-in ended on another account than the one asked for."""
+
+
 class LockError(HswapError):
     """A cross-process lock could not be acquired in time."""
 

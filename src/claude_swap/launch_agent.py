@@ -150,20 +150,43 @@ def build_plist(
     label: str = LABEL,
     home: Path | None = None,
     env: Mapping[str, str] | None = None,
+    argv: list[str] | None = None,
+    interval: int | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> bytes:
     """Serialize the LaunchAgent plist.
 
     Built with :mod:`plistlib` rather than a formatted XML string so paths
     containing ``&`` or ``<`` cannot produce a plist launchd refuses to parse.
+
+    ``argv`` replaces ``[*program, "menubar"]``; ``interval`` turns the job into
+    a periodic one (StartInterval) instead of a kept-alive UI process.
     """
     program = program or resolve_program()
     out_log, err_log = log_paths(label, home)
     env = os.environ if env is None else env
     forwarded = {k: env[k] for k in _FORWARDED_ENV_KEYS if k in env}
+    if interval is not None:
+        return plistlib.dumps(
+            {
+                "Label": label,
+                "ProgramArguments": argv or [*program, "menubar"],
+                "RunAtLoad": True,
+                "StartInterval": interval,
+                "ProcessType": "Background",
+                "EnvironmentVariables": {
+                    "PATH": _path_env(program), **forwarded, **(extra_env or {})
+                },
+                # A line every few minutes would grow without bound; the job's
+                # own state file is the record, stderr keeps the failures.
+                "StandardOutPath": "/dev/null",
+                "StandardErrorPath": str(err_log),
+            }
+        )
     return plistlib.dumps(
         {
             "Label": label,
-            "ProgramArguments": [*program, "menubar"],
+            "ProgramArguments": argv or [*program, "menubar"],
             "RunAtLoad": True,
             # Restart a crash, but respect a deliberate Quit. The menu bar's
             # quit handler calls rumps.quit_application(), a clean exit(0);
@@ -218,6 +241,7 @@ def status(label: str = LABEL, uid: int | None = None, home: Path | None = None)
     loaded = printed.returncode == 0
     state: str | None = None
     pid: int | None = None
+    last_exit: int | None = None
     if loaded:
         for line in printed.stdout.splitlines():
             # `launchctl print` nests sub-dictionaries — pid-local endpoints,
@@ -233,14 +257,24 @@ def status(label: str = LABEL, uid: int | None = None, home: Path | None = None)
                 raw = stripped.removeprefix("pid = ").strip()
                 if raw.isdigit():
                     pid = int(raw)
+            elif last_exit is None and stripped.startswith("last exit code = "):
+                raw = stripped.removeprefix("last exit code = ").split(":")[0].strip()
+                if raw.lstrip("-").isdigit():
+                    last_exit = int(raw)
     return {
         "label": label,
         "installed": plist_path(label, home).exists(),
         "loaded": loaded,
         "state": state,
         "pid": pid,
+        "last_exit_code": last_exit,
         "plist": str(plist_path(label, home)),
     }
+
+
+def domain_available(uid: int | None = None) -> bool:
+    """Whether the user's GUI domain exists (False from SSH or a daemon with no GUI login)."""
+    return _launchctl("print", domain_target(uid)).returncode == 0
 
 
 def install(
@@ -248,8 +282,9 @@ def install(
     home: Path | None = None,
     program: list[str] | None = None,
     uid: int | None = None,
+    plist: bytes | None = None,
 ) -> dict:
-    """Write the plist and hand the service to launchd.
+    """Write the plist (``plist``, or the menu bar's) and hand it to launchd.
 
     Idempotent: an already-loaded service is booted out first, so running this
     after an upgrade re-reads the plist instead of failing with launchd's
@@ -265,7 +300,7 @@ def install(
     # Owner-only and atomic, not the umask's 0644 via write_bytes: a forwarded
     # proxy URL can carry credentials, and a write cut short by Ctrl-C must
     # not leave a truncated plist for the next login to choke on.
-    atomic_write_bytes(target_plist, build_plist(program, label, home))
+    atomic_write_bytes(target_plist, plist or build_plist(program, label, home))
 
     settled = True
     if is_loaded(label, uid):

@@ -946,6 +946,8 @@ Defaults live in settings.json in the backup root; flags override them.
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         if sys.platform != "win32":
             if os.geteuid() == 0 and not switcher._is_running_in_container():
+                if args.json and args.add_account and args.login:
+                    raise ClaudeSwitchError("Do not run this script as root (unless running in a container)")
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
@@ -1165,11 +1167,35 @@ def _keepalive_command(argv: list[str]) -> None:
         "--json", action="store_true", help="Print the report as JSON on stdout"
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    service = parser.add_mutually_exclusive_group()
+    service.add_argument(
+        "--install-service",
+        action="store_true",
+        help="Run keepalive every 5 minutes from a LaunchAgent (macOS); keeps --ahead",
+    )
+    service.add_argument(
+        "--uninstall-service", action="store_true", help="Remove that LaunchAgent"
+    )
+    service.add_argument(
+        "--service-status", action="store_true", help="Show the LaunchAgent's state"
+    )
+    parser.add_argument(
+        "--then-auto",
+        action="store_true",
+        help="With --install-service: run 'auto --once' after each successful keepalive",
+    )
     args = parser.parse_args(argv)
     if not (math.isfinite(args.ahead) and args.ahead >= 0):
         parser.error("--ahead must be a non-negative number of seconds")
     if args.adopt and args.dry_run:
         parser.error("--adopt cannot be combined with --dry-run")
+    in_service = args.install_service or args.uninstall_service or args.service_status
+    if args.then_auto and not args.install_service:
+        parser.error("--then-auto needs --install-service")
+    if in_service and (args.adopt or args.dry_run or args.ensure_file):
+        parser.error("--adopt, --dry-run and --ensure-file do not apply to the service options")
+    if in_service:
+        sys.exit(_keepalive_service(args))
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -1374,6 +1400,97 @@ def _use_native_tls() -> None:
         pass
 
 
+def _login_json(switcher: ClaudeAccountSwitcher, args) -> int:
+    """``add --login --json``: login_events JSON Lines on stdout, every other print on stderr."""
+    from contextlib import redirect_stdout
+
+    from harness_swap.infrastructure import login_events
+
+    out = sys.stdout
+    try:
+        with redirect_stdout(sys.stderr):
+            before = switcher.list_accounts(json_output=True, fetch=set())["accounts"]
+            switcher.login_and_add_account(
+                email=args.email, org=args.org, sso=args.sso,
+                console=args.console, alias=args.alias, events=out,
+            )
+    except Exception as e:  # every failure is an event; stdout stays JSON Lines
+        login_events.emit_error(out, "claude", e)
+        return 1
+    # Added from here on: a failure below must not turn into an error event.
+    row = keepalive = None
+    with redirect_stdout(sys.stderr):
+        try:
+            rows = switcher.list_accounts(json_output=True, fetch=set())["accounts"]
+            row = next((r for r in rows if r.get("active")), None)
+        except Exception:
+            pass
+        if sys.platform == "darwin":
+            from claude_swap.keepalive import run_keepalive
+
+            try:
+                keepalive = run_keepalive(switcher)  # sync the stores now; a failure keeps the add
+            except Exception:
+                pass
+    known = {(r.get("email"), r.get("organizationUuid")) for r in before}
+    refreshed = row is not None and (row.get("email"), row.get("organizationUuid")) in known
+    login_events.emit(out, "claude", "added", account=row, refreshed=refreshed, keepalive=keepalive)
+    return 0
+
+
+def _keepalive_service(args) -> int:
+    """Handle ``keepalive --install-service|--uninstall-service|--service-status``.
+
+    Exit codes: 0 done, 1 refused or failed (nothing changed), 3 the plist is
+    written but no GUI session exists to load it (launchd loads it at next login).
+    """
+    from claude_swap import keepalive_service as ks
+    from claude_swap.json_output import SCHEMA_VERSION
+
+    try:
+        if args.service_status:
+            result = ks.status()
+        else:
+            if sys.platform != "win32" and os.geteuid() == 0:
+                raise ClaudeSwitchError("Do not install the keepalive service as root; run it as the user.")
+            if args.install_service:
+                result = ks.install(ahead=args.ahead, then_auto=args.then_auto)
+            else:
+                result = ks.uninstall()
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        return 1
+    code = 3 if result.get("action") == "deferred" else 0
+    if args.json:
+        if "action" in result:
+            result = {"ok": True, **result}
+        print(json.dumps({"schemaVersion": SCHEMA_VERSION, **result}, indent=2))
+        return code
+    action = result.get("action")
+    if action == "deferred":
+        print(f"Keepalive service written to {result['plist']}; no GUI session to load it now, launchd loads it at next login.")
+    elif action in ("installed", "updated", "unchanged"):
+        print(f"Keepalive service {action} ({result['label']}, every {result['intervalSeconds']}s).")
+    elif action == "removed":
+        print("Keepalive service removed.")
+    elif action == "absent":
+        print("Keepalive service was not installed.")
+    elif result["platform"] == "unsupported":
+        print("The keepalive service is macOS-only; on Linux run `keepalive` from cron.")
+    elif not result["installed"]:
+        print("Keepalive service is not installed.")
+    elif not result["managed"]:
+        print(f"A keepalive agent not made by hswap is installed: {result['plist']}")
+    else:
+        state = result["state"] or ("loaded" if result["loaded"] else "not loaded")
+        print(f"Keepalive service: {state}, last exit {result['lastExitCode']}")
+        print(f"  plist: {result['plist']}")
+    return code
+
+
 def _menubar_service(args) -> int:
     """Handle ``menubar --install-service|--uninstall-service|--service-status``.
 
@@ -1538,6 +1655,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s keepalive                  sync and refresh the active login ahead of expiry
+  %(prog)s keepalive --install-service run keepalive every 5 minutes via launchd
   %(prog)s keychain-selftest          check a credential survives a Keychain write
   %(prog)s migrate-store              move a macOS login to the file credential store
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
@@ -1825,8 +1943,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
 
-    if args.json and not (args.list or args.status or args.switch or args.switch_to):
-        parser.error("--json can only be used with 'list', 'status', or 'switch'")
+    if args.json and not (
+        args.list or args.status or args.switch or args.switch_to or (args.add_account and args.login)
+    ):
+        parser.error("--json can only be used with 'list', 'status', 'switch' or 'add --login'")
 
     if args.json and args.token_status:
         # Token status is not part of the JSON v1 schema; reject rather than
@@ -1853,6 +1973,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if (args.login or args.org or args.sso or args.console) and not args.add_account:
         parser.error("--login, --org, --sso and --console can only be used with 'add'")
 
+    if args.json and args.add_account and args.login and args.slot is not None:
+        parser.error("--slot cannot be combined with 'add --login --json' (it could need a prompt)")
     if (args.org or args.sso or args.console or args.email) and args.add_account and not args.login:
         parser.error("--email, --org, --sso and --console need 'add --login'")
 
@@ -1921,6 +2043,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
+        if args.add_account and args.login and args.json:
+            sys.exit(_login_json(switcher, args))
         if args.add_account and args.login:
             switcher.login_and_add_account(
                 email=args.email, org=args.org, sso=args.sso,
@@ -2007,6 +2131,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
             sys.exit(menubar_run(switcher))
     except ClaudeSwitchError as e:
+        if args.json and args.add_account and args.login:
+            from harness_swap.infrastructure import login_events
+
+            login_events.emit_error(sys.stdout, "claude", e)
+            sys.exit(1)
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
         if args.json:

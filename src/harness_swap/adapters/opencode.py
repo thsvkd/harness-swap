@@ -40,6 +40,8 @@ token on use, an active login within 10 minutes of expiry is not asked (its
 
 from __future__ import annotations
 
+from typing import TextIO
+
 import dataclasses
 import json
 import os
@@ -411,7 +413,7 @@ class OpenCodeAdapter:
 
     def add_account(
         self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
-        email: str | None = None,
+        email: str | None = None, events: TextIO | None = None,
     ) -> Account:
         if self._require_mode() == LEGACY:
             if login:

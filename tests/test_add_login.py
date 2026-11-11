@@ -75,3 +75,54 @@ def test_failed_login_adds_nothing(temp_home: Path, mock_claude_config: Path):
         with pytest.raises(ConfigError):
             s.login_and_add_account()
     add.assert_not_called()
+
+
+class _StubSwitcher:
+    """Just enough of ClaudeAccountSwitcher for cli._login_json."""
+
+    def __init__(self, fail=None):
+        self.rows = [{"email": "old@x.com", "organizationUuid": "", "active": True}]
+        self.fail = fail
+
+    def list_accounts(self, json_output, fetch):
+        assert json_output and fetch == set()  # cache only, never a usage fetch
+        return {"accounts": self.rows}
+
+    def login_and_add_account(self, events, **kw):
+        print("chatter that must not reach stdout")
+        from harness_swap.infrastructure import login_events
+
+        login_events.emit(events, "claude", "login_url", url="https://claude.com/x", awaitsCode=True)
+        if self.fail:
+            raise self.fail
+        self.rows = [{**self.rows[0], "active": False}, {"email": "new@x.com", "organizationUuid": "", "active": True}]
+
+
+def _run_login_json(capsys, switcher):
+    import argparse
+    import json
+
+    from claude_swap import cli
+
+    args = argparse.Namespace(email=None, org=None, sso=False, console=False, alias=None)
+    with patch.object(cli.sys, "platform", "linux"):
+        code = cli._login_json(switcher, args)
+    out = capsys.readouterr()
+    return code, [json.loads(line) for line in out.out.splitlines()], out.err
+
+
+def test_login_json_stdout_is_only_events(capsys):
+    code, events, err = _run_login_json(capsys, _StubSwitcher())
+    assert code == 0
+    assert [e["type"] for e in events] == ["login_url", "added"]
+    assert events[1]["account"]["email"] == "new@x.com"
+    assert events[1]["refreshed"] is False and events[1]["keepalive"] is None
+    assert "chatter" in err
+
+
+def test_login_json_failure_is_an_error_event(capsys):
+    from claude_swap.exceptions import WrongAccountError
+
+    code, events, _err = _run_login_json(capsys, _StubSwitcher(fail=WrongAccountError("no")))
+    assert code == 1
+    assert events[-1] == {"type": "error", "harness": "claude", "error": {"type": "wrong_account", "message": "no"}}

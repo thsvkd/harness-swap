@@ -15,7 +15,7 @@ reason the user can read.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Protocol, TextIO, TypeVar, runtime_checkable
 
 from harness_swap.core.errors import UnsupportedOperation
 from harness_swap.core.models import (
@@ -59,11 +59,13 @@ class HarnessAdapter(Protocol):
 class AccountAdder(Protocol):
     def add_account(
         self, *, alias: str | None = None, provider: str | None = None, login: bool = False,
-        email: str | None = None,
+        email: str | None = None, events: TextIO | None = None,
     ) -> Account:
         """Register an account. ``login`` runs the harness's own sign-in first,
         isolated so the current login is never replaced or revoked. ``email``
-        (with ``login``) refuses the sign-in unless it ended on that account."""
+        (with ``login``) refuses the sign-in unless it ended on that account.
+        ``events`` (with ``login``): a device-code sign-in reported as
+        ``infrastructure.login_events`` JSON Lines on that stream."""
         ...
 
 

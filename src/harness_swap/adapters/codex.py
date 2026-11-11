@@ -302,6 +302,7 @@ def latest_rate_limits(home: Path, user_id: str, account_id: str) -> tuple[dict,
 
 
 class CodexAdapter(FileCredentialAdapter):
+    device_login_args = ("login", "--device-auth")
     id = "codex"
     display_name = "Codex CLI"
     providers = ("openai",)

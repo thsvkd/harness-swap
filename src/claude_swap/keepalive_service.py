@@ -22,7 +22,6 @@ import os
 import plistlib
 import sys
 import tempfile
-import urllib.parse
 from pathlib import Path
 
 from claude_swap import launch_agent
@@ -270,10 +269,15 @@ def _read_system() -> dict | None:
     return doc
 
 
+def _proxy_secret(value: str) -> bool:
+    # "@" anywhere: "user:pass@host:port" without a scheme parses with no netloc at all.
+    return "@" in value
+
+
 def _refuse_proxy_secrets() -> None:
     """The daemon plist is world-readable, and build_plist forwards the proxy variables."""
     for key in launch_agent._FORWARDED_ENV_KEYS:
-        if "proxy" in key.lower() and "@" in urllib.parse.urlsplit(os.environ.get(key, "")).netloc:
+        if "proxy" in key.lower() and _proxy_secret(os.environ.get(key, "")):
             raise ClaudeSwitchError(
                 f"{key} holds a user name or password, and the LaunchDaemon's plist is readable "
                 "by every local user; unset it for this install (or use a proxy without one)."
@@ -294,7 +298,9 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
     doc = _read_system()
     path = system_plist_path()
     target = f"{SYSTEM}/{LABEL}"
-    unchanged = doc is not None and _job(doc) == _job(plistlib.loads(plist))
+    stored_env = (doc or {}).get("EnvironmentVariables") or {}
+    holds_secret = any("proxy" in k.lower() and _proxy_secret(str(v)) for k, v in stored_env.items())
+    unchanged = doc is not None and not holds_secret and _job(doc) == _job(plistlib.loads(plist))
     loaded = launch_agent.is_loaded(LABEL, domain=SYSTEM)
     if doc is None and loaded:
         raise ForeignServiceError(f"launchd runs {target} from a plist hswap did not write; left untouched.")

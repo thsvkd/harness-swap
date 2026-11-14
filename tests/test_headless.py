@@ -164,6 +164,57 @@ class TestReconcile:
         assert report["ok"] is True and report["action"] == "refreshed"
         assert [post["refresh_token"] for post in healthy.endpoint.posts] == ["RT-3"]
 
+    def _settle_rt3(self, healthy, capsys):
+        """RT-1 refreshed to RT-3 in the GUI; a person keeps the Keychain's."""
+        rt3 = creds("AT-3", "RT-3", expires_in_s=NEAR)
+        healthy.security.items[ACTIVE_ITEM] = rt3
+        healthy.file.unlink()
+        code, out, err = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--json"], capsys
+        )
+        assert code == 0, out + err
+        return rt3
+
+    def test_a_stale_file_does_not_beat_the_kept_login_back_in_the_item(self, healthy, capsys):
+        # The re-review's scenario: A (live RT-3) writes an MCP secret, recreating the item
+        # and deleting the file; B over SSH with a stale cache writes RT-1 to the file.
+        rt3 = self._settle_rt3(healthy, capsys)
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-3", "RT-3", expires_in_s=NEAR, mcpOAuth={"s": {}})
+        healthy.write_file(healthy.login)
+        report = _reconcile()
+        assert report["ok"] is True and report["kept"] == "keychain", report
+        assert oauth.credential_fingerprint(healthy.file.read_text()) == oauth.credential_fingerprint(rt3)
+        assert oauth.credential_fingerprint(healthy.read_enc(SLOT_1)) == oauth.credential_fingerprint(rt3)
+        healthy.keepalive()
+        assert [post["refresh_token"] for post in healthy.endpoint.posts] == ["RT-3"]
+
+    def test_two_stale_copies_stay_ambiguous(self, healthy, capsys):
+        # The file went back to the replaced RT-1 and the item holds a token nothing saw:
+        # neither is the login a run kept.
+        self._settle_rt3(healthy, capsys)
+        healthy.write_file(healthy.login)
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-X", "RT-X")
+        before = healthy.snapshot()
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
+        assert healthy.snapshot() == before
+
+    def test_a_write_between_the_decision_and_the_move_stops_it(self, healthy, monkeypatch):
+        from claude_swap import reconcile
+
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=9000)
+        healthy.file.unlink()
+        real = reconcile.choose_kept
+
+        def then_an_mcp_login(*args):
+            verdict = real(*args)
+            healthy.security.items[ACTIVE_ITEM] = creds("AT-1C", "RT-1", expires_in_s=9500)
+            return verdict
+
+        monkeypatch.setattr(reconcile, "choose_kept", then_an_mcp_login)
+        report = _reconcile()
+        assert report["error"]["type"] == "keychain_item_changed"
+        assert not healthy.file.exists() and healthy.read_enc(SLOT_1) == healthy.login
+
     def test_with_the_file_gone_a_linked_item_is_kept(self, healthy):
         successor = creds("AT-K", "RT-K")
         ClaudeAccountSwitcher()
@@ -370,20 +421,36 @@ class TestReconcileFailures:
 
 
 class TestBackupCap:
-    def test_each_name_keeps_the_newest_five(self, healthy):
+    def _old(self, healthy, n, value):
+        healthy.security.items[("claude-swap", f"claude-code-credentials.backup-2026010{n}T000000Z")] = value
+
+    def test_redundant_copies_past_five_go(self, healthy):
         from claude_swap import migrate_store
 
+        kept = creds("AT-1B", "RT-1", expires_in_s=9000)
         for n in range(7):
-            healthy.security.items[("claude-swap", f"claude-code-credentials.backup-2026010{n}T000000Z")] = f"v{n}"
+            self._old(healthy, n, creds(f"AT-1-{n}", "RT-1"))  # the kept lineage: redundant
         healthy.security.items[("claude-swap", "slot-1-a@example.com.backup-20260101T000000Z")] = "s"
-        healthy.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=9000)
+        healthy.security.items[ACTIVE_ITEM] = kept
         report = _reconcile()
         assert report["ok"] is True
-        names = sorted(a for (svc, a) in healthy.security.items if a.startswith("claude-code-credentials.backup-"))
+        names = [a for (_, a) in healthy.security.items if a.startswith("claude-code-credentials.backup-")]
         assert len(names) == migrate_store.BACKUPS_KEPT == 5
         assert set(report["backups"]) <= set(names)  # this run's survive
         assert "claude-code-credentials.backup-20260100T000000Z" in report["backupsPruned"]
         assert ("claude-swap", "slot-1-a@example.com.backup-20260101T000000Z") in healthy.security.items
+
+    def test_a_copy_that_may_be_the_only_live_token_stays(self, healthy):
+        for n in range(7):
+            self._old(healthy, n, creds(f"AT-L{n}", f"RT-L{n}"))  # other lineages, maybe live
+        ClaudeAccountSwitcher()
+        consumed_grants.reserve(oauth.credential_fingerprint(creds("x", "RT-L0")), ("a@example.com", ""))
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=9000)
+        report = _reconcile()
+        assert report["ok"] is True
+        assert report["backupsPruned"] == ["claude-code-credentials.backup-20260100T000000Z"]  # spent
+        for n in range(1, 7):
+            assert ("claude-swap", f"claude-code-credentials.backup-2026010{n}T000000Z") in healthy.security.items
 
 
 class TestDoctor:
@@ -654,6 +721,22 @@ class TestKeepaliveDaemon:
             self._install(macos_services, calls)
         doc = plistlib.loads(ks.system_plist_path().read_bytes())
         assert doc["EnvironmentVariables"]["HTTPS_PROXY"] == "http://proxy.example:3128"
+
+    @pytest.mark.parametrize("value", ["user:secret@proxy.example:3128", "http://user@proxy.example:3128"])
+    def test_a_proxy_user_without_a_scheme_is_caught_too(self, macos_services, monkeypatch, value):
+        monkeypatch.setenv("https_proxy", value)
+        with _launchctl([]), pytest.raises(ClaudeSwitchError, match="password"):
+            self._install(macos_services, [])
+
+    def test_a_plist_holding_a_proxy_password_is_rewritten(self, macos_services, monkeypatch):
+        with _launchctl([]):
+            self._install(macos_services, [])
+        doc = plistlib.loads(ks.system_plist_path().read_bytes())
+        doc["EnvironmentVariables"]["HTTPS_PROXY"] = "http://u:p@proxy.example:1"  # a 0.3.0 install
+        ks.system_plist_path().write_bytes(plistlib.dumps(doc))
+        with _launchctl([], loaded=True):
+            assert self._install(macos_services, [])["action"] == "updated"
+        assert "HTTPS_PROXY" not in plistlib.loads(ks.system_plist_path().read_bytes())["EnvironmentVariables"]
 
     def test_a_failed_bootstrap_removes_the_new_plist(self, macos_services):
         calls = []

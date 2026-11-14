@@ -232,28 +232,43 @@ def _slot_plan(switcher, active, kept: str) -> list[tuple[str, str, str, list[st
     return plan
 
 
-def seen_logins(switcher) -> dict:
-    """Fingerprints of every login migrate-store and reconcile read, wrote or backed up,
-    and when. Unreadable reads as empty: the evidence it gives is then missing, not wrong."""
+def settled_logins(switcher) -> dict:
+    """``{fingerprint: "kept" | "replaced"}``: the role the last migrate-store or reconcile
+    run that touched a login gave it. Unreadable reads as empty: the evidence is then
+    missing, not wrong."""
     try:
         data = json.loads((switcher.backup_dir / "cache" / SEEN_FILENAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _remember(switcher, values) -> None:
-    now = time.time()
-    seen = {
-        fp: at
-        for fp, at in seen_logins(switcher).items()
-        if isinstance(at, (int, float)) and now - at < _SEEN_RETENTION_S
+    if not isinstance(data, dict):
+        return {}
+    return {
+        fp: row["role"]
+        for fp, row in data.items()
+        if isinstance(row, dict) and row.get("role") in ("kept", "replaced")
     }
-    for value in values:
-        if not holds_no_login(value):
-            seen[oauth.credential_fingerprint(value)] = now
+
+
+def _remember(switcher, kept: str, replaced) -> None:
+    path = switcher.backup_dir / "cache" / SEEN_FILENAME
+    now = time.time()
     try:
-        atomic_write_json(switcher.backup_dir / "cache" / SEEN_FILENAME, seen)
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        rows = {}
+    rows = {
+        fp: row
+        for fp, row in (rows.items() if isinstance(rows, dict) else ())
+        if isinstance(row, dict) and isinstance(row.get("at"), (int, float))
+        and now - row["at"] < _SEEN_RETENTION_S
+    }
+    kept_fp = oauth.credential_fingerprint(kept)
+    for value in replaced:
+        if not holds_no_login(value) and oauth.credential_fingerprint(value) != kept_fp:
+            rows[oauth.credential_fingerprint(value)] = {"at": now, "role": "replaced"}
+    rows[kept_fp] = {"at": now, "role": "kept"}  # last: a login kept again is no longer replaced
+    try:
+        atomic_write_json(path, rows)
     except OSError as e:
         _logger.warning("could not write %s: %s", SEEN_FILENAME, type(e).__name__)
 
@@ -263,9 +278,19 @@ def _backup_order(account: str) -> tuple:
     return stamp, int(attempt) if attempt.isdigit() else 0
 
 
-def _prune_backups(report: dict) -> None:
-    """Keep the newest BACKUPS_KEPT per backup name, and every one this run made. Best
-    effort: the move is done, and a backup left behind is kept, not lost."""
+def _expendable(value: str | None, kept: str) -> bool:
+    """A backup that cannot be the only copy of a live login: the kept lineage, now in the
+    file and the `.enc`, or a token the ledger lists. Anything else may be the login that
+    lost a wrong choice, so it stays past the cap."""
+    if value is None:
+        return False
+    fingerprint = oauth.credential_fingerprint(value)
+    return fingerprint == oauth.credential_fingerprint(kept) or consumed_grants.entry(fingerprint) is not None
+
+
+def _prune_backups(report: dict, kept: str) -> None:
+    """Past the newest BACKUPS_KEPT per backup name, delete what is expendable. Never one
+    this run made. Best effort: the move is done, and a backup left behind is kept, not lost."""
     bases = {name.rsplit(".backup-", 1)[0] for name in report["backups"]}
     try:
         accounts = [
@@ -278,15 +303,18 @@ def _prune_backups(report: dict) -> None:
             for account in ours[:-BACKUPS_KEPT]:
                 if account in report["backups"]:
                     continue
-                if macos_keychain.get_password(SECURITY_SERVICE, account) is not None:
+                if _expendable(macos_keychain.get_password(SECURITY_SERVICE, account), kept):
                     macos_keychain.delete_password(SECURITY_SERVICE, account)
                     report["backupsPruned"].append(account)
-    except (*macos_keychain.KEYCHAIN_ERRORS, ValueError) as e:
+    except (*macos_keychain.KEYCHAIN_ERRORS, ValueError, consumed_grants.LedgerUnreadable) as e:
         _logger.warning("could not prune Keychain backups: %s", type(e).__name__)
 
 
-def _migrate(switcher, report: dict, keep: str, dry_run: bool, kept: str | None = None) -> None:
-    """``kept``: the login to keep when it is in neither store (reconcile's slot copy)."""
+def _migrate(
+    switcher, report: dict, keep: str, dry_run: bool, kept: str | None = None, judged=None
+) -> None:
+    """``kept``: the login to keep when it is in neither store (reconcile's slot copy).
+    ``judged``: the (Keychain item, file) the caller decided on; anything else stops."""
     path = get_credentials_path()
     try:
         file_creds = path.read_text(encoding="utf-8")
@@ -296,6 +324,8 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool, kept: str | None 
     keychain_creds = items.get(
         (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()), ""
     )
+    if judged is not None and (keychain_creds, file_creds if file_creds.strip() else "") != judged:
+        raise _Stop("keychain_item_changed", _ITEM_CHANGED)  # an unlocked write landed
     report["fileFingerprint"] = _refresh_fingerprint(file_creds)
     report["keychainFingerprint"] = _refresh_fingerprint(keychain_creds)
     # Before any refusal below, since the choice of --keep is what this warns about.
@@ -354,8 +384,8 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool, kept: str | None 
     if not report["itemAbsent"]:
         raise _Stop("keychain_item_present")
     set_setting(switcher.backup_dir, "credentials.store", "file")
-    _remember(switcher, [kept, file_creds, *items.values(), *(c for *_, r in plan for c in r)])
-    _prune_backups(report)
+    _remember(switcher, kept, [file_creds, *items.values(), *(c for *_, r in plan for c in r)])
+    _prune_backups(report, kept)
 
 
 def _restore_is_safe(switcher, active, value: str) -> bool:

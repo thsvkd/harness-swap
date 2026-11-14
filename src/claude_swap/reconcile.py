@@ -8,9 +8,9 @@ item, and the file is deleted when the item was new. In file mode that stops eve
 This is ``migrate-store`` with the ``--keep`` choice made from evidence instead of a person.
 The item is compared with the file, or with the active slot's copy when Claude Code deleted
 the file. The later login is: the later generation of one lineage, the one a recorded link
-or the ledger says came after the other, or the store's when the item holds a login that
-migrate-store or reconcile already settled (``seen_logins.json``), since a stale cache put
-it back. A login nothing here has seen proves nothing: a stale writer can hold one too.
+or the ledger says came after the other, or, of two logins an earlier migrate-store or reconcile run
+settled against each other (``seen_logins.json``), the one it kept: the other came back
+from a stale cache. A login nothing here has seen proves nothing: a stale writer can hold one too.
 Anything else is ``reconcile_ambiguous``, nothing changes, and a person settles it with
 ``migrate-store --keep``. That includes the usual case, a GUI refresh: nothing records
 that the item's token came from the file's.
@@ -36,7 +36,7 @@ from claude_swap.migrate_store import (
     _migrate,
     _preflight,
     _report_failure,
-    seen_logins,
+    settled_logins,
 )
 from claude_swap.settings import atomic_write_json
 from claude_swap.paths import get_credentials_path
@@ -84,10 +84,15 @@ def _newer(switcher, active, item: str, rival: str) -> str | None:
     item_wins, rival_wins = came_after(item_fp, rival_fp), came_after(rival_fp, item_fp)
     if item_wins != rival_wins:
         return "item" if item_wins else "rival"
-    # A login this command already settled, now back in the item while the store moved on:
-    # a stale writer put it there.
-    if not item_wins and item_fp in seen_logins(switcher):
-        return "rival"
+    # A run settled these two against each other before: the one it replaced came back
+    # from a stale cache. Both roles must match; a copy only touched proves nothing.
+    if not item_wins:
+        roles = settled_logins(switcher)
+        pair = (roles.get(item_fp), roles.get(rival_fp))
+        if pair == ("replaced", "kept"):
+            return "rival"
+        if pair == ("kept", "replaced"):
+            return "item"
     return None
 
 
@@ -150,9 +155,11 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
             keychain = items.get(
                 (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()), ""
             )
-            keep, kept = choose_kept(switcher, keychain, _file_text())
+            file_creds = _file_text()
+            keep, kept = choose_kept(switcher, keychain, file_creds)
             report["kept"] = keep
-            _migrate(switcher, report, "file" if keep == "slot" else keep, dry_run, kept)
+            store_keep = "file" if keep == "slot" else keep
+            _migrate(switcher, report, store_keep, dry_run, kept, judged=(keychain, file_creds))
         report["action"] = "planned" if dry_run else "reconciled"
 
     _report_failure(report, work)

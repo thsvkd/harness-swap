@@ -53,8 +53,9 @@ Details in [claude.md](claude.md#running-without-a-login-session-file-store).
   `security -i` on stdin, never argv; reports carry 6-hex fingerprints, never tokens.
   It never treats a login it has not seen as the newer one (a stale Claude Code can
   write such a token), and with nothing to prove which copy is newer it changes
-  nothing. It re-reads each item right before deleting it, and keeps the newest 5
-  backups per name.
+  nothing. It re-reads each item right before deleting it. Past the newest 5
+  backups per name it deletes only copies of the kept lineage or of tokens the
+  ledger lists, so a backup that may be the last live copy is never pruned.
 - `doctor` is read-only and asks the keychain by attributes only.
 - `keepalive --install-service --system` runs `sudo` for the root steps only; hswap
   itself refuses to run as root. The daemon plist is world-readable (launchd's

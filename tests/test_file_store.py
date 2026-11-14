@@ -222,6 +222,11 @@ def run_cli(argv, capsys):
     return code, out, err
 
 
+# migrate-store also installs LaunchAgents (test_headless covers that); these tests are about
+# the move, and with the agents only written, not loaded, it would exit 3.
+NO_SERVICES = ["--no-reconcile", "--no-keepalive"]
+
+
 def json_error_type(out):
     return json.loads(out)["error"]["type"]
 
@@ -1212,7 +1217,9 @@ class TestMigrateStore:
         assert len(backups(split)) + len(backups(split, "slot-")) == count
 
     def test_no_token_in_any_output_or_log(self, split, capsys):
-        code, out, err = run_cli(["migrate-store", "--to", "file", "--keep", "keychain", "--json"], capsys)
+        code, out, err = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "keychain", *NO_SERVICES, "--json"], capsys
+        )
         assert code == 0
         report = json.loads(out)
         assert report["ok"] is True
@@ -1245,7 +1252,9 @@ class TestMigrateStore:
 
     @pytest.mark.parametrize("flags", [["--dry-run"], []], ids=["dry-run", "real"])
     def test_differing_stores_are_reported_with_both_fingerprints(self, split, capsys, flags):
-        code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file", *flags, "--json"], capsys)
+        code, out, _ = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "file", *flags, *NO_SERVICES, "--json"], capsys
+        )
         assert code == 0
         report = json.loads(out)
         assert report["storesDiffer"] is True

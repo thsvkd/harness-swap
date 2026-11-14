@@ -60,6 +60,30 @@ _LOCKED_MESSAGE = (
 )
 
 
+_HINT_RUNNING = (
+    "Nothing records who refreshed. The keepalive service was running, so the server most "
+    "likely revoked the access token early (401) and Claude Code refreshed it itself."
+)
+_HINT_STOPPED = (
+    "Nothing records who refreshed. The keepalive service was not running, so Claude Code "
+    "refreshed on its own: start it with hswap claude keepalive --install-service [--system]."
+)
+_HINT_FIX = " Keep the newer login with hswap claude migrate-store --to file --keep keychain."
+
+
+def _ambiguity_hint() -> str:
+    """Why nothing could tell, as far as this machine can see. A jarvis tick running
+    keepalive instead of the service reads as "not running"."""
+    from claude_swap import keepalive_service
+
+    try:
+        status = keepalive_service.status()
+        running = bool(status.get("managed") and status.get("loaded"))
+    except Exception:  # noqa: BLE001 - a hint must not fail the report
+        running = False
+    return (_HINT_RUNNING if running else _HINT_STOPPED) + _HINT_FIX
+
+
 def _file_text() -> str:
     try:
         text = get_credentials_path().read_text(encoding="utf-8")
@@ -134,6 +158,7 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
         "warning": None,
         "error": None,
         "backupsPruned": [],
+        "hint": None,
     }
     if dry_run:
         report["dryRun"] = True
@@ -163,6 +188,8 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
         report["action"] = "planned" if dry_run else "reconciled"
 
     _report_failure(report, work)
+    if report["error"] and report["error"]["type"] == AMBIGUOUS:
+        report["hint"] = _ambiguity_hint()
     if not dry_run:
         try:  # doctor reads it; no token in it
             atomic_write_json(switcher.backup_dir / "cache" / REPORT_FILENAME, report)

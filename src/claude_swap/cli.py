@@ -1051,7 +1051,8 @@ def _migrate_store_command(argv: list[str]) -> None:
             "file, back up every Claude Code Keychain item inside the login keychain, and "
             "delete the originals. Needs the login keychain readable, so run it from the GUI "
             "session or after `security unlock-keychain` in the same shell. macOS only. "
-            "Exit code 0 when ok, 1 otherwise."
+            "Exit code 0 when ok, 1 otherwise, 3 when moved but a LaunchAgent it installed "
+            "loads only at the next login."
         ),
     )
     parser.add_argument("--to", choices=("file",), help="The store to move to")
@@ -1073,6 +1074,11 @@ def _migrate_store_command(argv: list[str]) -> None:
         action="store_true",
         help="Do not install the reconcile LaunchAgent after the move (installed by default)",
     )
+    parser.add_argument(
+        "--no-keepalive",
+        action="store_true",
+        help="Do not install the keepalive LaunchAgent after the move (installed when no keepalive job exists)",
+    )
     parser.add_argument("--json", action="store_true", help="Print the report as JSON on stdout")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
@@ -1089,7 +1095,9 @@ def _migrate_store_command(argv: list[str]) -> None:
             print(text)
         else:
             error(f"Error: {report['error']['message']}")
-        sys.exit(0 if report["ok"] else 1)
+        services = (report.get("reconcileService"), report.get("keepaliveService"))
+        deferred = any(service and service.get("action") == "deferred" for service in services)
+        sys.exit((3 if deferred else 0) if report["ok"] else 1)
 
     if Platform.detect() != Platform.MACOS:
         finish(
@@ -1117,9 +1125,11 @@ def _migrate_store_command(argv: list[str]) -> None:
             "run now: config unset credentials.store, and reconcile --uninstall-service",
         )
     report = run_migrate_store(switcher, args.keep, dry_run=args.dry_run)
-    report["reconcileService"] = None
+    report["reconcileService"] = report["keepaliveService"] = None
     if report["ok"] and not args.dry_run and not args.no_reconcile:
         report["reconcileService"] = _install_reconcile_service()
+    if report["ok"] and not args.dry_run and not args.no_keepalive:
+        report["keepaliveService"] = _install_keepalive_service()
     report["doctor"] = doctor.summary(switcher)
     if report["storesDiffer"] and not args.json:
         warning(
@@ -1132,12 +1142,39 @@ def _migrate_store_command(argv: list[str]) -> None:
     lines = [f"Migrated: the {args.keep} login is kept and credentials.store is file."]
     if service:
         lines.append(f"Reconcile service: {service.get('action') or service['error']['message']}")
+    keepalive = report["keepaliveService"]
+    if keepalive:
+        lines.append(f"Keepalive service: {keepalive.get('action') or keepalive['error']['message']}")
+    if not keepalive or keepalive.get("domain") != "system":
+        lines.append(
+            "With no one logged in, keepalive needs the LaunchDaemon instead: "
+            "hswap claude keepalive --install-service --system (asks for sudo)."
+        )
     checked = report["doctor"]
     if checked["ok"] is None:
         lines.append(f"Doctor: {checked['error']['message']}")
     else:
         lines.append("Doctor: ok" if checked["ok"] else f"Doctor: {', '.join(checked['problems'])}")
     finish(report, "\n".join(lines))
+
+
+def _install_keepalive_service() -> dict:
+    """The gui agent, unless a keepalive job (gui, system or someone else's) exists. With it
+    running, Claude Code finds a fresh token in the file and never refreshes on its own."""
+    from claude_swap import keepalive_service
+    from claude_swap.keepalive import DEFAULT_AHEAD_S
+
+    try:
+        status = keepalive_service.status()
+        if status["installed"]:
+            return {"action": "present", "domain": status["domain"], "loaded": status["loaded"]}
+        result = keepalive_service.install(ahead=DEFAULT_AHEAD_S, then_auto=False)
+    except ClaudeSwitchError as e:
+        return {"action": None, "error": error_envelope(e)["error"]}
+    return {
+        "action": result["action"], "domain": result["domain"],
+        "loaded": result["loaded"], "plist": result["plist"],
+    }
 
 
 def _install_reconcile_service() -> dict:

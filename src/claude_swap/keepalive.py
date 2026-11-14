@@ -56,6 +56,11 @@ from claude_swap.settings import atomic_write_json
 from claude_swap.usage_store import PERMANENT_AUTH_ERRORS, FetchRecord
 
 DEFAULT_AHEAD_S = 3600.0
+# Claude Code 2.1.325 refreshes only when the stored token is this close to its expiry,
+# re-reading storage first: `$O(e,n=Date.now()){if(e===null)return!1;return n+300000>=e}`.
+# With keepalive_service.INTERVAL_S between runs, DEFAULT_AHEAD_S keeps the file's token
+# outside it, so Claude Code takes the fresh token and never refreshes on its own.
+CLAUDE_CODE_REFRESH_WINDOW_S = 300
 REPORT_FILENAME = "keepalive.json"
 # Same bound as `_fetch_active_usage`: the POST runs under locks a concurrent
 # switch waits on for 10 s.

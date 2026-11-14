@@ -37,12 +37,14 @@ def _backup_count() -> int | None:
         return None
 
 
-def _last_reconcile_error(switcher) -> str | None:
+def _last_reconcile(switcher) -> tuple[str | None, str | None]:
+    """(error type, hint) of the last reconcile run."""
     try:
         last = json.loads((switcher.backup_dir / "cache" / reconcile.REPORT_FILENAME).read_text(encoding="utf-8"))
-        return (last.get("error") or {}).get("type")
+        hint = last.get("hint")
+        return (last.get("error") or {}).get("type"), hint if isinstance(hint, str) else None
     except (OSError, ValueError, AttributeError):
-        return None
+        return None, None
 
 
 def run_doctor(switcher) -> dict:
@@ -66,6 +68,7 @@ def run_doctor(switcher) -> dict:
     except FileNotFoundError:
         sessions = []
 
+    last_error, last_hint = _last_reconcile(switcher)
     report = {
         "schemaVersion": SCHEMA_VERSION,
         "ok": False,
@@ -80,7 +83,8 @@ def run_doctor(switcher) -> dict:
         "reconcileService": None,
         "keepaliveService": None,
         "keychainBackups": None,
-        "lastReconcileError": _last_reconcile_error(switcher),
+        "lastReconcileError": last_error,
+        "lastReconcileHint": last_hint,
     }
     problems = report["problems"]
     if macos:
@@ -109,6 +113,10 @@ def run_doctor(switcher) -> dict:
             problems.append("profile_env")
         if not report["reconcileService"]["managed"]:
             problems.append("reconcile_service_missing")
+        # Either domain will do; a scheduler hswap cannot see (a jarvis tick) is not counted.
+        keepalive = report["keepaliveService"]
+        if not (keepalive["managed"] and keepalive["loaded"]):
+            problems.append("keepalive_service_missing")
     report["ok"] = not problems
     return report
 

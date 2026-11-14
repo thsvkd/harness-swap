@@ -144,7 +144,7 @@ class TestReconcile:
         assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
         # A person settles it; RT-3 is now in the file and the `.enc`.
         code, out, err = run_cli(
-            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--json"], capsys
+            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--no-keepalive", "--json"], capsys
         )
         assert code == 0, out + err
         assert healthy.file.read_text() == rt3 and healthy.read_enc(SLOT_1) == rt3
@@ -170,7 +170,7 @@ class TestReconcile:
         healthy.security.items[ACTIVE_ITEM] = rt3
         healthy.file.unlink()
         code, out, err = run_cli(
-            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--json"], capsys
+            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--no-keepalive", "--json"], capsys
         )
         assert code == 0, out + err
         return rt3
@@ -453,9 +453,17 @@ class TestBackupCap:
             assert ("claude-swap", f"claude-code-credentials.backup-2026010{n}T000000Z") in healthy.security.items
 
 
+RUNNING = {
+    "domain": "system", "installed": True, "managed": True, "loaded": True,
+    "outdated": False, "lastExitCode": 0,
+}
+_REAL_KS_STATUS = ks.status
+
+
 class TestDoctor:
     @pytest.fixture(autouse=True)
-    def _darwin(self, darwin):
+    def _darwin(self, darwin, monkeypatch):
+        monkeypatch.setattr(ks, "status", lambda *a, **k: dict(RUNNING))  # keepalive runs
         yield
 
     def _ready(self, env):
@@ -470,6 +478,7 @@ class TestDoctor:
             "schemaVersion", "ok", "problems", "store", "keychainItemPresent", "keychainLocked",
             "fileExists", "fileMode", "slotsWithoutBackup", "sessionDirs",
             "reconcileService", "keepaliveService", "keychainBackups", "lastReconcileError",
+            "lastReconcileHint",
         }
         assert report["keychainBackups"] == 0 and report["lastReconcileError"] is None
         assert report["schemaVersion"] == 1
@@ -481,8 +490,57 @@ class TestDoctor:
         assert report["slotsWithoutBackup"] == [] and report["sessionDirs"] == []
         assert report["reconcileService"]["installed"] is True
         assert report["reconcileService"]["managed"] is True
-        assert report["keepaliveService"]["installed"] is False
+        assert report["keepaliveService"]["domain"] == "system"
+        assert report["keepaliveService"]["loaded"] is True
+        assert report["lastReconcileHint"] is None
         assert daemon.security.non_guard_calls() == []
+
+    def test_keepalive_service_missing_with_no_job(self, healthy, monkeypatch):
+        self._ready(healthy)
+        monkeypatch.setattr(ks, "status", _REAL_KS_STATUS)
+        assert self._problems(healthy) == ["keepalive_service_missing"]
+
+    def test_keepalive_service_missing_while_the_agent_waits_for_a_login(self, healthy, monkeypatch):
+        self._ready(healthy)
+        monkeypatch.setattr(ks, "status", _REAL_KS_STATUS)
+        assert ks.install(3600, False, program=PROGRAM)["action"] == "deferred"
+        report = run_doctor(ClaudeAccountSwitcher())
+        assert report["problems"] == ["keepalive_service_missing"]
+        assert report["keepaliveService"]["installed"] is True
+        assert report["keepaliveService"]["loaded"] is False
+
+    @pytest.mark.parametrize("domain", ["gui", "system"])
+    def test_either_loaded_job_is_enough(self, healthy, monkeypatch, domain):
+        self._ready(healthy)
+        monkeypatch.setattr(ks, "status", lambda *a, **k: {**RUNNING, "domain": domain})
+        assert self._problems(healthy) == []
+
+    def test_a_foreign_job_does_not_count(self, healthy, monkeypatch):
+        self._ready(healthy)
+        monkeypatch.setattr(ks, "status", lambda *a, **k: {**RUNNING, "managed": False})
+        assert self._problems(healthy) == ["keepalive_service_missing"]
+
+    def test_outside_the_file_store_keepalive_is_not_asked_for(self, env, monkeypatch):
+        monkeypatch.setattr(ks, "status", _REAL_KS_STATUS)
+        env.write_file(creds())
+        assert self._problems(env) == ["not_file_store"]
+
+    @pytest.mark.parametrize("running", [True, False])
+    def test_an_ambiguous_reconcile_leaves_a_hint(self, healthy, monkeypatch, running):
+        self._ready(healthy)
+        if not running:
+            monkeypatch.setattr(ks, "status", _REAL_KS_STATUS)
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        report = _reconcile()
+        assert report["error"]["type"] == "reconcile_ambiguous"
+        hint = report["hint"]
+        assert "migrate-store --to file --keep keychain" in hint
+        assert ("401" in hint) if running else ("was not running" in hint)
+        doctor_report = run_doctor(ClaudeAccountSwitcher())
+        assert doctor_report["lastReconcileHint"] == hint
+        assert doctor_report["lastReconcileError"] == "reconcile_ambiguous"
+        for token in TOKENS:
+            assert token not in hint
 
     def test_it_is_read_only(self, daemon):
         self._ready(daemon)
@@ -799,23 +857,50 @@ class TestKeepaliveDaemon:
 
 
 class TestMigrateStoreWithReconcile:
-    def test_default_installs_the_reconcile_service_and_reports_doctor(self, split, capsys, darwin):
+    def test_default_installs_both_services_and_reports_doctor(self, split, capsys, darwin):
         code, out, err = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--json"], capsys)
         report = json.loads(out)
-        assert code == 0, err
+        assert code == 3, err  # migrated; the agents load at the next login
         assert report["ok"] is True
         assert report["reconcileService"]["action"] == "deferred"
+        assert report["keepaliveService"]["action"] == "deferred"
+        assert report["keepaliveService"]["domain"] == "gui"
         assert launch_agent.plist_path(rs.LABEL).exists()
-        assert report["doctor"]["ok"] is True and report["doctor"]["problems"] == []
+        assert launch_agent.plist_path(ks.LABEL).exists()
+        # Written but not loaded: no GUI session here.
+        assert report["doctor"]["problems"] == ["keepalive_service_missing"]
+
+    def test_an_existing_keepalive_job_is_left_as_it_is(self, split, capsys, darwin, monkeypatch):
+        monkeypatch.setattr(ks, "status", lambda *a, **k: dict(RUNNING))
+        code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--json"], capsys)
+        report = json.loads(out)
+        assert report["keepaliveService"] == {"action": "present", "domain": "system", "loaded": True}
+        assert not launch_agent.plist_path(ks.LABEL).exists()
+
+    def test_no_keepalive_installs_no_keepalive(self, split, capsys, darwin):
+        code, out, _ = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "file", "--no-keepalive", "--no-reconcile", "--json"],
+            capsys,
+        )
+        report = json.loads(out)
+        assert code == 0 and report["keepaliveService"] is None
+        assert not launch_agent.plist_path(ks.LABEL).exists()
+        assert report["doctor"]["problems"] == ["reconcile_service_missing", "keepalive_service_missing"]
+
+    def test_text_output_points_at_the_daemon(self, split, capsys, darwin):
+        code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file"], capsys)
+        assert code == 3
+        assert "keepalive --install-service --system" in out
 
     def test_without_reconcile_installs_nothing(self, split, capsys):
         code, out, _ = run_cli(
-            ["migrate-store", "--to", "file", "--keep", "file", "--no-reconcile", "--json"], capsys
+            ["migrate-store", "--to", "file", "--keep", "file", "--no-reconcile", "--no-keepalive", "--json"],
+            capsys,
         )
         report = json.loads(out)
         assert code == 0 and report["reconcileService"] is None
         assert not launch_agent.plist_path(rs.LABEL).exists()
-        assert report["doctor"]["problems"] == ["reconcile_service_missing"]
+        assert "reconcile_service_missing" in report["doctor"]["problems"]
 
     def test_a_failing_doctor_does_not_hide_a_done_migration(self, split, capsys, monkeypatch):
         from claude_swap import doctor
@@ -824,7 +909,9 @@ class TestMigrateStoreWithReconcile:
             raise PermissionError("denied")
 
         monkeypatch.setattr(doctor, "run_doctor", broken)
-        code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--no-reconcile", "--json"], capsys)
+        code, out, _ = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "file", "--no-reconcile", "--no-keepalive", "--json"], capsys
+        )
         report = json.loads(out)
         assert code == 0 and report["ok"] is True
         assert report["doctor"]["ok"] is None and report["doctor"]["error"]["type"] == "io_error"
@@ -834,5 +921,39 @@ class TestMigrateStoreWithReconcile:
 
     def test_dry_run_installs_nothing(self, split, capsys):
         code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--dry-run", "--json"], capsys)
-        assert code == 0 and json.loads(out)["reconcileService"] is None
+        report = json.loads(out)
+        assert code == 0 and report["reconcileService"] is None and report["keepaliveService"] is None
         assert not launch_agent.plist_path(rs.LABEL).exists()
+        assert not launch_agent.plist_path(ks.LABEL).exists()
+
+
+class TestKeepaliveBeatsClaudeCode:
+    """Claude Code 2.1.325 refreshes only when the stored token is within 5 minutes of its
+    expiry, after re-reading storage (`$O(e,n=Date.now()){...return n+300000>=e}`). A keepalive
+    job that runs every INTERVAL_S and refreshes within DEFAULT_AHEAD_S keeps the file's
+    token out of that window, so Claude Code finds it fresh and never refreshes itself."""
+
+    def test_the_constants_leave_room(self):
+        from claude_swap.keepalive import CLAUDE_CODE_REFRESH_WINDOW_S, DEFAULT_AHEAD_S
+
+        assert CLAUDE_CODE_REFRESH_WINDOW_S == 300
+        # A refresh lands at the first run with less than DEFAULT_AHEAD_S left, at worst
+        # one interval past that line.
+        assert DEFAULT_AHEAD_S - ks.INTERVAL_S > CLAUDE_CODE_REFRESH_WINDOW_S
+        # Room for at least three failed runs (network, a held lock) before Claude Code's window.
+        assert (DEFAULT_AHEAD_S - CLAUDE_CODE_REFRESH_WINDOW_S) // ks.INTERVAL_S >= 3
+
+    def test_a_run_one_interval_late_still_refreshes_outside_the_window(self):
+        from claude_swap.keepalive import CLAUDE_CODE_REFRESH_WINDOW_S, DEFAULT_AHEAD_S, _due
+
+        assert not _due(creds(expires_in_s=DEFAULT_AHEAD_S + 60), DEFAULT_AHEAD_S)
+        late = DEFAULT_AHEAD_S + 60 - ks.INTERVAL_S
+        assert _due(creds(expires_in_s=late), DEFAULT_AHEAD_S)
+        assert late > CLAUDE_CODE_REFRESH_WINDOW_S
+
+    def test_the_installed_job_uses_these_constants(self, tmp_path):
+        from claude_swap.keepalive import DEFAULT_AHEAD_S
+
+        doc = plistlib.loads(ks.build(PROGRAM, DEFAULT_AHEAD_S, False, tmp_path))
+        assert doc["StartInterval"] == ks.INTERVAL_S
+        assert doc["ProgramArguments"][-2:] == ["--ahead", str(int(DEFAULT_AHEAD_S))]

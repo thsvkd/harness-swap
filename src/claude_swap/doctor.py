@@ -91,7 +91,7 @@ def run_doctor(switcher) -> dict:
         report["keychainItemPresent"] = macos_keychain.credential_item_present()
         report["keychainLocked"] = macos_keychain.keychain_reachable(platform="darwin") is not True
         report["reconcileService"] = _service(reconcile_service.status())
-        report["keepaliveService"] = _service(keepalive_service.status(), "domain")
+        report["keepaliveService"] = _service(keepalive_service.status(), "domain", "ahead")
         report["keychainBackups"] = _backup_count()
         if not file_store:
             problems.append("not_file_store")
@@ -117,6 +117,9 @@ def run_doctor(switcher) -> dict:
         keepalive = report["keepaliveService"]
         if not (keepalive["managed"] and keepalive["loaded"]):
             problems.append("keepalive_service_missing")
+        ahead = keepalive["ahead"]
+        if keepalive["managed"] and ahead is not None and ahead <= keepalive_service.MIN_AHEAD_S:
+            problems.append("keepalive_ahead_too_short")
     report["ok"] = not problems
     return report
 

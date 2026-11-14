@@ -29,13 +29,15 @@ from claude_swap.credentials import (
     holds_no_login,
 )
 from claude_swap.exceptions import NotFileStoreError
-from claude_swap.keepalive import _read_active, _read_slot, _Stop
+from claude_swap.keepalive import _expires_at, _read_active, _read_slot, _Stop
 from claude_swap.migrate_store import (
     _all_locks,
     _keychain_items,
     _migrate,
     _preflight,
     _report_failure,
+    _mark_suspect,
+    back_up_once,
     settled_logins,
 )
 from claude_swap.settings import atomic_write_json
@@ -61,17 +63,22 @@ _LOCKED_MESSAGE = (
 
 
 _HINT_RUNNING = (
-    "Nothing records who refreshed. The keepalive service was running, so the server most "
-    "likely revoked the access token early (401) and Claude Code refreshed it itself."
+    "Nothing records which login is newer. The keepalive service was running, so the server "
+    "most likely revoked the access token early (401) and Claude Code refreshed it itself."
 )
 _HINT_STOPPED = (
-    "Nothing records who refreshed. The keepalive service was not running, so Claude Code "
-    "refreshed on its own: start it with hswap claude keepalive --install-service [--system]."
+    "Nothing records which login is newer. The keepalive service was not running, so Claude "
+    "Code may have refreshed on its own: start it with hswap claude keepalive "
+    "--install-service [--system]."
 )
-_HINT_FIX = " Keep the newer login with hswap claude migrate-store --to file --keep keychain."
+_HINT_FIX = (
+    " Check which store was written last and keep it with hswap claude migrate-store --to "
+    "file --keep file|keychain. For reference only, nothing decides by it: the Keychain "
+    "item's access token expires at {item}, the {rival}'s at {other}."
+)
 
 
-def _ambiguity_hint() -> str:
+def _ambiguity_hint(item: str, rival: str, rival_name: str) -> str:
     """Why nothing could tell, as far as this machine can see. A jarvis tick running
     keepalive instead of the service reads as "not running"."""
     from claude_swap import keepalive_service
@@ -81,7 +88,49 @@ def _ambiguity_hint() -> str:
         running = bool(status.get("managed") and status.get("loaded"))
     except Exception:  # noqa: BLE001 - a hint must not fail the report
         running = False
-    return (_HINT_RUNNING if running else _HINT_STOPPED) + _HINT_FIX
+    where = "credentials file" if rival_name == "file" else "active slot's .enc"
+    return (_HINT_RUNNING if running else _HINT_STOPPED) + _HINT_FIX.format(
+        item=oauth.expires_at_iso(_expires_at(item)) or "unknown",
+        rival=where,
+        other=oauth.expires_at_iso(_expires_at(rival)) or "unknown",
+    )
+
+
+class _Ambiguous(_Stop):
+    """Which copies nothing could order, for the hold and the hint."""
+
+    def __init__(self, item: str, rival: str, rival_name: str):
+        super().__init__(AMBIGUOUS, _AMBIGUOUS_MESSAGE)
+        self.item, self.rival, self.rival_name = item, rival, rival_name
+
+
+def _roles(switcher, active) -> dict | None:
+    """The recorded roles, carried to the successors the ledger or the stash links to a
+    kept login (a keepalive refresh) and, overriding that, to a suspect one's."""
+    recorded = settled_logins(switcher)
+    if recorded is None:
+        return None
+    roles = dict(recorded)
+    for wanted in ("kept", "suspect"):
+        for fp, role in recorded.items():
+            if role == wanted:
+                for successor in switcher._recorded_successors(active.identity, active.slot, fp):
+                    if wanted == "suspect" or successor not in recorded:
+                        roles[successor] = wanted
+    return roles
+
+
+def _hold(switcher, report: dict, ambiguous: _Ambiguous) -> None:
+    """Nothing may be decided, but the item may be the only copy of the newest login and a
+    stale writer can overwrite it, and the login a run kept may now be spent: back the
+    item up once, and stop trusting that kept login until a person settles it."""
+    rival_fp = oauth.credential_fingerprint(ambiguous.rival)
+    if rival_fp:
+        _mark_suspect(switcher, rival_fp)
+    try:
+        back_up_once(ambiguous.item, report)
+    except (*macos_keychain.KEYCHAIN_ERRORS, ValueError):
+        pass  # reported as ambiguous either way; the item stays where it is
 
 
 def _file_text() -> str:
@@ -95,8 +144,12 @@ def _file_text() -> str:
 def _newer(switcher, active, item: str, rival: str) -> str | None:
     """``item``, ``rival`` or None: which login came later, on evidence only. Never
     "the one nothing has seen": a Claude Code with a stale cache can write a token
-    hswap never saw, and it is the older one."""
+    hswap never saw, and it is the older one. Nothing either, with the role record
+    unreadable or a suspect on either side: the one it would keep may be spent."""
     item_fp, rival_fp = oauth.credential_fingerprint(item), oauth.credential_fingerprint(rival)
+    roles = _roles(switcher, active)
+    if roles is None or "suspect" in (roles.get(item_fp), roles.get(rival_fp)):
+        return None
     if item_fp == rival_fp:
         return "item" if credential_generation(item) >= credential_generation(rival) else "rival"
 
@@ -111,7 +164,6 @@ def _newer(switcher, active, item: str, rival: str) -> str | None:
     # A run settled these two against each other before: the one it replaced came back
     # from a stale cache. Both roles must match; a copy only touched proves nothing.
     if not item_wins:
-        roles = settled_logins(switcher)
         pair = (roles.get(item_fp), roles.get(rival_fp))
         if pair == ("replaced", "kept"):
             return "rival"
@@ -138,7 +190,7 @@ def choose_kept(switcher, keychain: str, file_creds: str) -> tuple[str, str]:
         return "keychain", keychain
     if verdict == "rival":
         return name, rival
-    raise _Stop(AMBIGUOUS, _AMBIGUOUS_MESSAGE)
+    raise _Ambiguous(keychain, rival, name)
 
 
 def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
@@ -181,15 +233,21 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
                 (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()), ""
             )
             file_creds = _file_text()
-            keep, kept = choose_kept(switcher, keychain, file_creds)
+            try:
+                keep, kept = choose_kept(switcher, keychain, file_creds)
+            except _Ambiguous as ambiguous:
+                report["hint"] = _ambiguity_hint(ambiguous.item, ambiguous.rival, ambiguous.rival_name)
+                if not dry_run:
+                    _hold(switcher, report, ambiguous)
+                raise
             report["kept"] = keep
             store_keep = "file" if keep == "slot" else keep
-            _migrate(switcher, report, store_keep, dry_run, kept, judged=(keychain, file_creds))
+            _migrate(
+                switcher, report, store_keep, dry_run, kept, judged=(keychain, file_creds), settle=False
+            )
         report["action"] = "planned" if dry_run else "reconciled"
 
     _report_failure(report, work)
-    if report["error"] and report["error"]["type"] == AMBIGUOUS:
-        report["hint"] = _ambiguity_hint()
     if not dry_run:
         try:  # doctor reads it; no token in it
             atomic_write_json(switcher.backup_dir / "cache" / REPORT_FILENAME, report)

@@ -69,6 +69,18 @@ def _reconcile(**kwargs):
     return run_reconcile(ClaudeAccountSwitcher(), **kwargs)
 
 
+def _held(env, before):
+    """An ambiguous run: the file, every `.enc` and every Claude Code item as they were;
+    the only additions are `claude-swap` backups and the role record."""
+    after = env.snapshot()
+    ignore = ("seen_logins.json",)
+    files = lambda snap: {k: v for k, v in snap["files"].items() if not k.endswith(ignore)}  # noqa: E731
+    assert files(after) == files(before)
+    added = {k: v for k, v in after["items"].items() if k not in before["items"]}
+    assert all(service == "claude-swap" for service, _ in added)
+    assert {k: v for k, v in after["items"].items() if k in before["items"]} == before["items"]
+
+
 def _no_token_in(env, text):
     logs = "".join(path.read_text(errors="replace") for path in env.home.rglob("*.log"))
     for token in TOKENS:
@@ -131,8 +143,7 @@ class TestReconcile:
         before = healthy.snapshot()
         report = _reconcile()
         assert report["error"]["type"] == "reconcile_ambiguous" and report["kept"] is None
-        assert healthy.snapshot() == before
-        assert healthy.security.deleted == [] and healthy.security.stdin == []
+        _held(healthy, before)
 
     @pytest.mark.parametrize("file_left", [False, True])
     def test_a_stale_rewrite_after_a_settled_refresh_does_not_win(self, healthy, capsys, file_left):
@@ -196,7 +207,77 @@ class TestReconcile:
         healthy.security.items[ACTIVE_ITEM] = creds("AT-X", "RT-X")
         before = healthy.snapshot()
         assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
-        assert healthy.snapshot() == before
+        _held(healthy, before)
+
+    def _gui_refresh(self, healthy, refresh="RT-4"):
+        """GUI Claude Code refreshes the kept login in the Keychain and deletes the file."""
+        item = creds("AT-" + refresh[3:], refresh, expires_in_s=NEAR)
+        healthy.security.items[ACTIVE_ITEM] = item
+        healthy.file.unlink()
+        report = _reconcile()
+        assert report["error"]["type"] == "reconcile_ambiguous"
+        return item
+
+    def test_an_ambiguous_run_backs_the_item_up_once(self, healthy):
+        item = self._gui_refresh(healthy)
+        assert list(backups(healthy).values()) == [item]
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"  # its own write woke it
+        assert list(backups(healthy).values()) == [item]
+
+    @pytest.mark.parametrize("stale", ["replaced", "kept"])
+    def test_a_kept_login_an_unexplained_refresh_spent_is_never_kept_again(self, healthy, capsys, stale):
+        # K (RT-3) is kept; GUI A refreshes it to K' (RT-4): ambiguous, so RT-3 may be spent.
+        # Then B, with a stale cache, writes R (RT-1, replaced) or K itself over the item.
+        rt3 = self._settle_rt3(healthy, capsys)
+        k_prime = self._gui_refresh(healthy)
+        assert k_prime in backups(healthy).values()  # the live login survives the overwrite
+        healthy.security.items[ACTIVE_ITEM] = (
+            healthy.login if stale == "replaced" else creds("AT-3B", "RT-3", expires_in_s=NEAR + 60)
+        )
+        before = healthy.snapshot()
+        report = _reconcile()
+        assert report["error"]["type"] == "reconcile_ambiguous", report
+        _held(healthy, before)
+        assert healthy.read_enc(SLOT_1) == rt3 and not healthy.file.exists()
+        assert healthy.keepalive()["ok"] is False and healthy.endpoint.posts == []
+
+    def test_a_person_settling_it_lifts_the_mark(self, healthy, capsys):
+        from claude_swap.migrate_store import settled_logins
+
+        self._settle_rt3(healthy, capsys)
+        k_prime = self._gui_refresh(healthy)
+        roles = settled_logins(ClaudeAccountSwitcher())
+        assert roles[oauth.credential_fingerprint(creds("x", "RT-3"))] == "suspect"
+        code, out, err = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--no-keepalive", "--json"], capsys
+        )
+        assert code == 0, out + err
+        roles = settled_logins(ClaudeAccountSwitcher())
+        assert "suspect" not in roles.values()
+        assert roles[oauth.credential_fingerprint(k_prime)] == "kept"
+
+    def test_keepalive_successors_of_a_kept_login_count_as_kept(self, healthy, capsys):
+        # K (RT-3) kept, then keepalive refreshed it to RT-NEW (the ledger links them).
+        self._settle_rt3(healthy, capsys)
+        assert healthy.keepalive()["action"] == "refreshed"
+        successor = healthy.file.read_text()
+        assert oauth.extract_oauth_data(successor)["refreshToken"] == "RT-NEW"
+        # B, stale, writes the replaced RT-1 back and deletes the file.
+        healthy.security.items[ACTIVE_ITEM] = healthy.login
+        healthy.file.unlink()
+        report = _reconcile()
+        assert report["ok"] is True and report["kept"] == "slot", report
+        assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-NEW"
+
+    def test_a_suspect_mark_follows_keepalive_successors(self, healthy, capsys):
+        from claude_swap.migrate_store import _mark_suspect
+
+        self._settle_rt3(healthy, capsys)
+        assert healthy.keepalive()["action"] == "refreshed"
+        _mark_suspect(ClaudeAccountSwitcher(), oauth.credential_fingerprint(creds("x", "RT-3")))
+        healthy.security.items[ACTIVE_ITEM] = healthy.login
+        healthy.file.unlink()
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
 
     def test_a_write_between_the_decision_and_the_move_stops_it(self, healthy, monkeypatch):
         from claude_swap import reconcile
@@ -291,7 +372,7 @@ class TestReconcile:
             healthy.security.items[ACTIVE_ITEM] = healthy.login
         before = healthy.snapshot()
         assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
-        assert healthy.snapshot() == before
+        _held(healthy, before)
 
     def test_two_unseen_logins_are_ambiguous_and_change_nothing(self, healthy, capsys):
         healthy.write_file(creds("AT-N", "RT-N"))
@@ -302,8 +383,7 @@ class TestReconcile:
         assert code == 4
         assert report["ok"] is False and report["error"]["type"] == "reconcile_ambiguous"
         assert report["kept"] is None
-        assert healthy.snapshot() == before
-        assert healthy.security.deleted == [] and healthy.security.stdin == []
+        _held(healthy, before)
         _no_token_in(healthy, out + err)
 
     def test_a_locked_keychain_is_reported_and_left_alone(self, daemon, capsys):
@@ -420,6 +500,71 @@ class TestReconcileFailures:
         assert moved.file.read_text() == newer
 
 
+class TestSeenLogins:
+    def _path(self, env):
+        return env.root / "cache" / "seen_logins.json"
+
+    def _same_lineage(self, env):
+        env.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=9000)
+        env.file.unlink()
+
+    def test_a_corrupt_record_fails_closed_and_is_left_for_a_person(self, healthy, capsys):
+        self._path(healthy).parent.mkdir(parents=True, exist_ok=True)
+        self._path(healthy).write_text("{nope")
+        self._same_lineage(healthy)  # would be settled with a readable record
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
+        assert self._path(healthy).read_text() == "{nope"
+        code, out, err = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--no-keepalive", "--json"], capsys
+        )
+        assert code == 0, out + err
+        assert json.loads(self._path(healthy).read_text())  # a person's run starts it again
+
+    def test_an_unreadable_record_fails_closed(self, healthy):
+        self._path(healthy).mkdir(parents=True)  # reads and writes both fail
+        self._same_lineage(healthy)
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
+
+    def test_a_failed_write_does_not_fail_the_run(self, healthy, monkeypatch):
+        from claude_swap import migrate_store
+
+        def full(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(migrate_store, "atomic_write_json", full)
+        self._same_lineage(healthy)
+        report = _reconcile()
+        assert report["ok"] is True and not self._path(healthy).exists()
+
+    def test_a_dry_run_and_a_failed_run_write_nothing(self, healthy):
+        self._same_lineage(healthy)
+        assert _reconcile(dry_run=True)["ok"] is True
+        assert not self._path(healthy).exists()
+        healthy.security.delete_rc = 1
+        assert _reconcile()["ok"] is False
+        assert not self._path(healthy).exists()
+
+    def test_rows_older_than_400_days_go(self, healthy):
+        import time
+
+        now = time.time()
+        self._path(healthy).parent.mkdir(parents=True, exist_ok=True)
+        self._path(healthy).write_text(json.dumps({
+            "old": {"at": now - 401 * 86400, "role": "replaced"},
+            "young": {"at": now - 399 * 86400, "role": "replaced"},
+        }))
+        self._same_lineage(healthy)
+        assert _reconcile()["ok"] is True
+        rows = json.loads(self._path(healthy).read_text())
+        assert "old" not in rows and "young" in rows
+
+    def test_backups_made_in_one_second_sort_in_order(self):
+        from claude_swap.migrate_store import _backup_order
+
+        names = [f"claude-code-credentials.backup-20261114T000000Z{suffix}" for suffix in ("-10", "-2", "", "-1")]
+        assert sorted(names, key=_backup_order) == [names[2], names[3], names[1], names[0]]
+
+
 class TestBackupCap:
     def _old(self, healthy, n, value):
         healthy.security.items[("claude-swap", f"claude-code-credentials.backup-2026010{n}T000000Z")] = value
@@ -515,6 +660,14 @@ class TestDoctor:
         monkeypatch.setattr(ks, "status", lambda *a, **k: {**RUNNING, "domain": domain})
         assert self._problems(healthy) == []
 
+    @pytest.mark.parametrize("ahead, flagged", [(600.0, True), (601.0, False), (None, False)])
+    def test_keepalive_ahead_too_short(self, healthy, monkeypatch, ahead, flagged):
+        self._ready(healthy)
+        monkeypatch.setattr(ks, "status", lambda *a, **k: {**RUNNING, "ahead": ahead})
+        report = run_doctor(ClaudeAccountSwitcher())
+        assert report["problems"] == (["keepalive_ahead_too_short"] if flagged else [])
+        assert report["keepaliveService"]["ahead"] == ahead
+
     def test_a_foreign_job_does_not_count(self, healthy, monkeypatch):
         self._ready(healthy)
         monkeypatch.setattr(ks, "status", lambda *a, **k: {**RUNNING, "managed": False})
@@ -534,8 +687,12 @@ class TestDoctor:
         report = _reconcile()
         assert report["error"]["type"] == "reconcile_ambiguous"
         hint = report["hint"]
-        assert "migrate-store --to file --keep keychain" in hint
+        assert "migrate-store --to file --keep file|keychain" in hint
         assert ("401" in hint) if running else ("was not running" in hint)
+        # For reference, both expiries; never a token.
+        item_exp = oauth.expires_at_iso(json.loads(healthy.security.items[ACTIVE_ITEM])["claudeAiOauth"]["expiresAt"])
+        file_exp = oauth.expires_at_iso(json.loads(healthy.file.read_text())["claudeAiOauth"]["expiresAt"])
+        assert item_exp in hint and file_exp in hint
         doctor_report = run_doctor(ClaudeAccountSwitcher())
         assert doctor_report["lastReconcileHint"] == hint
         assert doctor_report["lastReconcileError"] == "reconcile_ambiguous"
@@ -950,6 +1107,17 @@ class TestKeepaliveBeatsClaudeCode:
         late = DEFAULT_AHEAD_S + 60 - ks.INTERVAL_S
         assert _due(creds(expires_in_s=late), DEFAULT_AHEAD_S)
         assert late > CLAUDE_CODE_REFRESH_WINDOW_S
+
+    def test_the_service_refuses_an_ahead_inside_the_window(self, healthy, capsys, macos_services):
+        from claude_swap.keepalive import CLAUDE_CODE_REFRESH_WINDOW_S, DEFAULT_AHEAD_S
+
+        assert ks.MIN_AHEAD_S == CLAUDE_CODE_REFRESH_WINDOW_S + ks.INTERVAL_S == 600
+        assert DEFAULT_AHEAD_S > ks.MIN_AHEAD_S
+        with pytest.raises(ks.AheadTooShortError):
+            ks.install(ks.MIN_AHEAD_S, False, macos_services, UID, PROGRAM)
+        code, out, _ = run_cli(["keepalive", "--install-service", "--ahead", "600", "--json"], capsys)
+        assert code == 1 and json_error_type(out) == "ahead_too_short"
+        assert not launch_agent.plist_path(ks.LABEL).exists()
 
     def test_the_installed_job_uses_these_constants(self, tmp_path):
         from claude_swap.keepalive import DEFAULT_AHEAD_S

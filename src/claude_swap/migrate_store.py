@@ -232,45 +232,87 @@ def _slot_plan(switcher, active, kept: str) -> list[tuple[str, str, str, list[st
     return plan
 
 
-def settled_logins(switcher) -> dict:
-    """``{fingerprint: "kept" | "replaced"}``: the role the last migrate-store or reconcile
-    run that touched a login gave it. Unreadable reads as empty: the evidence is then
-    missing, not wrong."""
+ROLES = ("kept", "replaced", "suspect")
+
+
+def _seen_path(switcher):
+    return switcher.backup_dir / "cache" / SEEN_FILENAME
+
+
+def _seen_rows(switcher) -> dict | None:
+    """The record's rows, ``{}`` when there is none yet, None when it cannot be read: a
+    record that may hold a ``suspect`` mark must not read as empty."""
     try:
-        data = json.loads((switcher.backup_dir / "cache" / SEEN_FILENAME).read_text(encoding="utf-8"))
+        data = json.loads(_seen_path(switcher).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def settled_logins(switcher) -> dict | None:
+    """``{fingerprint: "kept" | "replaced" | "suspect"}``: the role the last run that touched
+    a login gave it. ``suspect``: a kept login that an unexplained refresh may have spent.
+    None when the record cannot be read; the caller then decides nothing from it."""
+    rows = _seen_rows(switcher)
+    if rows is None:
+        return None
     return {
-        fp: row["role"]
-        for fp, row in data.items()
-        if isinstance(row, dict) and row.get("role") in ("kept", "replaced")
+        fp: row["role"] for fp, row in rows.items() if isinstance(row, dict) and row.get("role") in ROLES
     }
 
 
-def _remember(switcher, kept: str, replaced) -> None:
-    path = switcher.backup_dir / "cache" / SEEN_FILENAME
-    now = time.time()
-    try:
-        rows = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+def _write_roles(switcher, roles: dict, *, settle: bool) -> None:
+    """``settle``: a person's migrate-store, which starts a broken record again and lifts every
+    suspect mark it does not set. Otherwise a broken record is left for a person."""
+    rows = _seen_rows(switcher)
+    if rows is None:
+        if not settle:
+            _logger.warning("%s unreadable; left as it is", SEEN_FILENAME)
+            return
         rows = {}
+    now = time.time()
     rows = {
         fp: row
-        for fp, row in (rows.items() if isinstance(rows, dict) else ())
+        for fp, row in rows.items()
         if isinstance(row, dict) and isinstance(row.get("at"), (int, float))
         and now - row["at"] < _SEEN_RETENTION_S
+        and not (settle and row.get("role") == "suspect")
     }
-    kept_fp = oauth.credential_fingerprint(kept)
-    for value in replaced:
-        if not holds_no_login(value) and oauth.credential_fingerprint(value) != kept_fp:
-            rows[oauth.credential_fingerprint(value)] = {"at": now, "role": "replaced"}
-    rows[kept_fp] = {"at": now, "role": "kept"}  # last: a login kept again is no longer replaced
+    rows.update({fp: {"at": now, "role": role} for fp, role in roles.items()})
     try:
-        atomic_write_json(path, rows)
+        atomic_write_json(_seen_path(switcher), rows)
     except OSError as e:
         _logger.warning("could not write %s: %s", SEEN_FILENAME, type(e).__name__)
+
+
+def _remember(switcher, kept: str, replaced, *, settle: bool) -> None:
+    kept_fp = oauth.credential_fingerprint(kept)
+    roles = {
+        oauth.credential_fingerprint(value): "replaced"
+        for value in replaced
+        if not holds_no_login(value) and oauth.credential_fingerprint(value) != kept_fp
+    }
+    roles[kept_fp] = "kept"  # last: a login kept again is no longer replaced
+    _write_roles(switcher, roles, settle=settle)
+
+
+def _mark_suspect(switcher, fingerprint: str) -> None:
+    _write_roles(switcher, {fingerprint: "suspect"}, settle=False)
+
+
+def back_up_once(value: str, report: dict) -> None:
+    """A backup of ``value`` unless the newest credentials backup already holds it: the
+    reconcile agent wakes on its own Keychain write, and must not add one each time."""
+    names = [
+        account
+        for service, account in macos_keychain.generic_items()
+        if service == SECURITY_SERVICE and account.startswith(f"{CREDENTIALS_BACKUP}.backup-")
+    ]
+    newest = max(names, key=_backup_order, default=None)
+    if newest is None or macos_keychain.get_password(SECURITY_SERVICE, newest) != value:
+        _back_up(CREDENTIALS_BACKUP, value, report)
 
 
 def _backup_order(account: str) -> tuple:
@@ -311,10 +353,12 @@ def _prune_backups(report: dict, kept: str) -> None:
 
 
 def _migrate(
-    switcher, report: dict, keep: str, dry_run: bool, kept: str | None = None, judged=None
+    switcher, report: dict, keep: str, dry_run: bool, kept: str | None = None, judged=None,
+    *, settle: bool = True,
 ) -> None:
     """``kept``: the login to keep when it is in neither store (reconcile's slot copy).
-    ``judged``: the (Keychain item, file) the caller decided on; anything else stops."""
+    ``judged``: the (Keychain item, file) the caller decided on; anything else stops.
+    ``settle``: a person chose (migrate-store), which lifts the suspect marks."""
     path = get_credentials_path()
     try:
         file_creds = path.read_text(encoding="utf-8")
@@ -384,7 +428,9 @@ def _migrate(
     if not report["itemAbsent"]:
         raise _Stop("keychain_item_present")
     set_setting(switcher.backup_dir, "credentials.store", "file")
-    _remember(switcher, kept, [file_creds, *items.values(), *(c for *_, r in plan for c in r)])
+    _remember(
+        switcher, kept, [file_creds, *items.values(), *(c for *_, r in plan for c in r)], settle=settle
+    )
     _prune_backups(report, kept)
 
 

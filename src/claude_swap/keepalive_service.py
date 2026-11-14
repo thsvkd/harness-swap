@@ -26,10 +26,14 @@ from pathlib import Path
 
 from claude_swap import launch_agent
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.keepalive import CLAUDE_CODE_REFRESH_WINDOW_S
 
 LABEL = "dev.hswap.keepalive"
 INTERVAL_S = 300
 _MARKER = ("HSWAP_SERVICE", "keepalive")
+# A refresh lands at the first run with less than --ahead left, up to one interval late;
+# at or below this the file's token can reach Claude Code's own refresh window.
+MIN_AHEAD_S = CLAUDE_CODE_REFRESH_WINDOW_S + INTERVAL_S
 SYSTEM_DIR = Path("/Library/LaunchDaemons")
 SYSTEM = "system"
 
@@ -44,6 +48,16 @@ class UnsupportedPlatformError(ClaudeSwitchError):
 
 class ServiceConflictError(ClaudeSwitchError):
     json_type = "ServiceConflict"
+
+
+class AheadTooShortError(ClaudeSwitchError):
+    json_type = "ahead_too_short"
+
+    def __init__(self, ahead: float):
+        super().__init__(
+            f"--ahead {ahead:g} leaves the file's token inside Claude Code's own refresh window "
+            f"for a job that runs every {INTERVAL_S}s; use more than {MIN_AHEAD_S}s."
+        )
 
 
 def system_plist_path() -> Path:
@@ -349,6 +363,8 @@ def install(
     ``system``: a LaunchDaemon run as ``user`` (default: this one), through sudo; it
     replaces the gui agent. The caller checks that the store is file."""
     _require_macos()
+    if ahead <= MIN_AHEAD_S:
+        raise AheadTooShortError(ahead)
     program = program or launch_agent.resolve_program()
     if system:
         _refuse_proxy_secrets()

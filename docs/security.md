@@ -74,8 +74,14 @@ files under `~/Library/Logs/dev.hswap.*.err`, are all 0600.
   message (it can name a path or carry server text), an email address in the event
   log (accounts are slot numbers there). Paths are written with `~` for the home
   directory. As a last guard, any string shaped like a token (`sk-ant-…`, or 40 or
-  more token characters in a row) is replaced with `[redacted]` before a line is
-  written; a test runs every logging command against real-sized fake tokens.
+  more token characters in a row) is replaced with `[redacted]`, and an email
+  address with `[email]`, before a line is written. A test runs every logging
+  command against real-sized fake tokens, and auto errors whose messages hold an
+  email, a path, server text and a proxy URL with a password: none of it lands.
+- Event details are codes, numbers, slot numbers, fingerprints and times only:
+  `auto` keeps an event's kind, `reason`, `errorType` (an exception class or a
+  code) and numbers, never its message, `detail` or `warnings`. A `HSWAP_CALLER`
+  that is not a plain name is logged as `custom`.
 - Not written as root, and not into a store that does not exist yet.
 
 ## Switching never loses a login

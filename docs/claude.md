@@ -221,7 +221,7 @@ The original flag spellings (`hswap claude --switch`, `hswap claude --list`, ...
 
 ## Logs
 
-Every `hswap claude` command adds one line to `logs/events.jsonl` in the store root (see [Data locations](#data-locations)) when it ends, plus a line for each switch an `auto` loop makes. The file is 0600 and turns over at 1 MiB, keeping three older ones (`events.jsonl.1` to `.3`). Nothing is written when the store does not exist yet, as root, for `--help` and `--version`, or for `log` itself. A line that cannot be written is dropped: the command's result and exit code never depend on it.
+Every `hswap claude` command adds one line to `logs/events.jsonl` in the store root (see [Data locations](#data-locations)) when it ends, plus a line for each switch an `auto` loop makes. The file is 0600 and turns over at 1 MiB, keeping three older ones (`events.jsonl.1` to `.3`). The turn-over takes `logs/.events.lock`, so two runs cannot both rename; a run that finds it held does not wait more than half a second, writes its line into the current file a little over the limit, and leaves the turn-over to the next run. A line cut off by a full disk does not swallow the next: that one starts on a line of its own, and readers skip the broken one. Nothing is written when the store does not exist yet, as root, for `--help` and `--version`, or for `log` itself. A line that cannot be written is dropped: the command's result and exit code never depend on it.
 
 ```bash
 hswap claude log                        # the last 20, one line each
@@ -245,7 +245,7 @@ Each line is one JSON object:
 ```
 
 - `ts` (UTC), `v` (the hswap version), `cmd` (`list`, `status`, `switch`, `keepalive`, `auto`, `reconcile`, `doctor`, `migrate-store`, …), `ms`, `exit` (the process exit code).
-- `caller`: who ran it. `HSWAP_CALLER` when set: the LaunchAgents and the LaunchDaemon hswap installs set `launchd-gui-keepalive`, `launchd-system-keepalive` and `launchd-gui-reconcile`, and jarvis sets `jarvis-gateway`. Otherwise `tty` for a terminal and `unknown` for anything else (cron, a pipe).
+- `caller`: who ran it. `HSWAP_CALLER` when set (a name of letters, digits, `.`, `_` and `-`, at most 64; anything else is logged as `custom`): the LaunchAgents and the LaunchDaemon hswap installs set `launchd-gui-keepalive`, `launchd-system-keepalive` and `launchd-gui-reconcile`, and jarvis sets `jarvis-gateway`. Otherwise `tty` for a terminal and `unknown` for anything else (cron, a pipe).
 - `session`: `launchctl managername` on macOS, `aqua` (a GUI login), `background` (SSH, a per-user agent outside the GUI), `system` (a LaunchDaemon) or `unknown`; `n/a` elsewhere.
 - `store` (`file`, `auto`, `keychain`, `invalid`), `activeSlot` (the slot number, null if none).
 - `outcome`: `ok` or `error` unless the command says more: `keepalive` its `action` (`refreshed`, `none`, `synced-file`, …), `reconcile` `reconciled`, `none`, `planned`, `ambiguous` or `locked`, `auto --once` `switched`, `none`, `blocked` or `error`, `switch` `switched` or `none`, `doctor` `ok` or `problems`.
@@ -253,13 +253,23 @@ Each line is one JSON object:
 - `details`, by command:
   - `reconcile`: `item` and `rival` (which store, the refresh token's 6-hex fingerprint, `expiresAt`, its recorded role), `rule` (`same_lineage`, `recorded_link`, `settled_roles`, `suspect`, `roles_unreadable`, `item_empty`, `no_rival`, `none`), `kept`, `backups`, `pruned`, `deleted`, `keychainItemPresent`, `keychainLocked`.
   - `keepalive`: `action`, `refreshed`, `reason` (`due`, `not_due`, `blocked:<error type>`), `ahead`, `accessExpiresAt`, `loginExpiresAt`, `keychainItemPresent`.
-  - `auto`: `ticks`, the events it printed (`poll` with each slot's headroom, windows and the threshold, `switch`, `no-switch` with its reason code, …), with accounts as slot numbers.
+  - `auto`: `ticks`, the events it printed with only their kind and codes: `poll` (`active`, each slot's `headroomPct` and `windows`, `threshold`, `fetchErrors` causes), `switch` (`from`, `to`, `trigger`, `dryRun`), `no-switch` (`reason`), `error` (`errorType`, the exception's class or a code, and `transient`), `account-quarantined` (`number`, `reason`), `all-exhausted`, `sleep`. Accounts are slot numbers. Messages, `detail`, `warnings` and emails are never logged; the console and `auto --json` still show them.
   - `switch`: `switch` `{from, to, reason, trigger}`, `trigger` being `person` or `auto`.
-  - `doctor`: `problems`. `migrate-store`: `steps`, `kept`, `slotsMigrated`, `backups`, `pruned`, the two services' actions and doctor's problems.
+  - `doctor`: `problems`. `migrate-store`: `steps` (`backups:N`, `slots:1,2`, `itemAbsent:…`, or `planned:N` for a dry run), `kept`, `slotsMigrated`, `backups`, `pruned`, the two services' actions and doctor's problems.
 
 `claude-swap.log` in the store root keeps its lines (`<time> - <LEVEL> - <message>`) with the run in between: `<time> - WARNING - [cmd=keepalive caller=launchd-system-keepalive session=system] Keychain read failed rc=36`.
 
-hswap's LaunchAgents and LaunchDaemon write stderr to `~/Library/Logs/dev.hswap.<job>.err`. hswap creates that file 0600 before launchd does, puts a UTC time at the start of each line it writes there, and moves it to `.err.1` at the start of a run once it passes 1 MiB. A plist installed before 0.3.1 has no `HSWAP_CALLER`, so `--service-status` reports it `outdated`: run `--install-service` again.
+hswap's LaunchAgents and LaunchDaemon write stderr to `~/Library/Logs/dev.hswap.<job>.err`. hswap creates that file 0600 before launchd does, and each run under launchd sets it back to 0600 if it is yours. It puts a UTC time at the start of each line it writes there (a `\r` does not start a new line), and at the start of a run past 1 MiB moves it to `.err.1` and creates an empty 0600 `.err` for the next run.
+
+**After upgrading to 0.3.1.** Plists installed earlier have no `HSWAP_CALLER`, so `--service-status --json` reports them `"outdated": true` with `"outdatedReason": "caller_env_only"`: they run exactly as before, only their log lines say `caller: unknown`. `"outdatedReason": "job_changed"` means the job itself differs (program, `--ahead`, interval, `WatchPaths`). Reinstall each with the options it has:
+
+```bash
+hswap claude reconcile --install-service
+hswap claude keepalive --install-service --ahead 3600            # gui agent; add --then-auto if it had it
+hswap claude keepalive --install-service --system --ahead 3600   # the LaunchDaemon: asks for sudo
+```
+
+`--service-status --json` also says `"reinstallNeedsSudo": true` for the LaunchDaemon (false for a LaunchAgent, null with no job): a program that reinstalls on its own should leave that one to a person. A reinstall of a loaded job waits up to 30 seconds for a keepalive or reconcile run that holds the store lock, and keeps the lock while launchd reloads, so no run is stopped in the middle of a refresh. If a run holds it longer, nothing changes and the command fails with `service_busy` (exit 1); run it again.
 
 Not logged: `hswap claude run` (it becomes `claude`), `hswap list`/`hswap status` across all harnesses (only `hswap claude …`), and a command killed before it ends.
 
@@ -516,6 +526,7 @@ The agent is `~/Library/LaunchAgents/dev.hswap.keepalive.plist` (StartInterval 3
  "installed": true, "managed": true, "loaded": true, "domainAvailable": true,
  "state": "not running", "pid": null, "lastExitCode": 0,
  "intervalSeconds": 300, "ahead": 7200.0, "thenAuto": false, "outdated": false,
+ "outdatedReason": null, "domain": "gui", "reinstallNeedsSudo": false,
  "plist": "…/dev.hswap.keepalive.plist", "stderrLog": "…/dev.hswap.keepalive.err"}
 ```
 

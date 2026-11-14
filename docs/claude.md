@@ -615,7 +615,7 @@ If the file is missing, `keepalive` reports `no_credentials`.
 
 **What to avoid.** Do not run `claude` where the keychain is unlocked: at the Mac's own screen, through screen sharing, or in a session after `security unlock-keychain`. One refresh or `/login` there writes the Keychain and deletes the file. Use `/login` over SSH instead, where it writes the file.
 
-**Repair.** When `keepalive` reports `keychain_item_present`, run `hswap claude reconcile` from the GUI session or after `security unlock-keychain`; its LaunchAgent does that by itself (see [Running without a login session](#running-without-a-login-session-file-store)). It settles only what evidence settles. After a refresh in the GUI session it reports `reconcile_ambiguous`, and you keep the store whose writer refreshed last, normally the Keychain:
+**Repair.** When `keepalive` reports `keychain_item_present`, run `hswap claude reconcile` from the GUI session or after `security unlock-keychain`; its LaunchAgent does that by itself (see [Running without a login session](#running-without-a-login-session-file-store)). It settles only what evidence settles. With the keepalive service running, Claude Code rarely refreshes on its own; when it did (an early 401, or keepalive stopped), `reconcile` reports `reconcile_ambiguous`, and you keep the store whose writer refreshed last, normally the Keychain:
 
 ```bash
 hswap claude migrate-store --to file --keep keychain
@@ -664,7 +664,7 @@ hswap claude keepalive --install-service --system --then-auto   # asks for your 
 hswap claude doctor                                         # exit 0 when ready
 ```
 
-`migrate-store` installs the reconcile LaunchAgent at the end (below) unless you pass `--no-reconcile`. Its report adds `reconcileService` (`{"action", "loaded", "plist"}`, `{"action": null, "error": …}` if the install failed, which does not undo the move, or null when skipped or a dry run) and `doctor` (`{"ok", "problems"}`, or `{"ok": null, "problems": null, "error": {"type", "message"}}` when the check itself failed; the migration's own `ok` and exit code stand either way).
+`migrate-store` installs the reconcile LaunchAgent at the end (below) unless you pass `--no-reconcile`, and, when no keepalive job exists in either domain, the gui keepalive agent (`dev.hswap.keepalive`, default `--ahead`) unless you pass `--no-keepalive`. The LaunchDaemon needs sudo, so it only prints the `keepalive --install-service --system` command for that. With no GUI session the agents are written for the next login and `migrate-store` exits 3 (moved; 0 when nothing waits, 1 when the move failed). Its report adds `reconcileService` (`{"action", "loaded", "plist"}`, `{"action": null, "error": …}` if the install failed, which does not undo the move, or null when skipped or a dry run), `keepaliveService` (`{"action", "domain", "loaded", "plist"}`, `{"action": "present", "domain", "loaded"}` when a keepalive job already existed and was left as it is, the same error shape, or null) and `doctor` (`{"ok", "problems"}`, or `{"ok": null, "problems": null, "error": {"type", "message"}}` when the check itself failed; the migration's own `ok` and exit code stand either way).
 
 **The split comes back, and `reconcile` ends it.** Claude Code 2.1.325 cannot be kept off the Keychain on macOS. Wherever the keychain is open (the Mac's own screen, screen sharing, VS Code, `security unlock-keychain`), a `/login`, a token refresh or an MCP login writes the Keychain item, and if the item was new Claude Code deletes the file. From then on every write stops with `keychain_item_present` until the item is gone. Since the item can only be read where it can be written, the cleanup runs in the login session:
 
@@ -681,11 +681,15 @@ hswap claude reconcile --uninstall-service
 - a record links them (the ledger's `successorFp`, the stash's `consumedFp`), or the ledger lists one as spent: the other one;
 - an earlier `migrate-store` or `reconcile` run settled these two logins against each other: the one it kept. Each successful run records, per fingerprint, the role it gave the login it kept (`kept`) and every other one it backed up or overwrote (`replaced`), in `cache/seen_logins.json` (fingerprints only, 400 days, the latest role wins). Only a `replaced`/`kept` pair decides; a login that was merely seen proves nothing, since a stale Claude Code can put a replaced login in either the item or the file.
 
-A login nothing here has seen is **not** taken as the newer one: a Claude Code with a stale cache can write a token hswap never saw, and sending a spent token can revoke the whole login. So the usual case, a refresh in the GUI session (the item holds the successor, the file is gone), is `reconcile_ambiguous` (exit 4): nothing records that the item came from the file. Nothing changes; settle it with `migrate-store --to file --keep keychain` (or `--keep file`), or `/login` over SSH and `hswap claude add`. That run records what it kept and replaced, so if a stale Claude Code later writes the replaced login back (into the item, or over SSH into the file while the kept one returns in the item), `reconcile` keeps the kept one and removes the item by itself.
+A login nothing here has seen is **not** taken as the newer one: a Claude Code with a stale cache can write a token hswap never saw, and sending a spent token can revoke the whole login. Nor is the later `expiresAt` of two different refresh tokens: Claude Code stores `Date.now() + expires_in` with whatever lifetime the server sent, so a shorter lifetime can make a newer token look older.
+
+**Why this is rare: keep keepalive running.** With the keepalive service running, Claude Code finds a fresh token in the file and does not refresh itself; a GUI refresh (and an ambiguous reconcile) is then the exception: early server revocation (401), or keepalive stopped. Claude Code 2.1.325 refreshes only when the stored token is within 5 minutes of its expiry, and it re-reads storage first and stops when the token there is fresh (`$O(e)`: `now + 300000 >= expiresAt`). keepalive runs at least every 300 s (`StartInterval`) and refreshes once less than `--ahead` is left (default 3600 s), so the file's token always has more than 3300 s left, and three runs in a row can fail before Claude Code's window opens; a test pins these numbers. What Claude Code writes in the GUI session is then mostly an MCP login or a plan update on the same refresh token, which the first rule settles by itself. `doctor` reports `keepalive_service_missing` while no hswap keepalive job is loaded. A jarvis gateway tick that runs `hswap claude keepalive` does the same job, but hswap cannot see it, so doctor still reports the problem; read it alongside the tick's own status.
+
+When Claude Code did refresh in the GUI session (the item holds the successor, the file is gone), `reconcile` reports `reconcile_ambiguous` (exit 4): nothing records that the item came from the file. Nothing changes; settle it with `migrate-store --to file --keep keychain` (or `--keep file`), or `/login` over SSH and `hswap claude add`. That run records what it kept and replaced, so if a stale Claude Code later writes the replaced login back (into the item, or over SSH into the file while the kept one returns in the item), `reconcile` keeps the kept one and removes the item by itself.
 
 When it keeps the `.enc`'s login (the file was gone), `kept` is `slot` and that login is written back to the file. The rest is `migrate-store`'s, with the same locks and refusals: the kept login goes to `~/.claude/.credentials.json` and the active slot's `.enc`, whatever they held and every item's value are copied to `claude-swap` backups in the login keychain and read back, and only then are the items deleted and checked gone. Right before each delete the item is read again; if it changed since its backup (an MCP login takes no lock), it is not deleted and the run ends with `keychain_item_changed` (exit 1) for the next run to decide. The same stop applies when, once the locks are held, the item or the file differs from what the decision was made on. A failed backup or `.enc` read-back, a failed delete or locks that stay held leave the item in place too (`keychain_unavailable`, `refresh_failed`, `locked`), and a file error is `io_error`. These backups are not stash entries, because a stash entry for the account would hold every later refresh at `split_brain` (rule U); see [Cleaning up Keychain backups](#cleaning-up-keychain-backups). With the keychain locked it reports `keychain_item_present_locked` (exit 5) and `keychainLocked: true`, and reads no value: only the item's attributes and the keychain's lock state. Outside the file store it refuses with `not_file_store`.
 
-The `--json` report is migrate-store's (`kept`, `fileFingerprint`, `keychainFingerprint`, `backups`, `backupsPruned`, `slotsMigrated`, `itemAbsent`, `storesDiffer`, `warning`, `error`, and `plan` with `--dry-run`) plus `action` (`none`, `reconciled`, `planned`), `keychainItemPresent` and `keychainLocked`; `kept` is `file`, `keychain`, `slot` or null. Every run but a dry run also writes it to `cache/reconcile.json`, which `doctor` reads. It never carries a token; fingerprints are the first 6 hex digits of the refresh token's SHA-256.
+The `--json` report is migrate-store's (`kept`, `fileFingerprint`, `keychainFingerprint`, `backups`, `backupsPruned`, `slotsMigrated`, `itemAbsent`, `storesDiffer`, `warning`, `error`, and `plan` with `--dry-run`) plus `action` (`none`, `reconciled`, `planned`), `keychainItemPresent`, `keychainLocked` and `hint`; `kept` is `file`, `keychain`, `slot` or null. `hint` is null except after `reconcile_ambiguous`, where it says what this machine can see about who refreshed: the keepalive service was running (so most likely an early 401) or was not (so Claude Code refreshed on its own, start keepalive), followed by the `migrate-store --to file --keep keychain` fix. Every run but a dry run also writes it to `cache/reconcile.json`, which `doctor` reads. It never carries a token; fingerprints are the first 6 hex digits of the refresh token's SHA-256.
 
 The LaunchAgent `~/Library/LaunchAgents/dev.hswap.reconcile.plist` runs `hswap claude reconcile` with `WatchPaths` on `~/Library/Keychains/login.keychain-db`, `RunAtLoad`, and a 3600 s interval as a backstop, so a Claude Code write is cleaned up within seconds and at every login. Its own delete wakes it once more, and that run finds nothing. Like the keepalive agent it is marked `HSWAP_SERVICE=reconcile`, leaves a plist it did not write alone (`ForeignService`), refuses root, and without a GUI session writes the plist for the next login and exits 3. `--install-service` refuses with `not_file_store` outside the file store.
 
@@ -699,7 +703,8 @@ The LaunchAgent `~/Library/LaunchAgents/dev.hswap.reconcile.plist` runs `hswap c
  "fileExists": false, "fileMode": null, "slotsWithoutBackup": [], "sessionDirs": [],
  "reconcileService": {"installed": true, "managed": true, "loaded": true, "outdated": false, "lastExitCode": 4},
  "keepaliveService": {"domain": "system", "installed": true, "managed": true, "loaded": true, "outdated": false, "lastExitCode": 0},
- "keychainBackups": 3, "lastReconcileError": "reconcile_ambiguous"}
+ "keychainBackups": 3, "lastReconcileError": "reconcile_ambiguous",
+ "lastReconcileHint": "Nothing records who refreshed. The keepalive service was running, so the server most likely revoked the access token early (401) and Claude Code refreshed it itself. Keep the newer login with hswap claude migrate-store --to file --keep keychain."}
 ```
 
 When it cannot read the store, it prints the usual error envelope, `{"schemaVersion": 1, "error": {"type": "io_error", "message": …}}`, with exit 1.
@@ -710,6 +715,7 @@ When it cannot read the store, it prints the usual error envelope, `{"schemaVers
 - `reconcileService`, `keepaliveService`: `installed`, `managed`, `loaded`, `outdated`, `lastExitCode`, and the keepalive job's `domain`. Null off macOS.
 - `keychainBackups`: how many `claude-swap` `*.backup-*` items the login keychain holds (by attributes; null off macOS or when the listing failed).
 - `lastReconcileError`: the error `type` of the last `reconcile` run (`cache/reconcile.json`), null when it succeeded or never ran.
+- `lastReconcileHint`: that run's `hint` (text for a person, not a code), null unless it ended `reconcile_ambiguous`.
 
 | code | meaning (macOS unless noted) | fix |
 |---|---|---|
@@ -722,6 +728,7 @@ When it cannot read the store, it prints the usual error envelope, `{"schemaVers
 | `session_profiles` | `sessions/` holds profiles; file mode refuses to write | remove them |
 | `profile_env` | `CLAUDE_CONFIG_DIR` or `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set | unset it; Claude Code then uses another item |
 | `reconcile_service_missing` | hswap's reconcile agent is not installed | `reconcile --install-service` |
+| `keepalive_service_missing` | file store, and no hswap keepalive job (gui or system) is installed and loaded; a gui agent written for the next login counts as missing, and so does one hswap did not write. A jarvis tick running keepalive is not visible here | `keepalive --install-service --system` (or a login for the gui agent) |
 
 **Exit codes of the new commands.**
 
@@ -731,13 +738,15 @@ When it cannot read the store, it prints the usual error envelope, `{"schemaVers
 | `reconcile --install-service` | done | refused or failed | | written, loads at next login | | |
 | `keepalive --install-service --system` | done | refused or failed (`not_file_store`, `ForeignService`, a proxy password, sudo or bootstrap) | | | | |
 | `doctor` | ok | could not check | problems found | | | |
+| `migrate-store` | moved | failed or refused | | moved; an agent it installed loads at the next login | | |
 
 **What it costs.** The file store keeps every login in plaintext: `~/.claude/.credentials.json` (0600) and each slot's `.enc`, stash entry and `.prev` (base64, 0600). The Keychain encrypts at rest and refuses reads while locked; a file is readable by any process running as you at any time, and from a disk image, an unencrypted backup or a stolen disk. Turn on FileVault, keep `~/.claude` and the hswap store out of unencrypted backups, and treat the machine's user account as the boundary. On a Mac where FileVault is off this difference is large.
 
 **When it goes wrong.**
 
 - `keepalive.json` / `keepalive --json` with `keychain_item_present`: a Claude Code with the keychain open wrote the item. The reconcile agent cleans it at the next keychain change or login when evidence decides; until then nothing is refreshed or sent.
-- `reconcile` exit 4, `reconcile_ambiguous` (and `doctor`'s problem of that name): two logins nothing orders, usually a GUI refresh. Choose with `migrate-store --to file --keep …`.
+- `reconcile` exit 4, `reconcile_ambiguous` (and `doctor`'s problem of that name): two logins nothing orders, a GUI refresh. Read `hint` (`lastReconcileHint` in doctor): if keepalive was not running, start it; either way choose with `migrate-store --to file --keep keychain` from a login session.
+- `doctor` with `keepalive_service_missing`: install keepalive (`--system` for no login session), or make sure your own scheduler runs it; without it Claude Code refreshes on its own and every GUI refresh ends ambiguous.
 - `reconcile` exit 1, `keychain_item_changed`: the item changed during the run; the agent runs again on that change.
 - `reconcile` exit 5, `keychain_item_present_locked`: run it again from a login session.
 - `doctor` exit 2: the `problems` codes above. jarvis reads `doctor --json`.

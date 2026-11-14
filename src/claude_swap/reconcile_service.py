@@ -30,7 +30,7 @@ def build(program: list[str], home: Path | None = None) -> bytes:
             home,
             argv=[*program, "reconcile"],
             interval=INTERVAL_S,
-            extra_env=dict([_MARKER]),
+            extra_env=dict([_MARKER], HSWAP_CALLER="launchd-gui-reconcile"),
         )
     )
     doc["WatchPaths"] = [str((home or Path.home()) / "Library" / "Keychains" / "login.keychain-db")]

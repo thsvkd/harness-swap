@@ -2647,6 +2647,9 @@ class AutoSwitchEngine:
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
+        from claude_swap import events
+
+        events.auto_event(event.to_json())
 
     # -- loop -------------------------------------------------------------------
 

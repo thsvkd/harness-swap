@@ -369,6 +369,9 @@ def account_row(
 
 def error_envelope(exc: Exception) -> dict:
     """The structured error payload emitted on a handled ClaudeSwitchError."""
+    from claude_swap import events
+
+    events.error(getattr(exc, "json_type", type(exc).__name__))
     return {
         "schemaVersion": SCHEMA_VERSION,
         "error": {

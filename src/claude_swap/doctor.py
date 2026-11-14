@@ -121,6 +121,12 @@ def run_doctor(switcher) -> dict:
         if keepalive["managed"] and ahead is not None and ahead <= keepalive_service.MIN_AHEAD_S:
             problems.append("keepalive_ahead_too_short")
     report["ok"] = not problems
+    from claude_swap import events
+
+    report["lastEvents"] = [events.summary(row) for row in events.read(switcher.backup_dir)[-5:]]
+    if events.active() == "doctor":  # not migrate-store's summary
+        events.note(problems=list(problems))
+        events.outcome("ok" if report["ok"] else "problems")
     return report
 
 

@@ -961,7 +961,11 @@ Defaults live in settings.json in the backup root; flags override them.
         )
 
         if args.once:
-            sys.exit(engine.tick().value)
+            from claude_swap import events
+
+            result = engine.tick().value
+            events.outcome({0: "switched", 1: "error", 2: "none", 3: "blocked"}.get(result, "error"))
+            sys.exit(result)
 
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
@@ -1131,6 +1135,7 @@ def _migrate_store_command(argv: list[str]) -> None:
     if report["ok"] and not args.dry_run and not args.no_keepalive:
         report["keepaliveService"] = _install_keepalive_service()
     report["doctor"] = doctor.summary(switcher)
+    _log_migrate_store(report, args)
     if report["storesDiffer"] and not args.json:
         warning(
             f"WARNING: {report['warning']} (file {report['fileFingerprint']}, "
@@ -1156,6 +1161,30 @@ def _migrate_store_command(argv: list[str]) -> None:
     else:
         lines.append("Doctor: ok" if checked["ok"] else f"Doctor: {', '.join(checked['problems'])}")
     finish(report, "\n".join(lines))
+
+
+def _log_migrate_store(report: dict, args) -> None:
+    """logs/events.jsonl: the steps it took and how each ended (names and counts only)."""
+    from claude_swap import events
+
+    def action(service):
+        return None if service is None else (service.get("action") or service["error"]["type"])
+
+    events.note(
+        kept=report.get("kept"), dryRun=bool(args.dry_run), storesDiffer=report.get("storesDiffer"),
+        steps=report.get("plan") if args.dry_run else [
+            "backups:%d" % len(report.get("backups", [])),
+            "slots:%s" % ",".join(map(str, report.get("slotsMigrated", []))),
+            "itemAbsent:%s" % report.get("itemAbsent"),
+        ],
+        slotsMigrated=report.get("slotsMigrated"), backups=len(report.get("backups", [])),
+        pruned=len(report.get("backupsPruned", [])),
+        reconcileService=action(report.get("reconcileService")),
+        keepaliveService=action(report.get("keepaliveService")),
+        doctor=report["doctor"].get("problems"),
+    )
+    if report.get("error"):
+        events.error(report["error"]["type"])
 
 
 def _install_keepalive_service() -> dict:
@@ -1261,6 +1290,55 @@ def _reconcile_command(argv: list[str]) -> None:
     if report["action"] == "none":
         finish(report, "Nothing to reconcile: no Claude Code item in the login keychain.")
     finish(report, f"Reconciled: kept the {report['kept']} login; the Keychain item is gone.")
+
+
+def _log_command(argv: list[str]) -> None:
+    """Handle `cswap log [--since 1h|24h|ISO] [--cmd X] [--tail N] [--json]`. Read only;
+    needs no session and constructs no switcher."""
+    from claude_swap import events
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} log",
+        description=(
+            "Show what hswap commands did and why, from logs/events.jsonl in the store: who "
+            "ran each (caller, session), its outcome and exit code. --json prints the raw lines."
+        ),
+    )
+    parser.add_argument("--since", metavar="WHEN", help="Only events after this: 30m, 1h, 24h, 7d, or an ISO time")
+    parser.add_argument("--cmd", metavar="COMMAND", help="Only this command (keepalive, reconcile, auto, …)")
+    parser.add_argument("--tail", type=int, metavar="N", help="Only the last N events")
+    parser.add_argument("--json", action="store_true", help="Print the matching lines as they are stored")
+    args = parser.parse_args(argv)
+    try:
+        since = events.parse_since(args.since) if args.since else None
+    except ValueError:
+        parser.error("--since takes 30m, 1h, 24h, 7d or an ISO time")
+    if args.tail is not None and args.tail < 0:
+        parser.error("--tail must be 0 or more")
+
+    def after(row: dict) -> bool:
+        try:
+            return events.parse_since(row.get("ts", "")) >= since
+        except ValueError:
+            return False
+
+    rows = [
+        row for row in events.read(paths.get_backup_root())
+        if (args.cmd is None or row.get("cmd") == args.cmd) and (since is None or after(row))
+    ]
+    if args.tail is not None:
+        rows = rows[-args.tail:] if args.tail else []
+    for row in rows:
+        if args.json:
+            print(json.dumps(row, separators=(",", ":")))
+            continue
+        who = f"{row.get('caller')}/{row.get('session')}"
+        failed = f" {row['error']}" if row.get("error") else ""
+        print(
+            f"{row.get('ts')}  {row.get('cmd', '?'):<13} {who:<34} {row.get('outcome')} "
+            f"exit={row.get('exit')} {row.get('ms')}ms{failed}"
+        )
+    sys.exit(0)
 
 
 def _doctor_command(argv: list[str]) -> None:
@@ -1785,7 +1863,35 @@ def _menubar_service(args) -> int:
 
 
 def main() -> None:
-    """Main entry point for the CLI."""
+    """Main entry point for the CLI: the command, recorded in logs/events.jsonl."""
+    from claude_swap import events
+
+    argv = sys.argv[1:]
+    quiet = {"-h", "--help", "--version"} & set(argv)
+    events.begin("help" if quiet else events.command_name(argv))
+    label = events.STDERR_LABELS.get(events.caller())
+    saved_stderr = sys.stderr
+    if label:
+        events.turn_over_stderr_file(label)
+        sys.stderr = events.StampedStream(sys.stderr)
+    code: object = 0
+    try:
+        _main()
+    except SystemExit as e:
+        code = e.code
+        raise
+    except BaseException as e:
+        code = 1
+        events.error(type(e).__name__)
+        raise
+    finally:
+        sys.stderr = saved_stderr
+        if quiet:
+            events._state.clear()
+        events.finish(code)
+
+
+def _main() -> None:
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
@@ -1822,6 +1928,9 @@ def main() -> None:
         return  # only reachable in tests where sys.exit is mocked
     if argv and argv[0] == "doctor":
         _doctor_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "log":
+        _log_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])

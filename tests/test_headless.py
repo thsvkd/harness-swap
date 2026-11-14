@@ -623,8 +623,9 @@ class TestDoctor:
             "schemaVersion", "ok", "problems", "store", "keychainItemPresent", "keychainLocked",
             "fileExists", "fileMode", "slotsWithoutBackup", "sessionDirs",
             "reconcileService", "keepaliveService", "keychainBackups", "lastReconcileError",
-            "lastReconcileHint",
+            "lastReconcileHint", "lastEvents",
         }
+        assert report["lastEvents"] == []
         assert report["keychainBackups"] == 0 and report["lastReconcileError"] is None
         assert report["schemaVersion"] == 1
         assert report["ok"] is True and report["problems"] == []

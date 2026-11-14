@@ -99,7 +99,7 @@ def build(
             home,
             argv=_argv(program, ahead, then_auto),
             interval=INTERVAL_S,
-            extra_env=dict([_MARKER]),
+            extra_env=dict([_MARKER], HSWAP_CALLER=f"launchd-{'system' if user else 'gui'}-keepalive"),
         )
     )
     doc["WatchPaths"] = _watch_paths(home)
@@ -220,7 +220,20 @@ def _job(doc: dict, marker: tuple[str, str] = _MARKER) -> tuple:
         doc.get("WatchPaths"),
         doc.get("UserName"),
         _managed(doc, marker),
+        # Names the caller in logs/events.jsonl; a plist from before 0.3.1 lacks it.
+        (doc.get("EnvironmentVariables") or {}).get("HSWAP_CALLER"),
     )
+
+
+def prepare_stderr_log(label: str, home: Path | None) -> None:
+    """launchd creates StandardErrorPath with the umask (0644) when it does not exist."""
+    err = launch_agent.log_paths(label, home)[1]
+    err.parent.mkdir(parents=True, exist_ok=True)
+    os.close(os.open(err, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600))
+    try:
+        os.chmod(err, 0o600)
+    except OSError:
+        pass
 
 
 def refuse_foreign(
@@ -245,6 +258,7 @@ def install_job(label: str, marker: tuple[str, str], plist: bytes, home: Path | 
     path = launch_agent.plist_path(label, home)
     # Same job, whatever PATH or proxies the caller has: reloading could cut a run short.
     unchanged = doc is not None and _job(doc, marker) == _job(plistlib.loads(plist), marker)
+    prepare_stderr_log(label, home)
     if not launch_agent.domain_available(uid):
         # No GUI session (SSH, a LaunchDaemon): launchd loads the file at next login.
         if not unchanged:
@@ -319,9 +333,7 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
     if doc is None and loaded:
         raise ForeignServiceError(f"launchd runs {target} from a plist hswap did not write; left untouched.")
     if not (unchanged and loaded):
-        err_log = launch_agent.log_paths(LABEL, home)[1]
-        err_log.parent.mkdir(parents=True, exist_ok=True)
-        err_log.touch(exist_ok=True)  # the user's: launchd would create it as root
+        prepare_stderr_log(LABEL, home)  # the user's: launchd would create it as root
         previous = path.read_bytes() if doc is not None else None
         _put_system_plist(plist, path)
         if loaded:

@@ -73,6 +73,7 @@ def snapshot(home: Path, keychain) -> dict:
         if path.is_file()
         and not path.name.endswith((".log", ".lock", ".takeover"))
         and path.name != "keepalive.json"
+        and not path.name.startswith("events.jsonl")  # the run log
     }
     return {"files": files, "keychain": dict(keychain.data)}
 

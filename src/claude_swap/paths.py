@@ -127,7 +127,7 @@ def get_backup_root() -> Path:
 # user data being present (logger output, update-check + usage cache). The
 # migration treats a target containing only these as effectively empty, since
 # wiping them loses no real state.
-_THROWAWAY_NAMES = {"cache"}
+_THROWAWAY_NAMES = {"cache", "logs"}  # logs: events.jsonl, a record of runs
 _THROWAWAY_PREFIXES = ("claude-swap.log",)
 
 

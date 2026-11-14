@@ -168,6 +168,7 @@ class Env:
             if path.is_file()
             and not path.name.endswith((".log", ".lock", ".takeover"))
             and path.name not in ("keepalive.json", "reconcile.json")  # run reports
+            and not path.name.startswith("events.jsonl")  # the run log
         }
         return {"files": files, "items": dict(self.security.items)}
 

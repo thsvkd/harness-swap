@@ -33,6 +33,20 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
         return super()._open()
 
 
+class _RunContext(logging.Filter):
+    """Who ran the command that logged this line (see claude_swap.events)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from claude_swap import events
+
+            ctx = events.context()
+        except Exception:  # noqa: BLE001 - a log line never fails on this
+            ctx = {"cmd": "-", "caller": "-", "session": "-"}
+        record.run_cmd, record.run_caller, record.run_session = ctx["cmd"], ctx["caller"], ctx["session"]
+        return True
+
+
 def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     """Setup logging with file and optional console output.
 
@@ -63,8 +77,14 @@ def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
         delay=True,
     )
     file_handler.setLevel(logging.DEBUG)
+    # The run's context goes after the level, so "<time> - <LEVEL> - " still starts each
+    # line and the message stays whole for anything that greps it.
+    file_handler.addFilter(_RunContext())
     file_handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        logging.Formatter(
+            "%(asctime)s - %(levelname)s - "
+            "[cmd=%(run_cmd)s caller=%(run_caller)s session=%(run_session)s] %(message)s"
+        )
     )
     logger.addHandler(file_handler)
 

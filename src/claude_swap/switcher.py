@@ -374,6 +374,19 @@ def _gated_in_required_mode(method):
     return gated
 
 
+
+def _note_switch(from_ref: dict | None, to_ref: dict | None, reason: str) -> None:
+    """For logs/events.jsonl: slots only, and whether a person or auto asked."""
+    from claude_swap import events
+
+    def number(ref):
+        return ref.get("number") if isinstance(ref, dict) else None
+
+    trigger = "auto" if events.active() == "auto" else "person"
+    events.note(switch={"from": number(from_ref), "to": number(to_ref), "reason": reason, "trigger": trigger})
+    if trigger == "person":
+        events.outcome("switched" if reason == "switched" else "none")
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -6855,6 +6868,7 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
+        _note_switch(from_ref, to_ref, reason)
         return {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
@@ -6885,6 +6899,7 @@ class ClaudeAccountSwitcher:
         """
         if from_ref is None:
             from_ref = to_ref
+        _note_switch(from_ref, to_ref, reason)
         return {
             "schemaVersion": SCHEMA_VERSION,
             "switched": False,

@@ -22,7 +22,7 @@ item's attributes and the keychain's lock state.
 
 from __future__ import annotations
 
-from claude_swap import consumed_grants, macos_keychain, oauth
+from claude_swap import consumed_grants, events, macos_keychain, oauth
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     credential_generation,
@@ -37,6 +37,7 @@ from claude_swap.migrate_store import (
     _preflight,
     _report_failure,
     _mark_suspect,
+    _refresh_fingerprint,
     back_up_once,
     settled_logins,
 )
@@ -141,17 +142,21 @@ def _file_text() -> str:
     return text if text.strip() else ""
 
 
-def _newer(switcher, active, item: str, rival: str) -> str | None:
+def _newer(switcher, active, item: str, rival: str, side: str = "file") -> str | None:
     """``item``, ``rival`` or None: which login came later, on evidence only. Never
     "the one nothing has seen": a Claude Code with a stale cache can write a token
     hswap never saw, and it is the older one. Nothing either, with the role record
     unreadable or a suspect on either side: the one it would keep may be spent."""
     item_fp, rival_fp = oauth.credential_fingerprint(item), oauth.credential_fingerprint(rival)
     roles = _roles(switcher, active)
-    if roles is None or "suspect" in (roles.get(item_fp), roles.get(rival_fp)):
-        return None
+    _note_sides(item, rival, side, roles or {})
+    if roles is None:
+        return _ruled("roles_unreadable", None)
+    if "suspect" in (roles.get(item_fp), roles.get(rival_fp)):
+        return _ruled("suspect", None)
     if item_fp == rival_fp:
-        return "item" if credential_generation(item) >= credential_generation(rival) else "rival"
+        later = credential_generation(item) >= credential_generation(rival)
+        return _ruled("same_lineage", "item" if later else "rival")
 
     def came_after(winner: str, loser: str) -> bool:
         if winner in switcher._recorded_successors(active.identity, active.slot, loser):
@@ -160,22 +165,42 @@ def _newer(switcher, active, item: str, rival: str) -> str | None:
 
     item_wins, rival_wins = came_after(item_fp, rival_fp), came_after(rival_fp, item_fp)
     if item_wins != rival_wins:
-        return "item" if item_wins else "rival"
+        return _ruled("recorded_link", "item" if item_wins else "rival")
     # A run settled these two against each other before: the one it replaced came back
     # from a stale cache. Both roles must match; a copy only touched proves nothing.
     if not item_wins:
         pair = (roles.get(item_fp), roles.get(rival_fp))
         if pair == ("replaced", "kept"):
-            return "rival"
+            return _ruled("settled_roles", "rival")
         if pair == ("kept", "replaced"):
-            return "item"
-    return None
+            return _ruled("settled_roles", "item")
+    return _ruled("none", None)
+
+
+def _ruled(rule: str, verdict: str | None) -> str | None:
+    events.note(rule=rule)
+    return verdict
+
+
+def _note_sides(item: str, rival: str, side: str, roles: dict) -> None:
+    """For logs/events.jsonl: what was compared, as fingerprints and expiries only."""
+
+    def describe(creds: str, name: str) -> dict:
+        return {
+            "side": name,
+            "fp": _refresh_fingerprint(creds),
+            "expiresAt": oauth.expires_at_iso(_expires_at(creds)),
+            "role": roles.get(oauth.credential_fingerprint(creds)),
+        }
+
+    events.note(item=describe(item, "keychain"), rival=describe(rival, side))
 
 
 def choose_kept(switcher, keychain: str, file_creds: str) -> tuple[str, str]:
     """(``file``, ``keychain`` or ``slot``, the login), on evidence only. Raises
     _Stop(AMBIGUOUS)."""
     if holds_no_login(keychain) and not holds_no_login(file_creds):
+        events.note(rule="item_empty")
         return "file", file_creds
     active = _read_active(switcher)
     if holds_no_login(file_creds):
@@ -184,13 +209,31 @@ def choose_kept(switcher, keychain: str, file_creds: str) -> tuple[str, str]:
     else:
         rival, name = file_creds, "file"
     if holds_no_login(rival):
+        events.note(rule="no_rival")
         return "keychain", keychain
-    verdict = _newer(switcher, active, keychain, rival)
+    verdict = _newer(switcher, active, keychain, rival, name)
     if verdict == "item":
         return "keychain", keychain
     if verdict == "rival":
         return name, rival
     raise _Ambiguous(keychain, rival, name)
+
+
+def _log_event(report: dict) -> None:
+    kind = report["error"]["type"] if report["error"] else None
+    if kind:
+        result = {AMBIGUOUS: "ambiguous", LOCKED: "locked"}.get(kind, "error")
+    else:
+        result = report["action"]
+    events.note(
+        kept=report["kept"], backups=len(report["backups"]), pruned=len(report["backupsPruned"]),
+        deleted=report["action"] == "reconciled" and report["itemAbsent"],
+        keychainItemPresent=report["keychainItemPresent"], keychainLocked=report["keychainLocked"],
+        dryRun=report.get("dryRun", False),
+    )
+    events.details_default(rule="none" if kind == AMBIGUOUS else None)
+    events.outcome(result)
+    events.error(kind)
 
 
 def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
@@ -248,6 +291,7 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
         report["action"] = "planned" if dry_run else "reconciled"
 
     _report_failure(report, work)
+    _log_event(report)
     if not dry_run:
         try:  # doctor reads it; no token in it
             atomic_write_json(switcher.backup_dir / "cache" / REPORT_FILENAME, report)

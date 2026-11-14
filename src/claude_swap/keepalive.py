@@ -180,11 +180,29 @@ def run_keepalive(
     report["ok"] = report["error"] is None
     if report["error"] and report["error"]["type"] == "keychain_item_present":
         report["keychainItemPresent"] = True  # a failed check counts too
+    _log_event(report, ahead)
     try:
         atomic_write_json(switcher.backup_dir / "cache" / REPORT_FILENAME, report)
     except OSError as e:
         _logger.warning("could not write %s: %s", REPORT_FILENAME, type(e).__name__)
     return report
+
+
+def _log_event(report: dict, ahead: float) -> None:
+    """logs/events.jsonl: whether it refreshed and why (no token; expiries only)."""
+    from claude_swap import events
+
+    kind = report["error"]["type"] if report["error"] else None
+    refreshed = report["action"] == "refreshed"
+    events.note(
+        action=report["action"], refreshed=refreshed, ahead=ahead,
+        reason="blocked:" + kind if kind else ("due" if refreshed else "not_due"),
+        accessExpiresAt=report["accessExpiresAt"], loginExpiresAt=report["loginExpiresAt"],
+        keychainItemPresent=report["keychainItemPresent"], dryRun=report.get("dryRun", False),
+    )
+    events.outcome(report["action"] if report["ok"] else "error")
+    events.error(kind)
+    events.active_slot(report["activeSlot"])
 
 
 def _store_label(store) -> str:

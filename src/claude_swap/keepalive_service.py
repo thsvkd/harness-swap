@@ -274,6 +274,8 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
     target = f"{SYSTEM}/{LABEL}"
     unchanged = doc is not None and _job(doc) == _job(plistlib.loads(plist))
     loaded = launch_agent.is_loaded(LABEL, domain=SYSTEM)
+    if doc is None and loaded:
+        raise ForeignServiceError(f"launchd runs {target} from a plist hswap did not write; left untouched.")
     if not (unchanged and loaded):
         err_log = launch_agent.log_paths(LABEL, home)[1]
         err_log.parent.mkdir(parents=True, exist_ok=True)

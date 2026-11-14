@@ -1120,8 +1120,9 @@ def _migrate_store_command(argv: list[str]) -> None:
     if args.restore_keychain:
         finish(
             run_restore_keychain(switcher, args.restore_keychain),
-            "Restored the Keychain item; the backup stays. To go back to the Keychain for "
-            "good, also run: config unset credentials.store",
+            "Restored the Keychain item; the backup stays. While credentials.store is file the "
+            "reconcile service moves it back to the file, so to go back to the Keychain for good "
+            "run now: config unset credentials.store, and reconcile --uninstall-service",
         )
     report = run_migrate_store(switcher, args.keep, dry_run=args.dry_run)
     report["reconcileService"] = None

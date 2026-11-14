@@ -40,6 +40,18 @@ pytestmark = pytest.mark.no_keychain_fake
 
 PROGRAM = ["/Users/x/.local/bin/hswap", "claude"]
 UID = 501
+
+
+@pytest.fixture
+def darwin():
+    """sys.platform reads darwin everywhere (it is one object), so give Windows the
+    uid calls the macOS paths make."""
+    with (
+        patch.object(ks.sys, "platform", "darwin"),
+        patch.object(os, "getuid", lambda: UID, create=True),
+        patch.object(os, "geteuid", lambda: UID, create=True),
+    ):
+        yield
 TOKENS = ("AT-1", "RT-1", "AT-K", "RT-K", "AT-N", "RT-N", "AT-2", "RT-2")
 
 
@@ -131,6 +143,34 @@ class TestReconcile:
         assert report["ok"] is True and report["action"] == "refreshed"
         assert [post["refresh_token"] for post in healthy.endpoint.posts] == ["RT-K"]
         assert healthy.security.non_guard_calls() == []
+
+    def test_a_stale_item_with_the_file_gone_does_not_beat_the_slot(self, healthy):
+        # The item holds an older copy hswap has seen (here: stashed), the slot the newer
+        # one, and nothing links them: the file being gone proves nothing.
+        stale = creds("AT-K", "RT-K")
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(stale, ("a@example.com", ""), "1", "keepalive-split-brain")
+        healthy.security.items[ACTIVE_ITEM] = stale
+        healthy.file.unlink()
+        before = healthy.snapshot()
+        report = _reconcile()
+        assert report["error"]["type"] == "reconcile_ambiguous"
+        assert healthy.snapshot() == before
+
+    def test_with_the_file_gone_a_linked_item_is_kept(self, healthy):
+        successor = creds("AT-K", "RT-K")
+        ClaudeAccountSwitcher()
+        consumed_grants.record_lineage(
+            oauth.credential_fingerprint(healthy.login), oauth.credential_fingerprint(successor),
+            ("a@example.com", ""), consumed_grants.NEW_LOGIN,
+        )
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(successor, ("a@example.com", ""), "1", "keepalive-split-brain")
+        healthy.security.items[ACTIVE_ITEM] = successor
+        healthy.file.unlink()
+        report = _reconcile()
+        assert report["ok"] is True and report["kept"] == "keychain"
+        assert healthy.read_enc(SLOT_1) == successor
 
     @pytest.mark.parametrize("keychain_later", [True, False])
     def test_one_login_in_both_keeps_the_later_generation(self, healthy, keychain_later):
@@ -251,13 +291,8 @@ class TestReconcile:
 
 class TestDoctor:
     @pytest.fixture(autouse=True)
-    def _darwin(self):
-        with (
-            patch.object(ks.sys, "platform", "darwin"),
-            patch.object(rs.sys, "platform", "darwin"),
-            patch.object(launch_agent.sys, "platform", "darwin"),
-        ):
-            yield
+    def _darwin(self, darwin):
+        yield
 
     def _ready(self, env):
         rs.install(program=PROGRAM)  # no GUI domain here: written, deferred
@@ -366,14 +401,9 @@ def _launchctl(calls, *, gui=False, loaded=False):
 
 
 @pytest.fixture
-def macos_services(tmp_path, monkeypatch):
+def macos_services(tmp_path, monkeypatch, darwin):
     monkeypatch.setattr(ks, "SYSTEM_DIR", tmp_path / "LaunchDaemons")
-    with (
-        patch.object(ks.sys, "platform", "darwin"),
-        patch.object(rs.sys, "platform", "darwin"),
-        patch.object(launch_agent.sys, "platform", "darwin"),
-    ):
-        yield tmp_path
+    yield tmp_path
 
 
 class TestReconcileService:
@@ -416,9 +446,8 @@ class TestReconcileService:
         assert code == 1 and json_error_type(out) == "not_file_store"
         assert not launch_agent.plist_path(rs.LABEL).exists()
 
-    def test_cli_deferred_is_exit_3(self, healthy, capsys):
-        with patch.object(rs.sys, "platform", "darwin"), patch.object(launch_agent.sys, "platform", "darwin"):
-            code, out, _ = run_cli(["reconcile", "--install-service", "--json"], capsys)
+    def test_cli_deferred_is_exit_3(self, healthy, capsys, darwin):
+        code, out, _ = run_cli(["reconcile", "--install-service", "--json"], capsys)
         assert code == 3 and json.loads(out)["action"] == "deferred"
 
 
@@ -486,6 +515,12 @@ class TestKeepaliveDaemon:
             self._install(macos_services, calls)
         assert not any(call[0] == "sudo" for call in calls)
 
+    def test_a_daemon_loaded_from_another_plist_is_left_alone(self, macos_services):
+        calls = []
+        with _launchctl(calls, loaded=True), pytest.raises(ks.ForeignServiceError):
+            self._install(macos_services, calls)
+        assert not any(call[0] == "sudo" for call in calls)
+
     def test_cli_refuses_outside_the_file_store(self, env, capsys, macos_services):
         calls = []
         with _launchctl(calls):
@@ -505,13 +540,8 @@ class TestKeepaliveDaemon:
 
 
 class TestMigrateStoreWithReconcile:
-    def test_default_installs_the_reconcile_service_and_reports_doctor(self, split, capsys):
-        with (
-            patch.object(ks.sys, "platform", "darwin"),
-            patch.object(rs.sys, "platform", "darwin"),
-            patch.object(launch_agent.sys, "platform", "darwin"),
-        ):
-            code, out, err = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--json"], capsys)
+    def test_default_installs_the_reconcile_service_and_reports_doctor(self, split, capsys, darwin):
+        code, out, err = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--json"], capsys)
         report = json.loads(out)
         assert code == 0, err
         assert report["ok"] is True

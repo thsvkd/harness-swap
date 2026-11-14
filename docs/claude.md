@@ -623,9 +623,10 @@ hswap claude migrate-store --to file --keep keychain
 
 The file and the active slot's `.enc` take the kept login, what they held goes to the Keychain backups, and the next due `keepalive` refreshes once.
 
-**Rollback.** To go back to the Keychain, turn the setting off and restore a backup. Its account name is in the report, under `backups`:
+**Rollback.** To go back to the Keychain, remove the reconcile agent, turn the setting off and restore a backup, in that order: while the store is `file`, the agent moves a restored item straight back to the file. The backup's account name is in the report, under `backups`:
 
 ```bash
+hswap claude reconcile --uninstall-service
 hswap claude config unset credentials.store
 hswap claude migrate-store --restore-keychain claude-code-credentials.backup-<UTC time>
 ```
@@ -676,12 +677,13 @@ hswap claude reconcile --uninstall-service
 
 `reconcile` checks for an item by attributes. With none it exits 0 and reads nothing. With one, it decides which copy is the login, on evidence only:
 
-- the file holds no login (Claude Code deleted it): the Keychain's;
 - both hold the same refresh token: the later `expiresAt`;
 - a record links them (the ledger's `successorFp`, the stash's `consumedFp`), or the ledger lists one as spent: the other one;
 - exactly one of them is a login hswap has never seen (not in a slot, its `.enc`, the stash or the ledger), so it was written after hswap last looked: that one.
 
-Anything else is `reconcile_ambiguous` (exit 4) and nothing changes: choose with `migrate-store --to file --keep file|keychain`, or `/login` over SSH and `hswap claude add`. The rest is `migrate-store`'s, with the same locks and refusals: the kept login goes to `~/.claude/.credentials.json` and the active slot's `.enc`, whatever they held and every item's value are copied to `claude-swap` backups in the login keychain and read back, and only then are the items deleted and checked gone. These backups are not stash entries, because a stash entry for the account would hold every later refresh at `split_brain` (rule U); see [Cleaning up Keychain backups](#cleaning-up-keychain-backups). With the keychain locked it reports `keychain_item_present_locked` (exit 5), `keychainLocked: true`, and runs no `security` command but the attribute lookup. Outside the file store it refuses with `not_file_store`.
+The item is compared with the file, or, when Claude Code deleted the file, with the active slot's `.enc`: a GUI Claude Code with a stale cache can write an older token, so a missing file proves nothing by itself. With no `.enc` either, the item is kept. In the usual case (Claude Code refreshed the file's token, wrote the item and deleted the file) the item is a login hswap has never seen, so it wins.
+
+Anything else is `reconcile_ambiguous` (exit 4) and nothing changes: choose with `migrate-store --to file --keep file|keychain`, or `/login` over SSH and `hswap claude add`. The rest is `migrate-store`'s, with the same locks and refusals: the kept login goes to `~/.claude/.credentials.json` and the active slot's `.enc`, whatever they held and every item's value are copied to `claude-swap` backups in the login keychain and read back, and only then are the items deleted and checked gone. These backups are not stash entries, because a stash entry for the account would hold every later refresh at `split_brain` (rule U); see [Cleaning up Keychain backups](#cleaning-up-keychain-backups). With the keychain locked it reports `keychain_item_present_locked` (exit 5) and `keychainLocked: true`, and reads no value: only the item's attributes and the keychain's lock state. Outside the file store it refuses with `not_file_store`.
 
 The `--json` report is migrate-store's (`kept`, `fileFingerprint`, `keychainFingerprint`, `backups`, `slotsMigrated`, `itemAbsent`, `storesDiffer`, `warning`, `error`, and `plan` with `--dry-run`) plus `action` (`none`, `reconciled`, `planned`), `keychainItemPresent` and `keychainLocked`. It never carries a token; fingerprints are the first 6 hex digits of the refresh token's SHA-256.
 

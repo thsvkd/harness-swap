@@ -144,6 +144,8 @@ def _report_failure(report: dict, work) -> dict:
             "type": "keychain_unavailable",
             "message": _STEP_FAILED.format(type(e).__name__),
         }
+    except OSError as e:  # its text names a path
+        report["error"] = {"type": "io_error", "message": _STEP_FAILED.format(type(e).__name__)}
     report["ok"] = report["error"] is None
     return report
 

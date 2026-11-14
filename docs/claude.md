@@ -171,6 +171,8 @@ hswap claude auto                      # Auto-switch when nearing rate limits (s
 hswap claude keepalive                 # Sync the active login's stores and refresh it ahead of expiry
 hswap claude keychain-selftest         # Check a credential-sized value survives a Keychain write (macOS)
 hswap claude migrate-store --to file --keep file   # Move an SSH-only Mac to the file store (macOS)
+hswap claude reconcile                 # File store: take back a login Claude Code wrote to the Keychain
+hswap claude doctor                    # Check this Mac can keep its logins with no one logged in
 hswap claude config                    # Show or edit settings (see Configuration below)
 hswap claude list                      # Show all accounts with 5h/7d usage and reset times
 hswap claude list --token-status       # Add source-labelled OAuth token diagnostics
@@ -569,7 +571,7 @@ The report also carries `store` (`file`, `keychain` when `credentials.requireKey
 
 This is for a Mac used only over SSH and launchd daemons, where the login keychain stays locked. It is off by default: `credentials.store` is `auto`, which is everything above. Elsewhere than macOS the setting does nothing.
 
-**What Claude Code does.** Measured on Claude Code 2.1.319. No setting or environment variable puts Claude Code on a file store on macOS. Its store is Keychain first, with the file as a fallback:
+**What Claude Code does.** Measured on Claude Code 2.1.319, and unchanged in 2.1.325. No setting or environment variable puts Claude Code on a file store on macOS. Its store is Keychain first, with the file as a fallback:
 
 - *Reads:* the Keychain, and then the file if the Keychain is locked or has no item.
 - *Writes:* the Keychain first. If that works and the Keychain held nothing before, Claude Code **deletes the file**. If it fails because the keychain is locked and this process has seen the item, nothing is written anywhere. Any other failure writes the file.
@@ -601,7 +603,7 @@ This step records no lineage, and it puts no Keychain copy in the stash as a riv
 
 When the file and the Keychain hold different refresh tokens, `--dry-run` and the real run both set `storesDiffer` and print a warning with both fingerprints, because the login you do not keep is backed up but may be the newer one. If the kept one is spent, Claude will need `/login`. Compare the fingerprints and read the warning before you choose `--keep`.
 
-**What file mode does.** The active login is the file alone, slot backups are `.enc` files alone, and hswap does not read, write or delete a Keychain credential item or call `security` for one, with two exceptions: the guard below and `migrate-store`. Set it by hand with `hswap claude config set credentials.store file`, or force it with `HSWAP_CREDENTIALS_STORE=file`. The variable can only tighten: no other value turns off a configured `file`. It cannot be combined with `credentials.requireKeychain` or `HSWAP_REQUIRE_KEYCHAIN`, since one forbids the file and the other the Keychain. `config set` refuses the second one, and with both on through the environment or a hand edit, every command except `config` stops with `config_conflict` before it does anything.
+**What file mode does.** The active login is the file alone, slot backups are `.enc` files alone, and hswap does not read, write or delete a Keychain credential item or call `security` for one, with three exceptions: the guard below, `migrate-store` and `reconcile`. Set it by hand with `hswap claude config set credentials.store file`, or force it with `HSWAP_CREDENTIALS_STORE=file`. The variable can only tighten: no other value turns off a configured `file`. It cannot be combined with `credentials.requireKeychain` or `HSWAP_REQUIRE_KEYCHAIN`, since one forbids the file and the other the Keychain. `config set` refuses the second one, and with both on through the environment or a hand edit, every command except `config` stops with `config_conflict` before it does anything.
 
 The same stop applies on macOS, whatever the store, when the policy cannot be understood: a `credentials.store` other than `auto` or `file`, a `credentials.requireKeychain` that is not true or false, a `HSWAP_CREDENTIALS_STORE` other than `auto` or `file` (empty counts as unset), or a `settings.json` that cannot be read or parsed. `auto` is the default only when the key is absent, since falling back to it would silently drop these protections. `config`, `--help` and `--version` still run so you can repair it, and `keepalive` writes no `keepalive.json` in this state, so a watcher should act on the exit code too.
 
@@ -613,7 +615,7 @@ If the file is missing, `keepalive` reports `no_credentials`.
 
 **What to avoid.** Do not run `claude` where the keychain is unlocked: at the Mac's own screen, through screen sharing, or in a session after `security unlock-keychain`. One refresh or `/login` there writes the Keychain and deletes the file. Use `/login` over SSH instead, where it writes the file.
 
-**Repair.** When `keepalive` reports `keychain_item_present`, the Keychain holds the newer login, so keep that one, from the GUI session or after `security unlock-keychain`:
+**Repair.** When `keepalive` reports `keychain_item_present`, run `hswap claude reconcile` from the GUI session or after `security unlock-keychain`; its LaunchAgent does that by itself (see [Running without a login session](#running-without-a-login-session-file-store)). If it reports `reconcile_ambiguous`, or to choose yourself, keep the store whose writer refreshed last, normally the Keychain:
 
 ```bash
 hswap claude migrate-store --to file --keep keychain
@@ -645,6 +647,91 @@ security delete-generic-password -s claude-swap -a <name>
 ```
 
 Never delete one you might still restore.
+
+## Running without a login session (file store)
+
+The goal: with no one logged in to the Mac (a LaunchDaemon, SSH, a reboot to the login window), usage readings, `keepalive`, `switch` and `auto` all keep working, whatever FileVault or automatic login are set to.
+
+**Why the file store.** A login keychain that no session has unlocked cannot be read, so with the Keychain as a store every slot shows `keychain_unavailable` and nothing can refresh. The alternatives do not cover it: a `claude setup-token` token can only make model requests (no usage, no switching), and a separate keychain needs its password stored in plaintext next to it. So the file store (`credentials.store=file`) is the way, with one invariant: **no `Claude Code-credentials*` item in the login keychain.** In file mode, `keepalive`, `auto --once`, `switch` and `list` touch the keychain only through the guard's attribute lookup, which answers while the keychain is locked.
+
+**Set it up** once, from the GUI session or after `security unlock-keychain` in the same shell:
+
+```bash
+hswap claude migrate-store --to file --keep file --dry-run   # read storesDiffer and the plan
+hswap claude migrate-store --to file --keep file             # or --keep keychain; see above
+hswap claude keepalive --install-service --system --then-auto   # asks for your sudo password
+hswap claude doctor                                         # exit 0 when ready
+```
+
+`migrate-store` installs the reconcile LaunchAgent at the end (below) unless you pass `--without-reconcile`; `--with-reconcile` is the default. Its report adds `reconcileService` (`{"action", "loaded", "plist"}`, `{"action": null, "error": …}` if the install failed, which does not undo the move, or null when skipped or a dry run) and `doctor` (`{"ok", "problems"}`).
+
+**The split comes back, and `reconcile` ends it.** Claude Code 2.1.325 cannot be kept off the Keychain on macOS. Wherever the keychain is open (the Mac's own screen, screen sharing, VS Code, `security unlock-keychain`), a `/login`, a token refresh or an MCP login writes the Keychain item, and if the item was new Claude Code deletes the file. From then on every write stops with `keychain_item_present` until the item is gone. Since the item can only be read where it can be written, the cleanup runs in the login session:
+
+```bash
+hswap claude reconcile [--dry-run] [--json]
+hswap claude reconcile --install-service      # dev.hswap.reconcile, runs when the keychain changes
+hswap claude reconcile --service-status [--json]
+hswap claude reconcile --uninstall-service
+```
+
+`reconcile` checks for an item by attributes. With none it exits 0 and reads nothing. With one, it decides which copy is the login, on evidence only:
+
+- the file holds no login (Claude Code deleted it): the Keychain's;
+- both hold the same refresh token: the later `expiresAt`;
+- a record links them (the ledger's `successorFp`, the stash's `consumedFp`), or the ledger lists one as spent: the other one;
+- exactly one of them is a login hswap has never seen (not in a slot, its `.enc`, the stash or the ledger), so it was written after hswap last looked: that one.
+
+Anything else is `reconcile_ambiguous` (exit 4) and nothing changes: choose with `migrate-store --to file --keep file|keychain`, or `/login` over SSH and `hswap claude add`. The rest is `migrate-store`'s, with the same locks and refusals: the kept login goes to `~/.claude/.credentials.json` and the active slot's `.enc`, whatever they held and every item's value are copied to `claude-swap` backups in the login keychain and read back, and only then are the items deleted and checked gone. These backups are not stash entries, because a stash entry for the account would hold every later refresh at `split_brain` (rule U); see [Cleaning up Keychain backups](#cleaning-up-keychain-backups). With the keychain locked it reports `keychain_item_present_locked` (exit 5), `keychainLocked: true`, and runs no `security` command but the attribute lookup. Outside the file store it refuses with `not_file_store`.
+
+The `--json` report is migrate-store's (`kept`, `fileFingerprint`, `keychainFingerprint`, `backups`, `slotsMigrated`, `itemAbsent`, `storesDiffer`, `warning`, `error`, and `plan` with `--dry-run`) plus `action` (`none`, `reconciled`, `planned`), `keychainItemPresent` and `keychainLocked`. It never carries a token; fingerprints are the first 6 hex digits of the refresh token's SHA-256.
+
+The LaunchAgent `~/Library/LaunchAgents/dev.hswap.reconcile.plist` runs `hswap claude reconcile` with `WatchPaths` on `~/Library/Keychains/login.keychain-db`, `RunAtLoad`, and a 3600 s interval as a backstop, so a Claude Code write is cleaned up within seconds and at every login. Its own delete wakes it once more, and that run finds nothing. Like the keepalive agent it is marked `HSWAP_SERVICE=reconcile`, leaves a plist it did not write alone (`ForeignService`), refuses root, and without a GUI session writes the plist for the next login and exits 3. `--install-service` refuses with `not_file_store` outside the file store.
+
+**keepalive with no one logged in.** The gui keepalive agent only runs while someone is logged in. `--system` installs `/Library/LaunchDaemons/dev.hswap.keepalive.plist` instead, a LaunchDaemon with `UserName` set to you and `HOME` and `USER` set to yours, same program, interval and `WatchPaths`. hswap runs as you and calls `sudo` for the root steps only (`install -o root -g wheel -m 644`, `launchctl bootstrap system`, `bootout`, `rm`). It refuses with `not_file_store` outside the file store, since a daemon cannot reach the keychain. Only one keepalive job exists: installing the daemon removes hswap's gui agent once the daemon is loaded, and the gui install refuses with `ServiceConflict` while the daemon's plist exists. `--uninstall-service --system` removes it; `--service-status` reports whichever is installed, with `"domain": "system"` or `"gui"` (null when neither). The plist is world-readable as launchd requires of a daemon, so a proxy URL with a password in it (forwarded from your shell) is readable by local users. Instead of the daemon, any scheduler running as you works too, e.g. `hswap claude keepalive --json && hswap claude auto --once --json` from jarvis.
+
+**`doctor`.** `hswap claude doctor [--json]` changes nothing and needs no login session. Exit 0 when `ok`, 2 when there are problems, 1 when it could not check. The JSON is a contract: fields are only ever added, and `problems` holds these codes.
+
+```json
+{"schemaVersion": 1, "ok": false, "problems": ["keychain_item_present"],
+ "store": "file", "keychainItemPresent": true, "keychainLocked": true,
+ "fileExists": true, "fileMode": "0600", "slotsWithoutBackup": [], "sessionDirs": [],
+ "reconcileService": {"installed": true, "managed": true, "loaded": false, "outdated": false, "lastExitCode": null},
+ "keepaliveService": {"domain": "system", "installed": true, "managed": true, "loaded": true, "outdated": false, "lastExitCode": 0}}
+```
+
+- `store`: `file`, `auto` or `keychain` (`credentials.requireKeychain`); always `file` off macOS, where the file is the only store.
+- `keychainItemPresent`: the guard's answer, a failed check counting as true. `keychainLocked`: this process cannot use the login keychain (locked, or no login session). Both null off macOS.
+- `fileExists`, `fileMode` (octal string, null without a file), `slotsWithoutBackup` (slot numbers with no `.enc`), `sessionDirs` (names under `sessions/`).
+- `reconcileService`, `keepaliveService`: `installed`, `managed`, `loaded`, `outdated`, `lastExitCode`, and the keepalive job's `domain`. Null off macOS.
+
+| code | meaning (macOS unless noted) | fix |
+|---|---|---|
+| `not_file_store` | the store is not `file` | `migrate-store --to file …` |
+| `keychain_item_present` | a `Claude Code-credentials*` item exists, or the check failed | `reconcile` from a login session |
+| `file_missing` | file store (or any OS) and no credentials file | `/login` over SSH, then `add` |
+| `file_mode_insecure` | the file is readable by group or others (POSIX) | `chmod 600 ~/.claude/.credentials.json` |
+| `slot_without_backup` | a slot has no `.enc` | log in as it and `add`, or remove the slot |
+| `session_profiles` | `sessions/` holds profiles; file mode refuses to write | remove them |
+| `profile_env` | `CLAUDE_CONFIG_DIR` or `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set | unset it; Claude Code then uses another item |
+| `reconcile_service_missing` | hswap's reconcile agent is not installed | `reconcile --install-service` |
+
+**Exit codes of the new commands.**
+
+| command | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|---|
+| `reconcile` | ok, also nothing to do | failed or refused | | | `reconcile_ambiguous` | `keychain_item_present_locked` |
+| `reconcile --install-service` | done | refused or failed | | written, loads at next login | | |
+| `keepalive --install-service --system` | done | refused or failed (`not_file_store`, `ForeignService`, sudo) | | | | |
+| `doctor` | ok | could not check | problems found | | | |
+
+**What it costs.** The file store keeps every login in plaintext: `~/.claude/.credentials.json` (0600) and each slot's `.enc`, stash entry and `.prev` (base64, 0600). The Keychain encrypts at rest and refuses reads while locked; a file is readable by any process running as you at any time, and from a disk image, an unencrypted backup or a stolen disk. Turn on FileVault, keep `~/.claude` and the hswap store out of unencrypted backups, and treat the machine's user account as the boundary. On a Mac where FileVault is off this difference is large.
+
+**When it goes wrong.**
+
+- `keepalive.json` / `keepalive --json` with `keychain_item_present`: a Claude Code with the keychain open wrote the item. The reconcile agent cleans it at the next keychain change or login; until then nothing is refreshed or sent.
+- `reconcile` exit 4, `reconcile_ambiguous`: two logins nothing orders. Choose with `migrate-store --to file --keep …`.
+- `reconcile` exit 5, `keychain_item_present_locked`: run it again from a login session.
+- `doctor` exit 2: the `problems` codes above. jarvis reads `doctor --json`.
 
 ## Uninstall
 

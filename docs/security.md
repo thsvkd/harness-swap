@@ -37,6 +37,26 @@ follows, where they are enforced, and how they are tested.
   own lock file (`auth.lock`, `auth.json.lock`), which hswap opens without
   truncating.
 
+## Claude on macOS without a login session (file store)
+
+`credentials.store=file` keeps every Claude login in plaintext so it works with no
+one logged in: `~/.claude/.credentials.json` and the slots' `.enc`, stash and
+`.prev` files (base64, not encryption), all 0600. The Keychain encrypts at rest and
+refuses reads while locked; these files are readable by any process running as the
+user, and from a disk image, an unencrypted backup or a stolen disk. Turn on
+FileVault and keep `~/.claude` and the hswap store out of unencrypted backups.
+Details in [claude.md](claude.md#running-without-a-login-session-file-store).
+
+- `reconcile` reads a Claude Code Keychain item's value only from a login session,
+  copies it and whatever it replaces into `claude-swap` backups in the login
+  keychain with a read-back, and only then deletes the item. Values go to
+  `security -i` on stdin, never argv; reports carry 6-hex fingerprints, never tokens.
+  With nothing to prove which copy is newer it changes nothing.
+- `doctor` is read-only and asks the keychain by attributes only.
+- `keepalive --install-service --system` runs `sudo` for the root steps only; hswap
+  itself refuses to run as root. The daemon plist is world-readable (launchd's
+  rule), so a forwarded proxy URL with a password in it is visible to local users.
+
 ## Switching never loses a login
 
 For every file-backed harness (`core/credentials.py`):

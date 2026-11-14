@@ -62,6 +62,22 @@ Details in [claude.md](claude.md#running-without-a-login-session-file-store).
   rule), so the install refuses while a forwarded proxy variable carries a user
   name or password.
 
+## Logs (Claude engine)
+
+`logs/events.jsonl` and `claude-swap.log` in the store root, and the launchd stderr
+files under `~/Library/Logs/dev.hswap.*.err`, are all 0600.
+
+- In them: what ran (command, exit code, outcome, duration), who ran it
+  (`HSWAP_CALLER`, the launchd session), slot numbers, the first 6 hex digits of a
+  refresh token's SHA-256, access-token expiry times, error types, decision names.
+- Never in them: a token or any part of one, a credential file's content, an error
+  message (it can name a path or carry server text), an email address in the event
+  log (accounts are slot numbers there). Paths are written with `~` for the home
+  directory. As a last guard, any string shaped like a token (`sk-ant-…`, or 40 or
+  more token characters in a row) is replaced with `[redacted]` before a line is
+  written; a test runs every logging command against real-sized fake tokens.
+- Not written as root, and not into a store that does not exist yet.
+
 ## Switching never loses a login
 
 For every file-backed harness (`core/credentials.py`):

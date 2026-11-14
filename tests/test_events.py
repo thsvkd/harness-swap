@@ -353,6 +353,16 @@ class TestLogCommand:
         assert "reconcile" in lines[1] and "launchd-gui-reconcile" in lines[1]
         assert "ambiguous" in lines[1] and "reconcile_ambiguous" in lines[1]
 
+    def test_without_a_filter_it_shows_the_last_20(self, healthy, capsys):
+        logs = healthy.root / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        rows = [{"ts": events.iso(time.time() - 100 + n), "cmd": "status", "n": n} for n in range(25)]
+        (logs / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        _, out, _ = run_cli(["log", "--json"], capsys)
+        assert [json.loads(line)["n"] for line in out.splitlines()] == list(range(5, 25))
+        _, out, _ = run_cli(["log", "--json", "--cmd", "status"], capsys)
+        assert len(out.splitlines()) == 25
+
     def test_a_bad_since_is_a_usage_error(self, healthy, capsys):
         assert run_cli(["log", "--since", "yesterday"], capsys)[0] == 2
 

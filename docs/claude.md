@@ -173,6 +173,7 @@ hswap claude keychain-selftest         # Check a credential-sized value survives
 hswap claude migrate-store --to file --keep file   # Move an SSH-only Mac to the file store (macOS)
 hswap claude reconcile                 # File store: take back a login Claude Code wrote to the Keychain
 hswap claude doctor                    # Check this Mac can keep its logins with no one logged in
+hswap claude log --since 24h           # What each command did, who ran it, and why (see Logs)
 hswap claude config                    # Show or edit settings (see Configuration below)
 hswap claude list                      # Show all accounts with 5h/7d usage and reset times
 hswap claude list --token-status       # Add source-labelled OAuth token diagnostics
@@ -217,6 +218,50 @@ The original flag spellings (`hswap claude --switch`, `hswap claude --list`, ...
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
 - Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `hswap claude add --slot N`, or by replacing its stored credentials from a known-good export — a plain `hswap claude import backup.cswap` replaces dead-token slots automatically)
 - Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping hswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
+
+## Logs
+
+Every `hswap claude` command adds one line to `logs/events.jsonl` in the store root (see [Data locations](#data-locations)) when it ends, plus a line for each switch an `auto` loop makes. The file is 0600 and turns over at 1 MiB, keeping three older ones (`events.jsonl.1` to `.3`). Nothing is written when the store does not exist yet, as root, for `--help` and `--version`, or for `log` itself. A line that cannot be written is dropped: the command's result and exit code never depend on it.
+
+```bash
+hswap claude log                        # the last 20, one line each
+hswap claude log --since 24h --cmd reconcile
+hswap claude log --since 2026-11-14T00:00:00Z --json   # the stored lines as they are
+hswap claude log --tail 5
+```
+
+`--since` takes `30m`, `1h`, `24h`, `7d` or an ISO time; `--cmd` one command name; `--tail N` the last N (20 by default when neither filter is given). It is read only, needs no login session and starts no switcher.
+
+Each line is one JSON object:
+
+```json
+{"ts": "2026-11-14T17:21:33.456Z", "v": "0.3.1", "cmd": "reconcile", "caller": "launchd-gui-reconcile",
+ "session": "aqua", "store": "file", "activeSlot": 1, "outcome": "ambiguous", "exit": 4, "ms": 9,
+ "error": "reconcile_ambiguous",
+ "details": {"item": {"side": "keychain", "fp": "a5e4a1", "expiresAt": "2026-11-15T01:21:33Z", "role": null},
+             "rival": {"side": "slot", "fp": "16c7c6", "expiresAt": "2026-11-15T01:21:33Z", "role": null},
+             "rule": "none", "kept": null, "backups": 1, "pruned": 0, "deleted": false,
+             "keychainItemPresent": true, "keychainLocked": false, "dryRun": false}}
+```
+
+- `ts` (UTC), `v` (the hswap version), `cmd` (`list`, `status`, `switch`, `keepalive`, `auto`, `reconcile`, `doctor`, `migrate-store`, …), `ms`, `exit` (the process exit code).
+- `caller`: who ran it. `HSWAP_CALLER` when set: the LaunchAgents and the LaunchDaemon hswap installs set `launchd-gui-keepalive`, `launchd-system-keepalive` and `launchd-gui-reconcile`, and jarvis sets `jarvis-gateway`. Otherwise `tty` for a terminal and `unknown` for anything else (cron, a pipe).
+- `session`: `launchctl managername` on macOS, `aqua` (a GUI login), `background` (SSH, a per-user agent outside the GUI), `system` (a LaunchDaemon) or `unknown`; `n/a` elsewhere.
+- `store` (`file`, `auto`, `keychain`, `invalid`), `activeSlot` (the slot number, null if none).
+- `outcome`: `ok` or `error` unless the command says more: `keepalive` its `action` (`refreshed`, `none`, `synced-file`, …), `reconcile` `reconciled`, `none`, `planned`, `ambiguous` or `locked`, `auto --once` `switched`, `none`, `blocked` or `error`, `switch` `switched` or `none`, `doctor` `ok` or `problems`.
+- `error`: the error's type only (`keychain_item_present`, `reconcile_ambiguous`, an exception class name), never its message.
+- `details`, by command:
+  - `reconcile`: `item` and `rival` (which store, the refresh token's 6-hex fingerprint, `expiresAt`, its recorded role), `rule` (`same_lineage`, `recorded_link`, `settled_roles`, `suspect`, `roles_unreadable`, `item_empty`, `no_rival`, `none`), `kept`, `backups`, `pruned`, `deleted`, `keychainItemPresent`, `keychainLocked`.
+  - `keepalive`: `action`, `refreshed`, `reason` (`due`, `not_due`, `blocked:<error type>`), `ahead`, `accessExpiresAt`, `loginExpiresAt`, `keychainItemPresent`.
+  - `auto`: `ticks`, the events it printed (`poll` with each slot's headroom, windows and the threshold, `switch`, `no-switch` with its reason code, …), with accounts as slot numbers.
+  - `switch`: `switch` `{from, to, reason, trigger}`, `trigger` being `person` or `auto`.
+  - `doctor`: `problems`. `migrate-store`: `steps`, `kept`, `slotsMigrated`, `backups`, `pruned`, the two services' actions and doctor's problems.
+
+`claude-swap.log` in the store root keeps its lines (`<time> - <LEVEL> - <message>`) with the run in between: `<time> - WARNING - [cmd=keepalive caller=launchd-system-keepalive session=system] Keychain read failed rc=36`.
+
+hswap's LaunchAgents and LaunchDaemon write stderr to `~/Library/Logs/dev.hswap.<job>.err`. hswap creates that file 0600 before launchd does, puts a UTC time at the start of each line it writes there, and moves it to `.err.1` at the start of a run once it passes 1 MiB. A plist installed before 0.3.1 has no `HSWAP_CALLER`, so `--service-status` reports it `outdated`: run `--install-service` again.
+
+Not logged: `hswap claude run` (it becomes `claude`), `hswap list`/`hswap status` across all harnesses (only `hswap claude …`), and a command killed before it ends.
 
 ## Data locations
 
@@ -706,6 +751,8 @@ The LaunchAgent `~/Library/LaunchAgents/dev.hswap.reconcile.plist` runs `hswap c
  "reconcileService": {"installed": true, "managed": true, "loaded": true, "outdated": false, "lastExitCode": 4},
  "keepaliveService": {"domain": "system", "ahead": 3600.0, "installed": true, "managed": true, "loaded": true, "outdated": false, "lastExitCode": 0},
  "keychainBackups": 3, "lastReconcileError": "reconcile_ambiguous",
+ "lastEvents": [{"ts": "2026-11-14T17:20:01.120Z", "cmd": "keepalive", "caller": "launchd-system-keepalive", "outcome": "none", "exit": 0},
+                {"ts": "2026-11-14T17:21:33.456Z", "cmd": "reconcile", "caller": "launchd-gui-reconcile", "outcome": "ambiguous", "exit": 4}],
  "lastReconcileHint": "Nothing records which login is newer. The keepalive service was running, so the server most likely revoked the access token early (401) and Claude Code refreshed it itself. Check which store was written last and keep it with hswap claude migrate-store --to file --keep file|keychain. For reference only, nothing decides by it: the Keychain item's access token expires at 2026-11-14T20:10:00Z, the active slot's .enc's at 2026-11-14T12:05:00Z."}
 ```
 
@@ -718,6 +765,7 @@ When it cannot read the store, it prints the usual error envelope, `{"schemaVers
 - `keychainBackups`: how many `claude-swap` `*.backup-*` items the login keychain holds (by attributes; null off macOS or when the listing failed).
 - `lastReconcileError`: the error `type` of the last `reconcile` run (`cache/reconcile.json`), null when it succeeded or never ran.
 - `lastReconcileHint`: that run's `hint` (text for a person, not a code), null unless it ended `reconcile_ambiguous`.
+- `lastEvents`: the last five lines of [the event log](#logs), oldest first, each `{ts, cmd, caller, outcome, exit}`; `[]` when there are none. doctor's own run is not among them (it is written after).
 
 | code | meaning (macOS unless noted) | fix |
 |---|---|---|

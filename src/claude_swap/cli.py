@@ -1326,8 +1326,9 @@ def _log_command(argv: list[str]) -> None:
         row for row in events.read(paths.get_backup_root())
         if (args.cmd is None or row.get("cmd") == args.cmd) and (since is None or after(row))
     ]
-    if args.tail is not None:
-        rows = rows[-args.tail:] if args.tail else []
+    tail = args.tail if args.tail is not None else (None if args.since or args.cmd else 20)
+    if tail is not None:
+        rows = rows[-tail:] if tail else []
     for row in rows:
         if args.json:
             print(json.dumps(row, separators=(",", ":")))

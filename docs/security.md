@@ -51,11 +51,15 @@ Details in [claude.md](claude.md#running-without-a-login-session-file-store).
   copies it and whatever it replaces into `claude-swap` backups in the login
   keychain with a read-back, and only then deletes the item. Values go to
   `security -i` on stdin, never argv; reports carry 6-hex fingerprints, never tokens.
-  With nothing to prove which copy is newer it changes nothing.
+  It never treats a login it has not seen as the newer one (a stale Claude Code can
+  write such a token), and with nothing to prove which copy is newer it changes
+  nothing. It re-reads each item right before deleting it, and keeps the newest 5
+  backups per name.
 - `doctor` is read-only and asks the keychain by attributes only.
 - `keepalive --install-service --system` runs `sudo` for the root steps only; hswap
   itself refuses to run as root. The daemon plist is world-readable (launchd's
-  rule), so a forwarded proxy URL with a password in it is visible to local users.
+  rule), so the install refuses while a forwarded proxy variable carries a user
+  name or password.
 
 ## Switching never loses a login
 

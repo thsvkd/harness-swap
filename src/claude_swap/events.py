@@ -305,22 +305,22 @@ def _rows(lines) -> list[dict]:
     return rows
 
 
+_TAIL_BLOCK = 64 * 1024
+
+
 def _tail(candidate: Path, wanted: int) -> list[dict]:
-    """The last ``wanted`` events of one file, reading back from its end only as far as needed."""
-    block = 64 * 1024
+    """The last ``wanted`` events of one file, reading back from its end only as far as
+    needed: until that many lines parse, so broken ones do not shorten the answer."""
+    rows: list[dict] = []
     with open(candidate, "rb") as f:
         end = f.seek(0, os.SEEK_END)
-        data, start = b"", end
-        while start > 0:
-            start = max(0, start - block)
+        start = end
+        while start > 0 and len(rows) < wanted:
+            start = max(0, start - _TAIL_BLOCK)
             f.seek(start)
-            data = f.read(end - start)
-            if data.count(b"\n") > wanted:
-                break
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    if start > 0:
-        lines = lines[1:]  # the first may be a partial line
-    return _rows(lines)[-wanted:]
+            lines = f.read(end - start).decode("utf-8", errors="replace").splitlines()
+            rows = _rows(lines[1:] if start > 0 else lines)  # the first may be a partial line
+    return rows[-wanted:]
 
 
 def read(root: Path | None = None, last: int | None = None) -> list[dict]:
@@ -367,7 +367,8 @@ def _slots(value):
 # a detail, a warning or an email: those carry exception text, paths and server words.
 _AUTO_FIELDS = (
     "event", "reason", "trigger", "from", "to", "active", "number", "headroomPct", "threshold",
-    "windows", "fetchErrors", "dryRun", "transient", "earliestResetAt", "seconds",
+    "weeklyThreshold", "windowsPct", "fetchErrors", "dryRun", "transient", "earliestResetAt",
+    "seconds",
 )
 
 

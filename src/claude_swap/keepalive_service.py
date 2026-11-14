@@ -18,6 +18,7 @@ Linux is not covered: there is no Keychain, so a cron line does the same job.
 from __future__ import annotations
 
 import getpass
+import json
 import os
 from contextlib import contextmanager
 import plistlib
@@ -77,13 +78,24 @@ def between_runs():
     if not root.is_dir():
         yield  # no store, no run to wait for (and no store to create)
         return
-    lock = FileLock(root / ".lock", timeout=RELOAD_LOCK_TIMEOUT_S)
-    if not lock.acquire():
-        raise ServiceBusyError()
     try:
+        accounts = json.loads((root / "sequence.json").read_text(encoding="utf-8")).get("accounts") or {}
+    except (OSError, ValueError, AttributeError):
+        accounts = {}
+    # Every slot's consume lock first, as migrate-store takes them: an inactive slot's refresh
+    # (an `auto --once` the job chains) holds only that one across its POST.
+    paths_in_order = [root / "credentials" / f".consume-{num}.lock" for num in sorted(accounts)]
+    held = []
+    try:
+        for lock_path in [*paths_in_order, root / ".lock"]:
+            lock = FileLock(lock_path, timeout=RELOAD_LOCK_TIMEOUT_S)
+            if not lock.acquire():
+                raise ServiceBusyError()
+            held.append(lock)
         yield
     finally:
-        lock.release()
+        for lock in reversed(held):
+            lock.release()
 
 
 class AheadTooShortError(ClaudeSwitchError):
@@ -384,9 +396,9 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
     loaded = launch_agent.is_loaded(LABEL, domain=SYSTEM)
     if doc is None and loaded:
         raise ForeignServiceError(f"launchd runs {target} from a plist hswap did not write; left untouched.")
-    with between_runs():
-        _reload_system(plist, path, target, doc, unchanged, loaded, home)
-        if gui is not None:
+    _reload_system(plist, path, target, doc, unchanged, loaded, home)
+    if gui is not None:
+        with between_runs():
             launch_agent.uninstall(LABEL, home, uid)
     if unchanged and loaded:
         action = "unchanged"
@@ -397,26 +409,34 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
 
 def _reload_system(plist, path, target, doc, unchanged, loaded, home) -> None:
     if not (unchanged and loaded):
+        # The password prompt first, with no lock held: keepalive, auto and switch go on
+        # while a person types, and the steps below find sudo's credentials cached.
+        _sudo("-v")
         prepare_stderr_log(LABEL, home)  # the user's: launchd would create it as root
         previous = path.read_bytes() if doc is not None else None
-        _put_system_plist(plist, path)
-        if loaded:
-            _sudo("launchctl", "bootout", target)
-            launch_agent._wait_until_unloaded(LABEL, domain=SYSTEM)
+        _put_system_plist(plist, path)  # launchd reads it only at bootstrap
+        with between_runs():
+            _bootstrap_system(path, target, previous, loaded)
+
+
+def _bootstrap_system(path, target, previous, loaded) -> None:
+    if loaded:
+        _sudo("launchctl", "bootout", target)
+        launch_agent._wait_until_unloaded(LABEL, domain=SYSTEM)
+    try:
+        _sudo("launchctl", "bootstrap", SYSTEM, str(path))
+    except ClaudeSwitchError:
+        # Back to what was there: no plist launchd would load at the next boot unasked.
         try:
-            _sudo("launchctl", "bootstrap", SYSTEM, str(path))
+            if previous is None:
+                _sudo("rm", "-f", str(path))
+            else:
+                _put_system_plist(previous, path)
+                if loaded:
+                    _sudo("launchctl", "bootstrap", SYSTEM, str(path))
         except ClaudeSwitchError:
-            # Back to what was there: no plist launchd would load at the next boot unasked.
-            try:
-                if previous is None:
-                    _sudo("rm", "-f", str(path))
-                else:
-                    _put_system_plist(previous, path)
-                    if loaded:
-                        _sudo("launchctl", "bootstrap", SYSTEM, str(path))
-            except ClaudeSwitchError:
-                pass
-            raise
+            pass
+        raise
 
 
 def install(
@@ -453,6 +473,7 @@ def uninstall(home: Path | None = None, uid: int | None = None, system: bool = F
         return {"action": uninstall_job(LABEL, _MARKER, home, uid), **status(home, uid)}
     if _read_system() is None:
         return {"action": "absent", **status(home, uid)}
+    _sudo("-v")  # the password prompt holds no lock
     if launch_agent.is_loaded(LABEL, domain=SYSTEM):
         with between_runs():
             _sudo("launchctl", "bootout", f"{SYSTEM}/{LABEL}")

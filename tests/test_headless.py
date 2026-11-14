@@ -891,6 +891,104 @@ class TestReinstallWaitsForARun:
             assert install()["action"] == "updated"
 
 
+class TestDaemonSudoBeforeTheLock:
+    """The password prompt must not hold the store lock: keepalive, auto and switch would
+    fail with `locked` while a person types."""
+
+    @pytest.fixture
+    def store_lock(self, macos_services):
+        from claude_swap import paths
+
+        root = paths.get_backup_root()
+        root.mkdir(parents=True, exist_ok=True)
+        return root / ".lock"
+
+    def _observing(self, lock_path, seen):
+        from claude_swap.locking import FileLock
+
+        def free() -> bool:
+            probe = FileLock(lock_path, timeout=0)
+            got = probe.acquire(timeout=0)
+            if got:
+                probe.release()
+            return got
+
+        def watch(calls):
+            fake = _launchctl(calls, loaded=True)
+            real = fake.kwargs["side_effect"]
+
+            def run(argv, **kwargs):
+                if argv[0] == "sudo":
+                    seen.append((tuple(argv[1:3]), free()))
+                return real(argv, **kwargs)
+
+            fake.kwargs["side_effect"] = run
+            return fake
+        return watch
+
+    def _seed(self, macos_services):
+        with _launchctl([]):
+            ks.install(3600, False, macos_services, UID, PROGRAM, system=True, user="kgolf")
+        doc = plistlib.loads(ks.system_plist_path().read_bytes())
+        del doc["EnvironmentVariables"]["HSWAP_CALLER"]  # outdated: a reinstall reloads it
+        ks.system_plist_path().write_bytes(plistlib.dumps(doc))
+
+    def test_reinstall_asks_sudo_first_and_locks_only_around_launchctl(self, macos_services, store_lock):
+        self._seed(macos_services)
+        seen = []
+        with self._observing(store_lock, seen)([]):
+            assert ks.install(3600, False, macos_services, UID, PROGRAM, system=True, user="kgolf")["action"] == "updated"
+        assert seen[0] == (("-v",), True)  # authenticated with the lock free
+        assert ("install", "-o") in [step for step, _ in seen]
+        assert all(free for step, free in seen if step[0] == "install")
+        assert [free for step, free in seen if step[0] == "launchctl"] == [False, False]
+
+    def test_uninstall_too(self, macos_services, store_lock):
+        self._seed(macos_services)
+        seen = []
+        with self._observing(store_lock, seen)([]):
+            assert ks.uninstall(macos_services, UID, system=True)["action"] == "removed"
+        assert seen[0] == (("-v",), True)
+        assert [free for step, free in seen if step[0] == "launchctl"] == [False]
+
+    def test_a_refused_password_changes_nothing(self, macos_services, store_lock):
+        self._seed(macos_services)
+        before = ks.system_plist_path().read_bytes()
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:2] == ["sudo", "-v"]:
+                return subprocess.CompletedProcess(argv, 1, "", "Sorry, try again.")
+            if argv[:2] == ["launchctl", "print"]:  # only the daemon is loaded
+                return subprocess.CompletedProcess(argv, 0 if argv[2].startswith("system/") else 113, "", "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with patch.object(launch_agent.subprocess, "run", side_effect=run):
+            with pytest.raises(ClaudeSwitchError, match="sudo -v"):
+                ks.install(3600, False, macos_services, UID, PROGRAM, system=True, user="kgolf")
+        assert ks.system_plist_path().read_bytes() == before
+        assert [call for call in calls if call[0] == "sudo"] == [["sudo", "-v"]]
+
+
+class TestReloadWaitsForConsumeLocks:
+    def test_an_inactive_slot_refresh_holds_off_a_reload(self, healthy, monkeypatch):
+        from claude_swap.locking import FileLock
+
+        monkeypatch.setattr(ks, "RELOAD_LOCK_TIMEOUT_S", 0.2)
+        with patch.object(ks.sys, "platform", "darwin"), patch.object(launch_agent.sys, "platform", "darwin"):
+            calls = []
+            # An inactive slot's refresh holds only its consume lock across the POST.
+            with FileLock(healthy.root / "credentials" / ".consume-2.lock"):
+                with pytest.raises(ks.ServiceBusyError):
+                    with ks.between_runs():
+                        calls.append("reloaded")
+            assert calls == []
+            with ks.between_runs():
+                calls.append("reloaded")
+            assert calls == ["reloaded"]
+
+
 class TestKeepaliveDaemon:
     def _install(self, home, calls, **kwargs):
         return ks.install(7200, False, home, UID, PROGRAM, system=True, user="kgolf", **kwargs)

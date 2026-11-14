@@ -563,3 +563,46 @@ class TestLowLevel:
                 events.finish(0)
         # Another process held the turn-over: lines still land, nothing is lost.
         assert len(events.read(healthy.root)) == 10
+
+
+# --- re-review (0.3.1, before release) -----------------------------------------------
+
+
+class TestPollWindows:
+    def test_a_real_poll_keeps_window_usage_and_both_lines(self, healthy):
+        from claude_swap.autoswitch import PollEvent
+
+        events.begin("auto")
+        events.auto_event(PollEvent(
+            active={"number": 1, "email": "a@example.com"},
+            headroom={"1": 40.0, "2": 75.5},
+            threshold=90.0,
+            fetch_errors={"2": "http-429"},
+            windows={"1": {"5h": 60.0, "7d": 93.0, "Fable": 100.0}, "2": {"5h": 24.5}},
+            weekly_threshold=97.0,
+        ))
+        events.finish(0)
+        tick = _last(healthy, "auto")["details"]["ticks"][0]
+        assert tick == {
+            "event": "poll", "active": 1, "headroomPct": {"1": 40.0, "2": 75.5}, "threshold": 90.0,
+            "windowsPct": {"1": {"5h": 60.0, "7d": 93.0, "Fable": 100.0}, "2": {"5h": 24.5}},
+            "fetchErrors": {"2": "http-429"}, "weeklyThreshold": 97.0,
+        }
+
+
+class TestTailSkipsBrokenLines:
+    def test_n_good_rows_even_past_broken_lines(self, healthy):
+        logs = healthy.root / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        good = [json.dumps({"n": n}) for n in range(10)]
+        broken = ["{not json"] * 3
+        (logs / "events.jsonl").write_text("\n".join(good[:7] + broken + good[7:]) + "\n")
+        assert [row["n"] for row in events.read(healthy.root, last=5)] == [5, 6, 7, 8, 9]
+
+    def test_broken_lines_across_a_block_boundary(self, healthy, monkeypatch):
+        logs = healthy.root / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(events, "_TAIL_BLOCK", 64)
+        lines = [json.dumps({"n": n, "pad": "x" * 20}) for n in range(6)] + ["{broken" + "y" * 200] * 4
+        (logs / "events.jsonl").write_text("\n".join(lines) + "\n")
+        assert [row["n"] for row in events.read(healthy.root, last=3)] == [3, 4, 5]

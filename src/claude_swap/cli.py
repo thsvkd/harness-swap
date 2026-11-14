@@ -1041,6 +1041,7 @@ def _migrate_store_command(argv: list[str]) -> None:
     """Handle `cswap migrate-store --to file --keep {file,keychain} [--dry-run] [--json]`
     and `cswap migrate-store --restore-keychain ACCOUNT [--json]`. Pre-dispatched like
     `keepalive`."""
+    from claude_swap.doctor import run_doctor, summary
     from claude_swap.migrate_store import run_migrate_store, run_restore_keychain
 
     parser = argparse.ArgumentParser(
@@ -1066,6 +1067,19 @@ def _migrate_store_command(argv: list[str]) -> None:
         "--restore-keychain",
         metavar="BACKUP_ACCOUNT",
         help="Rollback: write this backup back as the Claude Code Keychain item",
+    )
+    parser.add_argument(
+        "--with-reconcile",
+        dest="with_reconcile",
+        action="store_true",
+        default=True,
+        help="After the move, install the reconcile LaunchAgent (the default)",
+    )
+    parser.add_argument(
+        "--without-reconcile",
+        dest="with_reconcile",
+        action="store_false",
+        help="Do not install the reconcile LaunchAgent",
     )
     parser.add_argument("--json", action="store_true", help="Print the report as JSON on stdout")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -1110,6 +1124,10 @@ def _migrate_store_command(argv: list[str]) -> None:
             "good, also run: config unset credentials.store",
         )
     report = run_migrate_store(switcher, args.keep, dry_run=args.dry_run)
+    report["reconcileService"] = None
+    if report["ok"] and not args.dry_run and args.with_reconcile:
+        report["reconcileService"] = _install_reconcile_service()
+    report["doctor"] = summary(run_doctor(switcher))
     if report["storesDiffer"] and not args.json:
         warning(
             f"WARNING: {report['warning']} (file {report['fileFingerprint']}, "
@@ -1117,7 +1135,142 @@ def _migrate_store_command(argv: list[str]) -> None:
         )
     if args.dry_run:
         finish(report, "\n".join(report.get("plan", [])))
-    finish(report, f"Migrated: the {args.keep} login is kept and credentials.store is file.")
+    service = report["reconcileService"]
+    lines = [f"Migrated: the {args.keep} login is kept and credentials.store is file."]
+    if service:
+        lines.append(f"Reconcile service: {service.get('action') or service['error']['message']}")
+    problems = report["doctor"]["problems"]
+    lines.append("Doctor: ok" if not problems else f"Doctor: {', '.join(problems)}")
+    finish(report, "\n".join(lines))
+
+
+def _install_reconcile_service() -> dict:
+    """The step after a migration: the move is done whatever this returns."""
+    from claude_swap import reconcile_service
+
+    try:
+        result = reconcile_service.install()
+    except ClaudeSwitchError as e:
+        return {"action": None, "error": error_envelope(e)["error"]}
+    return {"action": result["action"], "loaded": result["loaded"], "plist": result["plist"]}
+
+
+def _reconcile_command(argv: list[str]) -> None:
+    """Handle `cswap reconcile [--dry-run] [--json]` and its service options."""
+    from claude_swap import reconcile_service
+    from claude_swap.reconcile import EXIT_CODES, run_reconcile
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} reconcile",
+        description=(
+            "File store: when a Claude Code with the keychain open wrote its login to the "
+            "Keychain, move the newer login back to the credentials file and the active "
+            "slot's .enc, keep what they held, and delete the item. Decides only on evidence. "
+            "Needs the login keychain readable, so run it from a login session. macOS only. "
+            "Exit codes: 0 ok (also: nothing to do), 1 failed, 3 service written but not "
+            "loaded, 4 reconcile_ambiguous, 5 keychain_item_present_locked."
+        ),
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Report the plan and write nothing")
+    parser.add_argument("--json", action="store_true", help="Print the report as JSON on stdout")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    service = parser.add_mutually_exclusive_group()
+    service.add_argument(
+        "--install-service",
+        action="store_true",
+        help="Run reconcile whenever the login keychain changes, from a LaunchAgent (macOS)",
+    )
+    service.add_argument("--uninstall-service", action="store_true", help="Remove that LaunchAgent")
+    service.add_argument("--service-status", action="store_true", help="Show the LaunchAgent's state")
+    args = parser.parse_args(argv)
+    if args.install_service or args.uninstall_service or args.service_status:
+        if args.dry_run:
+            parser.error("--dry-run does not apply to the service options")
+
+        def install() -> dict:
+            _require_file_store("reconcile --install-service")
+            return reconcile_service.install()
+
+        sys.exit(
+            _run_service(args, "reconcile", reconcile_service.status, install, reconcile_service.uninstall)
+        )
+
+    def finish(report: dict, text: str) -> None:
+        if args.json:
+            print(json.dumps(report, indent=2))
+        elif report["ok"]:
+            print(text)
+        else:
+            error(f"Error: {report['error']['message']}")
+        sys.exit(0 if report["ok"] else EXIT_CODES.get(report["error"]["type"], 1))
+
+    if Platform.detect() != Platform.MACOS:
+        finish(
+            {
+                "schemaVersion": 1,
+                "ok": False,
+                "error": {"type": "unsupported", "message": "reconcile is macOS only."},
+            },
+            "",
+        )
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    report = run_reconcile(switcher, dry_run=args.dry_run)
+    if args.dry_run:
+        finish(report, "\n".join(report.get("plan", [])) or "Nothing to reconcile.")
+    if report["action"] == "none":
+        finish(report, "Nothing to reconcile: no Claude Code item in the login keychain.")
+    finish(report, f"Reconciled: kept the {report['kept']} login; the Keychain item is gone.")
+
+
+def _doctor_command(argv: list[str]) -> None:
+    """Handle `cswap doctor [--json]`. Read only."""
+    from claude_swap.doctor import run_doctor
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} doctor",
+        description=(
+            "Check, without changing anything, that this machine can keep its Claude logins "
+            "with no one logged in (the file store). Exit codes: 0 ok, 1 could not check, "
+            "2 problems found."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Print the report as JSON on stdout")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    try:
+        report = run_doctor(ClaudeAccountSwitcher(debug=args.debug))
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        def yes(value) -> str:
+            return "unknown" if value is None else ("yes" if value else "no")
+
+        print(f"store: {report['store']}")
+        print(f"keychain item present: {yes(report['keychainItemPresent'])} (locked here: {yes(report['keychainLocked'])})")
+        print(f"credentials file: {'mode ' + report['fileMode'] if report['fileExists'] else 'missing'}")
+        print(f"slots without a backup: {', '.join(map(str, report['slotsWithoutBackup'])) or 'none'}")
+        print(f"session profiles: {', '.join(report['sessionDirs']) or 'none'}")
+        for name, key in (("reconcile", "reconcileService"), ("keepalive", "keepaliveService")):
+            st = report[key]
+            if st is not None:
+                where = f" ({st['domain']})" if st.get("domain") else ""
+                print(f"{name} service: {'installed' if st['installed'] else 'not installed'}{where}, loaded: {yes(st['loaded'])}")
+        print("ok" if report["ok"] else f"problems: {', '.join(report['problems'])}")
+    sys.exit(0 if report["ok"] else 2)
 
 
 def _keepalive_command(argv: list[str]) -> None:
@@ -1184,6 +1337,14 @@ def _keepalive_command(argv: list[str]) -> None:
         action="store_true",
         help="With --install-service: run 'auto --once' after each successful keepalive",
     )
+    parser.add_argument(
+        "--system",
+        action="store_true",
+        help=(
+            "With a service option: a LaunchDaemon that runs as you with no one logged in "
+            "(file store only; uses sudo, replaces the GUI agent)"
+        ),
+    )
     args = parser.parse_args(argv)
     if not (math.isfinite(args.ahead) and args.ahead >= 0):
         parser.error("--ahead must be a non-negative number of seconds")
@@ -1192,6 +1353,8 @@ def _keepalive_command(argv: list[str]) -> None:
     in_service = args.install_service or args.uninstall_service or args.service_status
     if args.then_auto and not args.install_service:
         parser.error("--then-auto needs --install-service")
+    if args.system and not in_service:
+        parser.error("--system needs --install-service, --uninstall-service or --service-status")
     if in_service and (args.adopt or args.dry_run or args.ensure_file):
         parser.error("--adopt, --dry-run and --ensure-file do not apply to the service options")
     if in_service:
@@ -1439,24 +1602,39 @@ def _login_json(switcher: ClaudeAccountSwitcher, args) -> int:
 
 
 def _keepalive_service(args) -> int:
-    """Handle ``keepalive --install-service|--uninstall-service|--service-status``.
+    """Handle ``keepalive --install-service|--uninstall-service|--service-status [--system]``.
 
     Exit codes: 0 done, 1 refused or failed (nothing changed), 3 the plist is
     written but no GUI session exists to load it (launchd loads it at next login).
     """
     from claude_swap import keepalive_service as ks
+
+    def install() -> dict:
+        if args.system:
+            _require_file_store("keepalive --install-service --system")
+        return ks.install(ahead=args.ahead, then_auto=args.then_auto, system=args.system)
+
+    return _run_service(args, "keepalive", ks.status, install, lambda: ks.uninstall(system=args.system))
+
+
+def _require_file_store(what: str) -> None:
+    from claude_swap.exceptions import NotFileStoreError
+
+    if credentials_store(paths.get_backup_root()) != "file":
+        raise NotFileStoreError(what)
+
+
+def _run_service(args, name: str, status, install, uninstall) -> int:
+    """The shared half of the ``--install-service`` options of keepalive and reconcile."""
     from claude_swap.json_output import SCHEMA_VERSION
 
     try:
         if args.service_status:
-            result = ks.status()
+            result = status()
         else:
-            if sys.platform != "win32" and os.geteuid() == 0:
-                raise ClaudeSwitchError("Do not install the keepalive service as root; run it as the user.")
-            if args.install_service:
-                result = ks.install(ahead=args.ahead, then_auto=args.then_auto)
-            else:
-                result = ks.uninstall()
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                raise ClaudeSwitchError(f"Do not install the {name} service as root; run it as the user.")
+            result = install() if args.install_service else uninstall()
     except ClaudeSwitchError as e:
         if args.json:
             print(json.dumps(error_envelope(e), indent=2))
@@ -1469,24 +1647,27 @@ def _keepalive_service(args) -> int:
             result = {"ok": True, **result}
         print(json.dumps({"schemaVersion": SCHEMA_VERSION, **result}, indent=2))
         return code
+    title = name.capitalize()
     action = result.get("action")
     if action == "deferred":
-        print(f"Keepalive service written to {result['plist']}; no GUI session to load it now, launchd loads it at next login.")
+        print(f"{title} service written to {result['plist']}; no GUI session to load it now, launchd loads it at next login.")
     elif action in ("installed", "updated", "unchanged"):
-        print(f"Keepalive service {action} ({result['label']}, every {result['intervalSeconds']}s).")
+        where = " as a LaunchDaemon" if result.get("domain") == "system" else ""
+        print(f"{title} service {action}{where} ({result['label']}, every {result['intervalSeconds']}s).")
     elif action == "removed":
-        print("Keepalive service removed.")
+        print(f"{title} service removed.")
     elif action == "absent":
-        print("Keepalive service was not installed.")
+        print(f"{title} service was not installed.")
     elif result["platform"] == "unsupported":
-        print("The keepalive service is macOS-only; on Linux run `keepalive` from cron.")
+        tip = "; on Linux run `keepalive` from cron" if name == "keepalive" else ""
+        print(f"The {name} service is macOS-only{tip}.")
     elif not result["installed"]:
-        print("Keepalive service is not installed.")
+        print(f"{title} service is not installed.")
     elif not result["managed"]:
-        print(f"A keepalive agent not made by hswap is installed: {result['plist']}")
+        print(f"A {name} agent not made by hswap is installed: {result['plist']}")
     else:
         state = result["state"] or ("loaded" if result["loaded"] else "not loaded")
-        print(f"Keepalive service: {state}, last exit {result['lastExitCode']}")
+        print(f"{title} service: {state}, last exit {result['lastExitCode']}")
         print(f"  plist: {result['plist']}")
     return code
 
@@ -1582,6 +1763,12 @@ def main() -> None:
     if argv and argv[0] == "migrate-store":
         _migrate_store_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "reconcile":
+        _reconcile_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "doctor":
+        _doctor_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
@@ -1658,6 +1845,8 @@ Commands:
   %(prog)s keepalive --install-service run keepalive every 5 minutes via launchd
   %(prog)s keychain-selftest          check a credential survives a Keychain write
   %(prog)s migrate-store              move a macOS login to the file credential store
+  %(prog)s reconcile                  file store: take back a login Claude Code put in the Keychain
+  %(prog)s doctor                     check this Mac can keep its logins with no one logged in
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts

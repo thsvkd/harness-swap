@@ -8,13 +8,19 @@ it, and sharing the label makes a second, duplicate job impossible. A plist is
 ours only when it carries ``HSWAP_SERVICE=keepalive`` in its environment;
 anything else under that label is left alone, never overwritten or removed.
 
+With the file store keepalive needs no keychain, so it can also run where no one is
+logged in: ``--system`` installs a LaunchDaemon that runs it as the user. Only one of the
+two exists at a time, since both would run every few minutes.
+
 Linux is not covered: there is no Keychain, so a cron line does the same job.
 """
 
 from __future__ import annotations
 
+import getpass
 import plistlib
 import sys
+import tempfile
 from pathlib import Path
 
 from claude_swap import launch_agent
@@ -23,6 +29,8 @@ from claude_swap.exceptions import ClaudeSwitchError
 LABEL = "dev.hswap.keepalive"
 INTERVAL_S = 300
 _MARKER = ("HSWAP_SERVICE", "keepalive")
+SYSTEM_DIR = Path("/Library/LaunchDaemons")
+SYSTEM = "system"
 
 
 class ForeignServiceError(ClaudeSwitchError):
@@ -31,6 +39,14 @@ class ForeignServiceError(ClaudeSwitchError):
 
 class UnsupportedPlatformError(ClaudeSwitchError):
     json_type = "UnsupportedPlatform"
+
+
+class ServiceConflictError(ClaudeSwitchError):
+    json_type = "ServiceConflict"
+
+
+def system_plist_path() -> Path:
+    return SYSTEM_DIR / f"{LABEL}.plist"
 
 
 def _argv(program: list[str], ahead: float, then_auto: bool) -> list[str]:
@@ -57,7 +73,10 @@ def _watch_paths(home: Path | None) -> list[str]:
     ]
 
 
-def build(program: list[str], ahead: float, then_auto: bool, home: Path | None = None) -> bytes:
+def build(
+    program: list[str], ahead: float, then_auto: bool, home: Path | None = None, user: str | None = None
+) -> bytes:
+    """``user``: a LaunchDaemon's, which runs as that user with that user's home."""
     doc = plistlib.loads(
         launch_agent.build_plist(
             program,
@@ -69,23 +88,31 @@ def build(program: list[str], ahead: float, then_auto: bool, home: Path | None =
         )
     )
     doc["WatchPaths"] = _watch_paths(home)
+    if user:
+        doc["UserName"] = user
+        # Set outright, not left to launchd: the store is found through this home.
+        doc["EnvironmentVariables"].update(HOME=str(home or Path.home()), USER=user)
     return plistlib.dumps(doc)
 
 
-def _read(home: Path | None) -> dict | None:
+def _read_path(path: Path) -> dict | None:
     try:
-        return plistlib.loads(launch_agent.plist_path(LABEL, home).read_bytes())
+        return plistlib.loads(path.read_bytes())
     except FileNotFoundError:
         return None
     except Exception:
         return {}  # unreadable: treat as someone else's
 
 
-def _managed(doc: dict | None) -> bool | None:
+def _read(home: Path | None, label: str = LABEL) -> dict | None:
+    return _read_path(launch_agent.plist_path(label, home))
+
+
+def _managed(doc: dict | None, marker: tuple[str, str] = _MARKER) -> bool | None:
     if doc is None:
         return None
     env = doc.get("EnvironmentVariables") or {}
-    return env.get(_MARKER[0]) == _MARKER[1]
+    return env.get(marker[0]) == marker[1]
 
 
 def _settings(doc: dict | None) -> tuple[float | None, bool | None]:
@@ -115,38 +142,52 @@ def _outdated(doc: dict | None, home: Path | None) -> bool | None:
         program = args[: args.index("keepalive")] if "keepalive" in args else []
     if not program:
         return None
-    return _job(doc) != _job(plistlib.loads(build(program, ahead, then_auto, home)))
+    built = build(program, ahead, then_auto, home, user=doc.get("UserName"))
+    return _job(doc) != _job(plistlib.loads(built))
 
 
-def status(home: Path | None = None, uid: int | None = None) -> dict:
-    out_log, err_log = launch_agent.log_paths(LABEL, home)
-    plist = launch_agent.plist_path(LABEL, home)
-    doc = _read(home) if sys.platform == "darwin" else None
-    base = {
-        "label": LABEL,
+def job_status(label: str, marker: tuple[str, str], doc: dict | None, plist: Path, home: Path | None) -> dict:
+    """The fields every hswap service reports, launchd's answers still unasked."""
+    managed = _managed(doc, marker)
+    return {
+        "label": label,
         "platform": "launchd" if sys.platform == "darwin" else "unsupported",
         "installed": doc is not None,
-        "managed": _managed(doc),
+        "managed": managed,
         "loaded": False,
         "domainAvailable": False,
         "state": None,
         "pid": None,
         "lastExitCode": None,
-        "intervalSeconds": doc.get("StartInterval") if _managed(doc) else None,
-        "ahead": None,
-        "thenAuto": None,
+        "intervalSeconds": doc.get("StartInterval") if managed else None,
         "outdated": None,
         "plist": str(plist),
-        "stderrLog": str(err_log),
+        "stderrLog": str(launch_agent.log_paths(label, home)[1]),
     }
-    if sys.platform != "darwin":
-        return base
-    base["ahead"], base["thenAuto"] = _settings(doc)
-    base["outdated"] = _outdated(doc, home)
-    base["domainAvailable"] = launch_agent.domain_available(uid)
-    st = launch_agent.status(LABEL, uid, home)
+
+
+def ask_launchd(base: dict, label: str, uid: int | None, home: Path | None, domain: str | None = None) -> dict:
+    base["domainAvailable"] = True if domain else launch_agent.domain_available(uid)
+    st = launch_agent.status(label, uid, home, domain)
     base.update(loaded=st["loaded"], state=st["state"], pid=st["pid"], lastExitCode=st["last_exit_code"])
     return base
+
+
+def status(home: Path | None = None, uid: int | None = None) -> dict:
+    """The installed job, the LaunchDaemon first; ``domain`` says which (None: neither)."""
+    macos = sys.platform == "darwin"
+    system = _read_path(system_plist_path()) if macos else None
+    doc = system if system is not None else (_read(home) if macos else None)
+    plist = system_plist_path() if system is not None else launch_agent.plist_path(LABEL, home)
+    base = job_status(LABEL, _MARKER, doc, plist, home)
+    base.update(domain=None, ahead=None, thenAuto=None)
+    if not macos:
+        return base
+    if doc is not None:
+        base["domain"] = SYSTEM if system is not None else "gui"
+    base["ahead"], base["thenAuto"] = _settings(doc)
+    base["outdated"] = _outdated(doc, home)
+    return ask_launchd(base, LABEL, uid, home, SYSTEM if system is not None else None)
 
 
 def _require_macos() -> None:
@@ -157,22 +198,103 @@ def _require_macos() -> None:
         )
 
 
-def _job(doc: dict) -> tuple:
-    return (doc.get("ProgramArguments"), doc.get("StartInterval"), doc.get("WatchPaths"), _managed(doc))
+def _job(doc: dict, marker: tuple[str, str] = _MARKER) -> tuple:
+    return (
+        doc.get("ProgramArguments"),
+        doc.get("StartInterval"),
+        doc.get("WatchPaths"),
+        doc.get("UserName"),
+        _managed(doc, marker),
+    )
 
 
-def _refuse_foreign(home: Path | None, uid: int | None) -> dict | None:
+def refuse_foreign(
+    home: Path | None, uid: int | None, label: str = LABEL, marker: tuple[str, str] = _MARKER
+) -> dict | None:
     """Our plist, None when there is none, or raise: never touch someone else's job."""
-    doc = _read(home)
-    path = launch_agent.plist_path(LABEL, home)
-    if doc is not None and not _managed(doc):
+    doc = _read(home, label)
+    path = launch_agent.plist_path(label, home)
+    if doc is not None and not _managed(doc, marker):
         raise ForeignServiceError(
-            f"{path} was not made by hswap; left untouched. Remove it yourself to let hswap manage keepalive."
+            f"{path} was not made by hswap; left untouched. Remove it yourself to let hswap manage it."
         )
-    if doc is None and launch_agent.is_loaded(LABEL, uid):
+    if doc is None and launch_agent.is_loaded(label, uid):
         # Loaded from a plist elsewhere (another file name under the same label).
-        raise ForeignServiceError(f"launchd runs {LABEL} from a plist hswap did not write; left untouched.")
+        raise ForeignServiceError(f"launchd runs {label} from a plist hswap did not write; left untouched.")
     return doc
+
+
+def install_job(label: str, marker: tuple[str, str], plist: bytes, home: Path | None, uid: int | None) -> str:
+    """Write and load a gui LaunchAgent: installed/updated/unchanged/deferred."""
+    doc = refuse_foreign(home, uid, label, marker)
+    path = launch_agent.plist_path(label, home)
+    # Same job, whatever PATH or proxies the caller has: reloading could cut a run short.
+    unchanged = doc is not None and _job(doc, marker) == _job(plistlib.loads(plist), marker)
+    if not launch_agent.domain_available(uid):
+        # No GUI session (SSH, a LaunchDaemon): launchd loads the file at next login.
+        if not unchanged:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            launch_agent.log_paths(label, home)[1].parent.mkdir(parents=True, exist_ok=True)
+            launch_agent.atomic_write_bytes(path, plist)
+        return "deferred"
+    if unchanged and launch_agent.is_loaded(label, uid):
+        return "unchanged"
+    launch_agent.install(label, home, uid=uid, plist=plist)
+    return "updated" if doc is not None else "installed"
+
+
+def uninstall_job(label: str, marker: tuple[str, str], home: Path | None, uid: int | None) -> str:
+    if refuse_foreign(home, uid, label, marker) is None:
+        return "absent"
+    launch_agent.uninstall(label, home, uid)
+    return "removed"
+
+
+def _sudo(*args: str) -> None:
+    """Root's half of the LaunchDaemon. sudo asks for the password on the terminal."""
+    result = launch_agent.subprocess.run(["sudo", *args], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ClaudeSwitchError(
+            f"sudo {args[0]} failed (exit {result.returncode})" + (f": {detail}" if detail else "")
+        )
+
+
+def _read_system() -> dict | None:
+    doc = _read_path(system_plist_path())
+    if doc is not None and not _managed(doc):
+        raise ForeignServiceError(f"{system_plist_path()} was not made by hswap; left untouched.")
+    return doc
+
+
+def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
+    gui = refuse_foreign(home, uid)  # someone else's agent under this label would run alongside
+    doc = _read_system()
+    path = system_plist_path()
+    target = f"{SYSTEM}/{LABEL}"
+    unchanged = doc is not None and _job(doc) == _job(plistlib.loads(plist))
+    loaded = launch_agent.is_loaded(LABEL, domain=SYSTEM)
+    if not (unchanged and loaded):
+        err_log = launch_agent.log_paths(LABEL, home)[1]
+        err_log.parent.mkdir(parents=True, exist_ok=True)
+        err_log.touch(exist_ok=True)  # the user's: launchd would create it as root
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / path.name
+            staged.write_bytes(plist)
+            # launchd refuses a daemon plist root does not own or others can write; 644
+            # lets the user read it back for --service-status.
+            _sudo("install", "-o", "root", "-g", "wheel", "-m", "644", str(staged), str(path))
+        if loaded:
+            _sudo("launchctl", "bootout", target)
+            launch_agent._wait_until_unloaded(LABEL, domain=SYSTEM)
+        _sudo("launchctl", "bootstrap", SYSTEM, str(path))
+    if gui is not None:
+        launch_agent.uninstall(LABEL, home, uid)
+    if unchanged and loaded:
+        action = "unchanged"
+    else:
+        action = "updated" if doc is not None else "installed"
+    return {"action": action, **status(home, uid)}
 
 
 def install(
@@ -181,31 +303,32 @@ def install(
     home: Path | None = None,
     uid: int | None = None,
     program: list[str] | None = None,
+    system: bool = False,
+    user: str | None = None,
 ) -> dict:
-    """Write and load the agent. ``action``: installed/updated/unchanged/deferred."""
+    """Write and load the job. ``action``: installed/updated/unchanged/deferred.
+    ``system``: a LaunchDaemon run as ``user`` (default: this one), through sudo; it
+    replaces the gui agent. The caller checks that the store is file."""
     _require_macos()
-    doc = _refuse_foreign(home, uid)
-    plist = build(program or launch_agent.resolve_program(), ahead, then_auto, home)
-    path = launch_agent.plist_path(LABEL, home)
-    # Same job, whatever PATH or proxies the caller has: reloading could cut a run short.
-    unchanged = doc is not None and _job(doc) == _job(plistlib.loads(plist))
-    if not launch_agent.domain_available(uid):
-        # No GUI session (SSH, a LaunchDaemon): launchd loads the file at next login.
-        if not unchanged:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            launch_agent.log_paths(LABEL, home)[1].parent.mkdir(parents=True, exist_ok=True)
-            launch_agent.atomic_write_bytes(path, plist)
-        return {"action": "deferred", **status(home, uid)}
-    if unchanged and launch_agent.is_loaded(LABEL, uid):
-        return {"action": "unchanged", **status(home, uid)}
-    launch_agent.install(LABEL, home, uid=uid, plist=plist)
-    return {"action": "updated" if doc is not None else "installed", **status(home, uid)}
+    program = program or launch_agent.resolve_program()
+    if system:
+        return _install_system(build(program, ahead, then_auto, home, user=user or getpass.getuser()), home, uid)
+    if _read_path(system_plist_path()) is not None:
+        raise ServiceConflictError(
+            f"keepalive runs from {system_plist_path()}; remove it with "
+            "hswap claude keepalive --uninstall-service --system first, so only one job runs."
+        )
+    action = install_job(LABEL, _MARKER, build(program, ahead, then_auto, home), home, uid)
+    return {"action": action, **status(home, uid)}
 
 
-def uninstall(home: Path | None = None, uid: int | None = None) -> dict:
+def uninstall(home: Path | None = None, uid: int | None = None, system: bool = False) -> dict:
     _require_macos()
-    doc = _refuse_foreign(home, uid)
-    if doc is None:
+    if not system:
+        return {"action": uninstall_job(LABEL, _MARKER, home, uid), **status(home, uid)}
+    if _read_system() is None:
         return {"action": "absent", **status(home, uid)}
-    launch_agent.uninstall(LABEL, home, uid)
+    if launch_agent.is_loaded(LABEL, domain=SYSTEM):
+        _sudo("launchctl", "bootout", f"{SYSTEM}/{LABEL}")
+    _sudo("rm", "-f", str(system_plist_path()))
     return {"action": "removed", **status(home, uid)}

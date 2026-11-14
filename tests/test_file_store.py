@@ -61,6 +61,7 @@ class Security(FakeSecurity):
         super().__init__(**kwargs)
         self.calls: list[list[str]] = []
         self.check_failure = None  # an rc, or an exception to raise, for the guard's calls
+        self.locked = False  # no login session: every call but the guard's answers rc 36
 
     def _dump(self) -> str:
         records = []
@@ -95,6 +96,8 @@ class Security(FakeSecurity):
                 return self._completed(args, 0, self._dump())
             found = any(service == args[args.index("-s") + 1] for service, _ in self.items)
             return self._completed(args, 0 if found else 44)
+        if self.locked:
+            return self._completed(args, 36)
         return super().__call__(args, **kwargs)
 
     def non_guard_calls(self) -> list[list[str]]:

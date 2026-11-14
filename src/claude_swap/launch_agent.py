@@ -85,9 +85,10 @@ def log_paths(label: str = LABEL, home: Path | None = None) -> tuple[Path, Path]
     return logs / f"{label}.log", logs / f"{label}.err"
 
 
-def service_target(label: str = LABEL, uid: int | None = None) -> str:
-    """launchd service target, e.g. ``gui/501/com.cswap.menubar``."""
-    return f"gui/{os.getuid() if uid is None else uid}/{label}"
+def service_target(label: str = LABEL, uid: int | None = None, domain: str | None = None) -> str:
+    """launchd service target, e.g. ``gui/501/com.cswap.menubar``; ``domain`` (``system``)
+    replaces the user's GUI domain."""
+    return f"{domain or domain_target(uid)}/{label}"
 
 
 def domain_target(uid: int | None = None) -> str:
@@ -219,25 +220,28 @@ def _wait_until_unloaded(
     label: str = LABEL,
     uid: int | None = None,
     timeout: float = _UNLOAD_TIMEOUT_SECONDS,
+    domain: str | None = None,
 ) -> bool:
     """Block until launchd has dropped the job. True if it went away in time."""
     deadline = time.monotonic() + timeout
-    while is_loaded(label, uid):
+    while is_loaded(label, uid, domain):
         if time.monotonic() >= deadline:
             return False
         time.sleep(_UNLOAD_POLL_SECONDS)
     return True
 
 
-def is_loaded(label: str = LABEL, uid: int | None = None) -> bool:
+def is_loaded(label: str = LABEL, uid: int | None = None, domain: str | None = None) -> bool:
     """Whether launchd currently knows about the service."""
-    return _launchctl("print", service_target(label, uid)).returncode == 0
+    return _launchctl("print", service_target(label, uid, domain)).returncode == 0
 
 
-def status(label: str = LABEL, uid: int | None = None, home: Path | None = None) -> dict:
+def status(
+    label: str = LABEL, uid: int | None = None, home: Path | None = None, domain: str | None = None
+) -> dict:
     """Installed / loaded / running state, plus the pid when there is one."""
     _require_macos()
-    printed = _launchctl("print", service_target(label, uid))
+    printed = _launchctl("print", service_target(label, uid, domain))
     loaded = printed.returncode == 0
     state: str | None = None
     pid: int | None = None

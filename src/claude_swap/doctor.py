@@ -1,0 +1,90 @@
+"""``cswap doctor``: can this machine keep its Claude logins with no one logged in?
+
+Read only, and safe with no login session: the keychain is asked by attributes only
+(``credential_item_present``) and for reachability, and launchd only through ``print``.
+The JSON is a contract (docs/claude.md, "Running without a login session"): fields are
+added, never renamed, and ``problems`` holds stable codes.
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+
+from claude_swap import keepalive_service, macos_keychain, reconcile_service
+from claude_swap.json_output import SCHEMA_VERSION
+from claude_swap.keepalive import _store_label
+from claude_swap.models import Platform
+from claude_swap.paths import get_credentials_path
+
+_SERVICE_FIELDS = ("installed", "managed", "loaded", "outdated", "lastExitCode")
+
+
+def _service(status: dict, *extra: str) -> dict:
+    return {key: status.get(key) for key in (*extra, *_SERVICE_FIELDS)}
+
+
+def run_doctor(switcher) -> dict:
+    macos = switcher.platform == Platform.MACOS
+    # Off macOS the file is the only store there is.
+    store = _store_label(switcher._store) if macos else "file"
+    file_store = store == "file"
+    try:
+        mode = stat.S_IMODE(get_credentials_path().stat().st_mode)
+    except FileNotFoundError:
+        mode = None
+    accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+    without_backup = sorted(
+        int(num)
+        for num, account in accounts.items()
+        if not switcher._store._backup_enc_path(num, account.get("email", "")).exists()
+    )
+    try:
+        sessions = sorted(e.name for e in (switcher.backup_dir / "sessions").iterdir() if e.is_dir())
+    except FileNotFoundError:
+        sessions = []
+
+    report = {
+        "schemaVersion": SCHEMA_VERSION,
+        "ok": False,
+        "problems": [],
+        "store": store,
+        "keychainItemPresent": None,
+        "keychainLocked": None,
+        "fileExists": mode is not None,
+        "fileMode": None if mode is None else f"{mode:04o}",
+        "slotsWithoutBackup": without_backup,
+        "sessionDirs": sessions,
+        "reconcileService": None,
+        "keepaliveService": None,
+    }
+    problems = report["problems"]
+    if macos:
+        report["keychainItemPresent"] = macos_keychain.credential_item_present()
+        report["keychainLocked"] = macos_keychain.keychain_reachable(platform="darwin") is not True
+        report["reconcileService"] = _service(reconcile_service.status())
+        report["keepaliveService"] = _service(keepalive_service.status(), "domain")
+        if not file_store:
+            problems.append("not_file_store")
+    if file_store:
+        if macos and report["keychainItemPresent"]:
+            problems.append("keychain_item_present")
+        if mode is None:
+            problems.append("file_missing")
+        elif os.name == "posix" and mode & 0o077:
+            problems.append("file_mode_insecure")
+    if macos and file_store:
+        if without_backup:
+            problems.append("slot_without_backup")
+        if sessions:
+            problems.append("session_profiles")
+        if "CLAUDE_CONFIG_DIR" in os.environ or "CLAUDE_SECURESTORAGE_CONFIG_DIR" in os.environ:
+            problems.append("profile_env")
+        if not report["reconcileService"]["managed"]:
+            problems.append("reconcile_service_missing")
+    report["ok"] = not problems
+    return report
+
+
+def summary(report: dict) -> dict:
+    return {"ok": report["ok"], "problems": report["problems"]}

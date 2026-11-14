@@ -7,6 +7,7 @@ import gc
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -569,6 +570,31 @@ def block_real_keychain(request, monkeypatch):
     monkeypatch.setattr(_macos_keychain, "keychain_reachable", store.keychain_reachable)
     monkeypatch.setitem(sys.modules, "keyring", _make_fake_keyring())
     yield store
+
+
+@pytest.fixture(autouse=True)
+def block_real_launchd(monkeypatch):
+    """Safety net: no test may load a real launchd job or run sudo.
+
+    `migrate-store` installs the reconcile LaunchAgent by default, so a CLI test
+    would otherwise bootstrap a job that runs the real hswap against the real
+    HOME. Tests that drive launchctl patch ``subprocess.run`` over this; the
+    system-domain plist directory points nowhere unless a test sets it.
+    """
+    real = subprocess.run
+
+    def guarded(args, *a, **kw):
+        if isinstance(args, (list, tuple)) and args and os.path.basename(str(args[0])) in (
+            "launchctl", "sudo",
+        ):
+            return subprocess.CompletedProcess(args, 113, "", "blocked by the test suite")
+        return real(args, *a, **kw)
+
+    from claude_swap import keepalive_service
+
+    monkeypatch.setattr(subprocess, "run", guarded)
+    monkeypatch.setattr(keepalive_service, "SYSTEM_DIR", Path("/nonexistent/hswap-tests/LaunchDaemons"))
+    yield
 
 
 @pytest.fixture(autouse=True)

@@ -46,7 +46,8 @@ COPIES_DISAGREE_MESSAGE = (
 KEYCHAIN_ITEM_PRESENT_MESSAGE = (
     "keychain_item_present: the login keychain holds a Claude Code credential item, or the "
     "check for one failed, so the file's token may be spent. Nothing was changed or sent. "
-    "Repair with hswap claude migrate-store --to file --keep keychain."
+    "hswap claude reconcile clears it from a login session (its service does that when the "
+    "keychain changes), or repair with hswap claude migrate-store --to file --keep keychain."
 )
 RELOGIN_REQUIRED_MESSAGE = (
     "This login's token is already spent, or another copy of it holds a different token "
@@ -148,6 +149,18 @@ class KeychainItemPresentError(CredentialError):
 
     def __init__(self):
         super().__init__(KEYCHAIN_ITEM_PRESENT_MESSAGE)
+
+
+class NotFileStoreError(ClaudeSwitchError):
+    """A step that only makes sense once credentials.store is file."""
+
+    json_type = "not_file_store"
+
+    def __init__(self, what: str):
+        super().__init__(
+            f"{what} needs credentials.store=file; set it up with "
+            "hswap claude migrate-store --to file --keep file|keychain."
+        )
 
 
 class SwitchError(ClaudeSwitchError):

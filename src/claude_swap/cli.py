@@ -1041,7 +1041,7 @@ def _migrate_store_command(argv: list[str]) -> None:
     """Handle `cswap migrate-store --to file --keep {file,keychain} [--dry-run] [--json]`
     and `cswap migrate-store --restore-keychain ACCOUNT [--json]`. Pre-dispatched like
     `keepalive`."""
-    from claude_swap.doctor import run_doctor, summary
+    from claude_swap import doctor
     from claude_swap.migrate_store import run_migrate_store, run_restore_keychain
 
     parser = argparse.ArgumentParser(
@@ -1069,17 +1069,9 @@ def _migrate_store_command(argv: list[str]) -> None:
         help="Rollback: write this backup back as the Claude Code Keychain item",
     )
     parser.add_argument(
-        "--with-reconcile",
-        dest="with_reconcile",
+        "--no-reconcile",
         action="store_true",
-        default=True,
-        help="After the move, install the reconcile LaunchAgent (the default)",
-    )
-    parser.add_argument(
-        "--without-reconcile",
-        dest="with_reconcile",
-        action="store_false",
-        help="Do not install the reconcile LaunchAgent",
+        help="Do not install the reconcile LaunchAgent after the move (installed by default)",
     )
     parser.add_argument("--json", action="store_true", help="Print the report as JSON on stdout")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -1126,9 +1118,9 @@ def _migrate_store_command(argv: list[str]) -> None:
         )
     report = run_migrate_store(switcher, args.keep, dry_run=args.dry_run)
     report["reconcileService"] = None
-    if report["ok"] and not args.dry_run and args.with_reconcile:
+    if report["ok"] and not args.dry_run and not args.no_reconcile:
         report["reconcileService"] = _install_reconcile_service()
-    report["doctor"] = summary(run_doctor(switcher))
+    report["doctor"] = doctor.summary(switcher)
     if report["storesDiffer"] and not args.json:
         warning(
             f"WARNING: {report['warning']} (file {report['fileFingerprint']}, "
@@ -1140,8 +1132,11 @@ def _migrate_store_command(argv: list[str]) -> None:
     lines = [f"Migrated: the {args.keep} login is kept and credentials.store is file."]
     if service:
         lines.append(f"Reconcile service: {service.get('action') or service['error']['message']}")
-    problems = report["doctor"]["problems"]
-    lines.append("Doctor: ok" if not problems else f"Doctor: {', '.join(problems)}")
+    checked = report["doctor"]
+    if checked["ok"] is None:
+        lines.append(f"Doctor: {checked['error']['message']}")
+    else:
+        lines.append("Doctor: ok" if checked["ok"] else f"Doctor: {', '.join(checked['problems'])}")
     finish(report, "\n".join(lines))
 
 
@@ -1233,7 +1228,7 @@ def _reconcile_command(argv: list[str]) -> None:
 
 def _doctor_command(argv: list[str]) -> None:
     """Handle `cswap doctor [--json]`. Read only."""
-    from claude_swap.doctor import run_doctor
+    from claude_swap.doctor import io_error, run_doctor
 
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} doctor",
@@ -1253,6 +1248,13 @@ def _doctor_command(argv: list[str]) -> None:
             print(json.dumps(error_envelope(e), indent=2))
         else:
             error(f"Error: {e}")
+        sys.exit(1)
+    except OSError as e:
+        failure = io_error(e)
+        if args.json:
+            print(json.dumps({"schemaVersion": 1, "error": failure}, indent=2))
+        else:
+            error(f"Error: {failure['message']}")
         sys.exit(1)
     if args.json:
         print(json.dumps(report, indent=2))
@@ -1517,9 +1519,11 @@ Examples:
             else:
                 print(format_setting_value(value))
         elif action == "set":
+            _refuse_leaving_file_store_under_daemon(root, args.key, args.value)
             value = set_setting(root, args.key, args.value)
             print(f"{args.key} = {format_setting_value(value)}")
         elif action == "unset":
+            _refuse_leaving_file_store_under_daemon(root, args.key, None)
             if unset_setting(root, args.key):
                 default = setting_spec(args.key).default
                 print(f"{args.key} unset (default: {format_setting_value(default)})")
@@ -1537,6 +1541,18 @@ Examples:
             file=sys.stderr if json_mode else sys.stdout,
         )
         sys.exit(130)
+
+
+def _refuse_leaving_file_store_under_daemon(root, key: str, value: str | None) -> None:
+    """The keepalive LaunchDaemon runs where no keychain is reachable: off the file store
+    every run would fail, so it goes first."""
+    from claude_swap import keepalive_service as ks
+
+    if key == "credentials.store" and value != "file" and ks.system_plist_path().exists():
+        raise ks.ServiceConflictError(
+            f"the keepalive LaunchDaemon ({ks.system_plist_path()}) needs credentials.store=file; "
+            "remove it first with hswap claude keepalive --uninstall-service --system."
+        )
 
 
 def _use_native_tls() -> None:

@@ -300,25 +300,32 @@ def _run_metadata(args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def credential_items() -> list[tuple[str, str]]:
-    """(service, account) of every Claude Code credential item in the login keychain.
+def generic_items() -> list[tuple[str, str]]:
+    """(service, account) of every generic password item in the login keychain.
 
     Attributes only, never `-d`, so this decrypts nothing and answers while the keychain
-    is locked. Matches on the service attribute: hswap's own `claude-swap` items may
-    carry the name elsewhere. Raises when `security` fails.
+    is locked. Raises when `security` fails.
     """
     result = _run_metadata(["dump-keychain", login_keychain_file()])
     if result.returncode != 0:
         raise KeychainError(f"security dump-keychain failed (rc={result.returncode})")
     items = []
     for record in re.split(r"(?m)^keychain: ", result.stdout):
-        if 'class: "genp"' not in record:
-            continue
-        attributes = dict(_DUMP_ATTRIBUTE.findall(record))
-        service = attributes.get("svce", "")
-        if service == CREDENTIAL_SERVICE or service.startswith(f"{CREDENTIAL_SERVICE}-"):
-            items.append((service, attributes.get("acct", "")))
+        if 'class: "genp"' in record:
+            attributes = dict(_DUMP_ATTRIBUTE.findall(record))
+            items.append((attributes.get("svce", ""), attributes.get("acct", "")))
     return items
+
+
+def credential_items() -> list[tuple[str, str]]:
+    """(service, account) of every Claude Code credential item in the login keychain.
+    Matches on the service attribute: hswap's own `claude-swap` items may carry the
+    name elsewhere."""
+    return [
+        (service, account)
+        for service, account in generic_items()
+        if service == CREDENTIAL_SERVICE or service.startswith(f"{CREDENTIAL_SERVICE}-")
+    ]
 
 
 def credential_item_present() -> bool:

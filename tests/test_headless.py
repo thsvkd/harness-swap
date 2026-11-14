@@ -16,6 +16,7 @@ import pytest
 from claude_swap import consumed_grants, keepalive_service as ks, launch_agent, oauth
 from claude_swap import reconcile_service as rs
 from claude_swap.doctor import run_doctor
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.reconcile import run_reconcile
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -121,41 +122,47 @@ class TestReconcile:
         assert healthy.snapshot() == before
         assert healthy.security.non_guard_calls() == []
 
-    def test_claude_code_moved_the_login_to_the_keychain(self, healthy):
-        # A Claude Code with the keychain open refreshed, wrote the item and deleted the file.
-        successor = creds("AT-K", "RT-K", expires_in_s=NEAR)
-        healthy.security.items[ACTIVE_ITEM] = successor
-        healthy.file.unlink()
-        assert healthy.keepalive()["error"]["type"] == "keychain_item_present"
-
-        report = _reconcile()
-        assert report["ok"] is True and report["action"] == "reconciled"
-        assert report["kept"] == "keychain" and report["itemAbsent"] is True
-        assert healthy.file.read_text() == successor
-        assert healthy.read_enc(SLOT_1) == successor
-        assert ACTIVE_ITEM not in healthy.security.items
-        # What it replaced was kept first and read back.
-        assert list(backups(healthy, "slot-1-a@example.com.backup-").values()) == [healthy.login]
-        assert list(backups(healthy).values()) == [successor]
-
-        healthy.security.calls.clear()
-        report = healthy.keepalive()
-        assert report["ok"] is True and report["action"] == "refreshed"
-        assert [post["refresh_token"] for post in healthy.endpoint.posts] == ["RT-K"]
-        assert healthy.security.non_guard_calls() == []
-
-    def test_a_stale_item_with_the_file_gone_does_not_beat_the_slot(self, healthy):
-        # The item holds an older copy hswap has seen (here: stashed), the slot the newer
-        # one, and nothing links them: the file being gone proves nothing.
-        stale = creds("AT-K", "RT-K")
-        s = ClaudeAccountSwitcher()
-        s.stash_verified(stale, ("a@example.com", ""), "1", "keepalive-split-brain")
-        healthy.security.items[ACTIVE_ITEM] = stale
+    def test_claude_code_moved_the_login_to_the_keychain_is_ambiguous(self, healthy):
+        # A Claude Code with the keychain open refreshed, wrote the item and deleted the
+        # file. Nothing records that the item came from the slot's token: a stale cache
+        # writes exactly the same shape, so a person decides.
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K", expires_in_s=NEAR)
         healthy.file.unlink()
         before = healthy.snapshot()
         report = _reconcile()
-        assert report["error"]["type"] == "reconcile_ambiguous"
+        assert report["error"]["type"] == "reconcile_ambiguous" and report["kept"] is None
         assert healthy.snapshot() == before
+        assert healthy.security.deleted == [] and healthy.security.stdin == []
+
+    @pytest.mark.parametrize("file_left", [False, True])
+    def test_a_stale_rewrite_after_a_settled_refresh_does_not_win(self, healthy, capsys, file_left):
+        # The review's scenario. RT-1 is the login; GUI Claude Code A refreshes it to RT-3,
+        # writes the item and deletes the file.
+        rt3 = creds("AT-3", "RT-3", expires_in_s=NEAR)
+        healthy.security.items[ACTIVE_ITEM] = rt3
+        healthy.file.unlink()
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
+        # A person settles it; RT-3 is now in the file and the `.enc`.
+        code, out, err = run_cli(
+            ["migrate-store", "--to", "file", "--keep", "keychain", "--no-reconcile", "--json"], capsys
+        )
+        assert code == 0, out + err
+        assert healthy.file.read_text() == rt3 and healthy.read_enc(SLOT_1) == rt3
+        # Claude Code B, with a stale cache, writes RT-1 back (the item was new, so it
+        # also deletes the file, unless something rewrote it since).
+        healthy.security.items[ACTIVE_ITEM] = healthy.login
+        if not file_left:
+            healthy.file.unlink()
+        report = _reconcile()
+        assert report["ok"] is True, report
+        assert report["kept"] == ("file" if file_left else "slot")
+        assert healthy.file.read_text() == rt3 and healthy.read_enc(SLOT_1) == rt3
+        assert ACTIVE_ITEM not in healthy.security.items
+        assert healthy.login in backups(healthy).values()  # kept, then deleted
+        healthy.security.calls.clear()
+        report = healthy.keepalive()
+        assert report["ok"] is True and report["action"] == "refreshed"
+        assert [post["refresh_token"] for post in healthy.endpoint.posts] == ["RT-3"]
 
     def test_with_the_file_gone_a_linked_item_is_kept(self, healthy):
         successor = creds("AT-K", "RT-K")
@@ -164,13 +171,26 @@ class TestReconcile:
             oauth.credential_fingerprint(healthy.login), oauth.credential_fingerprint(successor),
             ("a@example.com", ""), consumed_grants.NEW_LOGIN,
         )
-        s = ClaudeAccountSwitcher()
-        s.stash_verified(successor, ("a@example.com", ""), "1", "keepalive-split-brain")
         healthy.security.items[ACTIVE_ITEM] = successor
         healthy.file.unlink()
         report = _reconcile()
         assert report["ok"] is True and report["kept"] == "keychain"
+        assert healthy.file.read_text() == successor
         assert healthy.read_enc(SLOT_1) == successor
+
+    def test_with_the_file_gone_a_linked_slot_is_kept(self, healthy):
+        older = creds("AT-K", "RT-K")
+        ClaudeAccountSwitcher()
+        consumed_grants.record_lineage(
+            oauth.credential_fingerprint(older), oauth.credential_fingerprint(healthy.login),
+            ("a@example.com", ""), consumed_grants.OBSERVED_POST,
+        )
+        healthy.security.items[ACTIVE_ITEM] = older
+        healthy.file.unlink()
+        report = _reconcile()
+        assert report["ok"] is True and report["kept"] == "slot"
+        assert healthy.file.read_text() == healthy.login
+        assert ACTIVE_ITEM not in healthy.security.items
 
     @pytest.mark.parametrize("keychain_later", [True, False])
     def test_one_login_in_both_keeps_the_later_generation(self, healthy, keychain_later):
@@ -210,23 +230,17 @@ class TestReconcile:
         assert report["ok"] is True and report["kept"] == "keychain"
         assert healthy.file.read_text() == successor
 
-    def test_an_unseen_keychain_login_beats_the_file_hswap_holds(self, healthy):
-        # The file's token is the slot's `.enc`; the item's was never seen: written later.
-        successor = creds("AT-K", "RT-K")
-        healthy.security.items[ACTIVE_ITEM] = successor
-        report = _reconcile()
-        assert report["ok"] is True and report["kept"] == "keychain"
-        assert healthy.file.read_text() == successor
-        assert any(value == healthy.login for value in backups(healthy).values())
-
-    def test_an_unseen_file_login_beats_a_keychain_copy_hswap_holds(self, healthy):
+    @pytest.mark.parametrize("fresh_in", ["keychain", "file"])
+    def test_a_login_only_one_side_has_seen_is_still_ambiguous(self, healthy, fresh_in):
         fresh = creds("AT-N", "RT-N")
-        healthy.write_file(fresh)  # /login over SSH
-        healthy.security.items[ACTIVE_ITEM] = healthy.login
-        report = _reconcile()
-        assert report["ok"] is True and report["kept"] == "file"
-        assert healthy.file.read_text() == fresh
-        assert healthy.read_enc(SLOT_1) == fresh
+        if fresh_in == "keychain":
+            healthy.security.items[ACTIVE_ITEM] = fresh
+        else:
+            healthy.write_file(fresh)  # /login over SSH
+            healthy.security.items[ACTIVE_ITEM] = healthy.login
+        before = healthy.snapshot()
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
+        assert healthy.snapshot() == before
 
     def test_two_unseen_logins_are_ambiguous_and_change_nothing(self, healthy, capsys):
         healthy.write_file(creds("AT-N", "RT-N"))
@@ -254,7 +268,7 @@ class TestReconcile:
         assert daemon.security.non_guard_calls() == []
 
     def test_dry_run_plans_and_writes_nothing(self, healthy):
-        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=9000)
         healthy.file.unlink()
         before = healthy.snapshot()
         report = _reconcile(dry_run=True)
@@ -280,13 +294,96 @@ class TestReconcile:
         assert env.snapshot() == before
 
     def test_no_token_in_output_logs_or_argv(self, healthy, capsys):
-        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-1", expires_in_s=9000)
         healthy.file.unlink()
         code, out, err = run_cli(["reconcile", "--json"], capsys)
         assert code == 0 and json.loads(out)["ok"] is True
         code, text_out, text_err = run_cli(["reconcile"], capsys)
         assert code == 0
         _no_token_in(healthy, out + err + text_out + text_err)
+
+
+class TestReconcileFailures:
+    """Every failure leaves the item where it is, so nothing is lost and the next run retries."""
+
+    @pytest.fixture
+    def moved(self, healthy):
+        # One lineage, a later generation in the item: reconcile keeps the item.
+        healthy.item = creds("AT-1B", "RT-1", expires_in_s=9000)
+        healthy.security.items[ACTIVE_ITEM] = healthy.item
+        healthy.file.unlink()
+        return healthy
+
+    def _assert_item_kept(self, env, report, kind):
+        assert report["ok"] is False and report["error"]["type"] == kind, report
+        assert env.security.items[ACTIVE_ITEM] == env.item
+        assert env.read_enc(SLOT_2) is not None
+
+    def test_a_backup_that_does_not_read_back(self, moved):
+        moved.security.mangle = lambda value: value[:-1]
+        self._assert_item_kept(moved, _reconcile(), "keychain_unavailable")
+        assert moved.security.deleted == []
+
+    def test_an_enc_that_does_not_read_back(self, moved, monkeypatch):
+        moved.write_enc(SLOT_1, creds("AT-1", "RT-1", expires_in_s=60))  # so the slot is rewritten
+        store = ClaudeAccountSwitcher()._store
+        monkeypatch.setattr(type(store), "_leftover_backup_enc", lambda self, num, email: "garbled")
+        self._assert_item_kept(moved, _reconcile(), "refresh_failed")
+        assert moved.security.deleted == []
+
+    def test_a_failed_delete(self, moved):
+        moved.security.delete_rc = 1
+        self._assert_item_kept(moved, _reconcile(), "keychain_unavailable")
+
+    def test_locks_that_stay_held(self, moved, monkeypatch):
+        from claude_swap import migrate_store
+        from claude_swap.exceptions import LockError
+
+        def held(*args, **kwargs):
+            raise LockError("held")
+
+        monkeypatch.setattr(migrate_store, "claude_credentials_lock", held)
+        before = moved.snapshot()
+        report = _reconcile()
+        assert report["error"]["type"] == "locked"
+        assert moved.snapshot() == before
+
+    def test_an_item_rewritten_before_its_delete_is_left_for_the_next_run(self, moved, monkeypatch):
+        from claude_swap import macos_keychain
+
+        real = macos_keychain.set_password
+        newer = creds("AT-1C", "RT-1", expires_in_s=9500, mcpOAuth={"srv": {"accessToken": "x"}})
+
+        def mcp_login_lands(service, account, value):
+            real(service, account, value)
+            if account.startswith("claude-code-credentials.backup-"):
+                moved.security.items[ACTIVE_ITEM] = newer  # a write that takes no lock
+
+        monkeypatch.setattr(macos_keychain, "set_password", mcp_login_lands)
+        report = _reconcile()
+        assert report["error"]["type"] == "keychain_item_changed"
+        assert moved.security.items[ACTIVE_ITEM] == newer
+        monkeypatch.setattr(macos_keychain, "set_password", real)
+        report = _reconcile()
+        assert report["ok"] is True
+        assert moved.file.read_text() == newer
+
+
+class TestBackupCap:
+    def test_each_name_keeps_the_newest_five(self, healthy):
+        from claude_swap import migrate_store
+
+        for n in range(7):
+            healthy.security.items[("claude-swap", f"claude-code-credentials.backup-2026010{n}T000000Z")] = f"v{n}"
+        healthy.security.items[("claude-swap", "slot-1-a@example.com.backup-20260101T000000Z")] = "s"
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=9000)
+        report = _reconcile()
+        assert report["ok"] is True
+        names = sorted(a for (svc, a) in healthy.security.items if a.startswith("claude-code-credentials.backup-"))
+        assert len(names) == migrate_store.BACKUPS_KEPT == 5
+        assert set(report["backups"]) <= set(names)  # this run's survive
+        assert "claude-code-credentials.backup-20260100T000000Z" in report["backupsPruned"]
+        assert ("claude-swap", "slot-1-a@example.com.backup-20260101T000000Z") in healthy.security.items
 
 
 class TestDoctor:
@@ -305,8 +402,9 @@ class TestDoctor:
         assert set(report) == {
             "schemaVersion", "ok", "problems", "store", "keychainItemPresent", "keychainLocked",
             "fileExists", "fileMode", "slotsWithoutBackup", "sessionDirs",
-            "reconcileService", "keepaliveService",
+            "reconcileService", "keepaliveService", "keychainBackups", "lastReconcileError",
         }
+        assert report["keychainBackups"] == 0 and report["lastReconcileError"] is None
         assert report["schemaVersion"] == 1
         assert report["ok"] is True and report["problems"] == []
         assert report["store"] == "file" and report["keychainItemPresent"] is False
@@ -339,6 +437,30 @@ class TestDoctor:
         self._ready(healthy)
         healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
         assert self._problems(healthy) == ["keychain_item_present"]
+
+    def test_reconcile_ambiguous(self, healthy):
+        self._ready(healthy)
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
+        report = run_doctor(ClaudeAccountSwitcher())
+        assert report["problems"] == ["keychain_item_present", "reconcile_ambiguous"]
+        assert report["lastReconcileError"] == "reconcile_ambiguous"
+
+    def test_backups_are_counted(self, healthy):
+        self._ready(healthy)
+        healthy.security.items[("claude-swap", "claude-code-credentials.backup-20260101T000000Z")] = "x"
+        healthy.security.items[("claude-swap", "account-1-a@example.com")] = "y"
+        assert run_doctor(ClaudeAccountSwitcher())["keychainBackups"] == 1
+
+    def test_an_unreadable_store_is_an_error_envelope(self, healthy, capsys, monkeypatch):
+        from claude_swap import doctor
+
+        def denied(*args, **kwargs):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(doctor, "get_credentials_path", denied)
+        code, out, _ = run_cli(["doctor", "--json"], capsys)
+        assert code == 1 and json_error_type(out) == "io_error"
 
     def test_file_missing(self, healthy):
         self._ready(healthy)
@@ -521,6 +643,60 @@ class TestKeepaliveDaemon:
             self._install(macos_services, calls)
         assert not any(call[0] == "sudo" for call in calls)
 
+    def test_no_proxy_password_goes_into_the_daemon_plist(self, macos_services, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://user:secret@proxy.example:3128")
+        calls = []
+        with _launchctl(calls), pytest.raises(ClaudeSwitchError, match="password"):
+            self._install(macos_services, calls)
+        assert not any(call[0] == "sudo" for call in calls)
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+        with _launchctl(calls):
+            self._install(macos_services, calls)
+        doc = plistlib.loads(ks.system_plist_path().read_bytes())
+        assert doc["EnvironmentVariables"]["HTTPS_PROXY"] == "http://proxy.example:3128"
+
+    def test_a_failed_bootstrap_removes_the_new_plist(self, macos_services):
+        calls = []
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["sudo", "launchctl", "bootstrap"]:
+                calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 5, "", "Bootstrap failed: 5")
+            return real(argv, **kwargs)
+
+        with _launchctl(calls) as fake:
+            real = fake.side_effect
+            fake.side_effect = run
+            with pytest.raises(ClaudeSwitchError, match="bootstrap"):
+                self._install(macos_services, calls)
+        assert not ks.system_plist_path().exists()
+
+    def test_a_failed_bootstrap_on_update_puts_the_old_plist_back(self, macos_services):
+        with _launchctl([]):
+            self._install(macos_services, [])
+        before = ks.system_plist_path().read_bytes()
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["sudo", "launchctl", "bootstrap"] and b"1234" in ks.system_plist_path().read_bytes():
+                return subprocess.CompletedProcess(argv, 5, "", "Bootstrap failed: 5")
+            return real(argv, **kwargs)
+
+        with _launchctl([], loaded=True) as fake:
+            real = fake.side_effect
+            fake.side_effect = run
+            with pytest.raises(ClaudeSwitchError, match="bootstrap"):
+                ks.install(1234, False, macos_services, UID, PROGRAM, system=True, user="kgolf")
+        assert ks.system_plist_path().read_bytes() == before
+
+    def test_config_refuses_to_leave_the_file_store_under_the_daemon(self, healthy, capsys, macos_services):
+        with _launchctl([]):
+            self._install(macos_services, [])
+        code, _, err = run_cli(["config", "unset", "credentials.store"], capsys)
+        assert code == 1 and "keepalive --uninstall-service --system" in err
+        assert healthy.stored_setting() == "file"
+        code, _, _ = run_cli(["config", "set", "credentials.store", "auto"], capsys)
+        assert code == 1 and healthy.stored_setting() == "file"
+
     def test_cli_refuses_outside_the_file_store(self, env, capsys, macos_services):
         calls = []
         with _launchctl(calls):
@@ -551,12 +727,27 @@ class TestMigrateStoreWithReconcile:
 
     def test_without_reconcile_installs_nothing(self, split, capsys):
         code, out, _ = run_cli(
-            ["migrate-store", "--to", "file", "--keep", "file", "--without-reconcile", "--json"], capsys
+            ["migrate-store", "--to", "file", "--keep", "file", "--no-reconcile", "--json"], capsys
         )
         report = json.loads(out)
         assert code == 0 and report["reconcileService"] is None
         assert not launch_agent.plist_path(rs.LABEL).exists()
         assert report["doctor"]["problems"] == ["reconcile_service_missing"]
+
+    def test_a_failing_doctor_does_not_hide_a_done_migration(self, split, capsys, monkeypatch):
+        from claude_swap import doctor
+
+        def broken(switcher):
+            raise PermissionError("denied")
+
+        monkeypatch.setattr(doctor, "run_doctor", broken)
+        code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--no-reconcile", "--json"], capsys)
+        report = json.loads(out)
+        assert code == 0 and report["ok"] is True
+        assert report["doctor"]["ok"] is None and report["doctor"]["error"]["type"] == "io_error"
+
+    def test_with_reconcile_is_gone(self, split, capsys):
+        assert run_cli(["migrate-store", "--to", "file", "--keep", "file", "--with-reconcile"], capsys)[0] == 2
 
     def test_dry_run_installs_nothing(self, split, capsys):
         code, out, _ = run_cli(["migrate-store", "--to", "file", "--keep", "file", "--dry-run", "--json"], capsys)

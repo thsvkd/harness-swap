@@ -18,9 +18,11 @@ Linux is not covered: there is no Keychain, so a cron line does the same job.
 from __future__ import annotations
 
 import getpass
+import os
 import plistlib
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 from claude_swap import launch_agent
@@ -255,8 +257,9 @@ def _sudo(*args: str) -> None:
     result = launch_agent.subprocess.run(["sudo", *args], capture_output=True, text=True, check=False)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
+        what = " ".join(args[:2]) if args[0] == "launchctl" else args[0]
         raise ClaudeSwitchError(
-            f"sudo {args[0]} failed (exit {result.returncode})" + (f": {detail}" if detail else "")
+            f"sudo {what} failed (exit {result.returncode})" + (f": {detail}" if detail else "")
         )
 
 
@@ -265,6 +268,25 @@ def _read_system() -> dict | None:
     if doc is not None and not _managed(doc):
         raise ForeignServiceError(f"{system_plist_path()} was not made by hswap; left untouched.")
     return doc
+
+
+def _refuse_proxy_secrets() -> None:
+    """The daemon plist is world-readable, and build_plist forwards the proxy variables."""
+    for key in launch_agent._FORWARDED_ENV_KEYS:
+        if "proxy" in key.lower() and "@" in urllib.parse.urlsplit(os.environ.get(key, "")).netloc:
+            raise ClaudeSwitchError(
+                f"{key} holds a user name or password, and the LaunchDaemon's plist is readable "
+                "by every local user; unset it for this install (or use a proxy without one)."
+            )
+
+
+def _put_system_plist(plist: bytes, path: Path) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / path.name
+        staged.write_bytes(plist)
+        # launchd refuses a daemon plist root does not own or others can write; 644
+        # lets the user read it back for --service-status.
+        _sudo("install", "-o", "root", "-g", "wheel", "-m", "644", str(staged), str(path))
 
 
 def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
@@ -280,16 +302,25 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
         err_log = launch_agent.log_paths(LABEL, home)[1]
         err_log.parent.mkdir(parents=True, exist_ok=True)
         err_log.touch(exist_ok=True)  # the user's: launchd would create it as root
-        with tempfile.TemporaryDirectory() as tmp:
-            staged = Path(tmp) / path.name
-            staged.write_bytes(plist)
-            # launchd refuses a daemon plist root does not own or others can write; 644
-            # lets the user read it back for --service-status.
-            _sudo("install", "-o", "root", "-g", "wheel", "-m", "644", str(staged), str(path))
+        previous = path.read_bytes() if doc is not None else None
+        _put_system_plist(plist, path)
         if loaded:
             _sudo("launchctl", "bootout", target)
             launch_agent._wait_until_unloaded(LABEL, domain=SYSTEM)
-        _sudo("launchctl", "bootstrap", SYSTEM, str(path))
+        try:
+            _sudo("launchctl", "bootstrap", SYSTEM, str(path))
+        except ClaudeSwitchError:
+            # Back to what was there: no plist launchd would load at the next boot unasked.
+            try:
+                if previous is None:
+                    _sudo("rm", "-f", str(path))
+                else:
+                    _put_system_plist(previous, path)
+                    if loaded:
+                        _sudo("launchctl", "bootstrap", SYSTEM, str(path))
+            except ClaudeSwitchError:
+                pass
+            raise
     if gui is not None:
         launch_agent.uninstall(LABEL, home, uid)
     if unchanged and loaded:
@@ -314,6 +345,7 @@ def install(
     _require_macos()
     program = program or launch_agent.resolve_program()
     if system:
+        _refuse_proxy_secrets()
         return _install_system(build(program, ahead, then_auto, home, user=user or getpass.getuser()), home, uid)
     if _read_path(system_plist_path()) is not None:
         raise ServiceConflictError(

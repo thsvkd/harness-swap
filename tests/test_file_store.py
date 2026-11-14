@@ -167,7 +167,7 @@ class Env:
             for path in sorted(self.home.rglob("*"))
             if path.is_file()
             and not path.name.endswith((".log", ".lock", ".takeover"))
-            and path.name != "keepalive.json"
+            and path.name not in ("keepalive.json", "reconcile.json")  # run reports
         }
         return {"files": files, "items": dict(self.security.items)}
 

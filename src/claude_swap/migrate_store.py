@@ -17,14 +17,17 @@ is the state a repair exists to end.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from claude_swap import consumed_grants, macos_keychain, oauth
 from claude_swap.claude_locks import claude_credentials_lock
-from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, SECURITY_SERVICE
+from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, SECURITY_SERVICE, holds_no_login
 from claude_swap.exceptions import (
     ClaudeSwitchError,
     ConfigConflictError,
@@ -43,9 +46,19 @@ from claude_swap.keepalive import (
 )
 from claude_swap.locking import FileLock
 from claude_swap.paths import get_credentials_path
-from claude_swap.settings import require_keychain, set_setting
+from claude_swap.settings import atomic_write_json, require_keychain, set_setting
 
 CREDENTIALS_BACKUP = "claude-code-credentials"
+# Per backup name: every run that finds an item adds one, and a GUI Claude Code can
+# recreate the item every few hours.
+BACKUPS_KEPT = 5
+SEEN_FILENAME = "seen_logins.json"
+_SEEN_RETENTION_S = 400 * 24 * 3600  # the ledger's: longer than a refresh token lives
+_ITEM_CHANGED = (
+    "A Claude Code credential item changed while this run kept it, so it was not deleted. "
+    "The file and the active slot's .enc hold the kept login; the next run decides again."
+)
+_logger = logging.getLogger("claude-swap")
 _NEEDS_KEYCHAIN = (
     "The login keychain is not readable from this process, so nothing was changed. Run this "
     "from the GUI session, or after security unlock-keychain in the same shell."
@@ -163,6 +176,7 @@ def run_migrate_store(switcher, keep: str, *, dry_run: bool = False) -> dict:
         "storesDiffer": False,
         "warning": None,
         "error": None,
+        "backupsPruned": [],
     }
     if dry_run:
         report["dryRun"] = True
@@ -218,7 +232,61 @@ def _slot_plan(switcher, active, kept: str) -> list[tuple[str, str, str, list[st
     return plan
 
 
-def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
+def seen_logins(switcher) -> dict:
+    """Fingerprints of every login migrate-store and reconcile read, wrote or backed up,
+    and when. Unreadable reads as empty: the evidence it gives is then missing, not wrong."""
+    try:
+        data = json.loads((switcher.backup_dir / "cache" / SEEN_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _remember(switcher, values) -> None:
+    now = time.time()
+    seen = {
+        fp: at
+        for fp, at in seen_logins(switcher).items()
+        if isinstance(at, (int, float)) and now - at < _SEEN_RETENTION_S
+    }
+    for value in values:
+        if not holds_no_login(value):
+            seen[oauth.credential_fingerprint(value)] = now
+    try:
+        atomic_write_json(switcher.backup_dir / "cache" / SEEN_FILENAME, seen)
+    except OSError as e:
+        _logger.warning("could not write %s: %s", SEEN_FILENAME, type(e).__name__)
+
+
+def _backup_order(account: str) -> tuple:
+    stamp, _, attempt = account.rsplit(".backup-", 1)[1].partition("-")
+    return stamp, int(attempt) if attempt.isdigit() else 0
+
+
+def _prune_backups(report: dict) -> None:
+    """Keep the newest BACKUPS_KEPT per backup name, and every one this run made. Best
+    effort: the move is done, and a backup left behind is kept, not lost."""
+    bases = {name.rsplit(".backup-", 1)[0] for name in report["backups"]}
+    try:
+        accounts = [
+            account
+            for service, account in macos_keychain.generic_items()
+            if service == SECURITY_SERVICE and account.rsplit(".backup-", 1)[0] in bases
+        ]
+        for base in bases:
+            ours = sorted((a for a in accounts if a.rsplit(".backup-", 1)[0] == base), key=_backup_order)
+            for account in ours[:-BACKUPS_KEPT]:
+                if account in report["backups"]:
+                    continue
+                if macos_keychain.get_password(SECURITY_SERVICE, account) is not None:
+                    macos_keychain.delete_password(SECURITY_SERVICE, account)
+                    report["backupsPruned"].append(account)
+    except (*macos_keychain.KEYCHAIN_ERRORS, ValueError) as e:
+        _logger.warning("could not prune Keychain backups: %s", type(e).__name__)
+
+
+def _migrate(switcher, report: dict, keep: str, dry_run: bool, kept: str | None = None) -> None:
+    """``kept``: the login to keep when it is in neither store (reconcile's slot copy)."""
     path = get_credentials_path()
     try:
         file_creds = path.read_text(encoding="utf-8")
@@ -238,7 +306,8 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
     ):
         report["storesDiffer"] = True
         report["warning"] = _STORES_DIFFER_WARNING
-    kept = file_creds if keep == "file" else keychain_creds
+    if kept is None:
+        kept = file_creds if keep == "file" else keychain_creds
     if not _oauth_payload(kept).get("refreshToken"):
         raise _Stop("no_credentials", f"The {keep} store holds no refresh token; nothing was changed.")
     _refuse_spent(kept)
@@ -251,7 +320,7 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
         report["slotsMigrated"] = [int(num) for num, *_ in plan]
         report["itemAbsent"] = not items
         report["plan"] = [
-            *(["write the keychain login to the file"] if keep == "keychain" else []),
+            *([f"write the {keep} login to the file"] if file_creds != kept else []),
             *[f"write slot {num}'s .enc" for num, *_ in plan],
             *[f"back up and delete {service}" for service, _ in items],
             "set credentials.store=file",
@@ -259,7 +328,7 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
         return
 
     # Files first: until the originals go, a failure leaves the Keychain as it was.
-    if keep == "keychain" and file_creds != kept:
+    if file_creds != kept:
         if file_creds.strip() and not _same_login(file_creds, kept):
             _back_up(CREDENTIALS_BACKUP, file_creds, report)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,12 +344,18 @@ def _migrate(switcher, report: dict, keep: str, dry_run: bool) -> None:
 
     for value in items.values():
         _back_up(CREDENTIALS_BACKUP, value, report)
-    for service, account in items:
+    for (service, account), value in items.items():
+        # A write that takes no lock (an MCP login) may have landed since the backup.
+        current = macos_keychain.get_password(service, account)
+        if current is not None and current != value:
+            raise _Stop("keychain_item_changed", _ITEM_CHANGED)
         macos_keychain.delete_password(service, account)
     report["itemAbsent"] = not macos_keychain.credential_item_present()
     if not report["itemAbsent"]:
         raise _Stop("keychain_item_present")
     set_setting(switcher.backup_dir, "credentials.store", "file")
+    _remember(switcher, [kept, file_creds, *items.values(), *(c for *_, r in plan for c in r)])
+    _prune_backups(report)
 
 
 def _restore_is_safe(switcher, active, value: str) -> bool:

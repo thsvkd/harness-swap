@@ -6,12 +6,14 @@ item, and the file is deleted when the item was new. In file mode that stops eve
 (``keychain_item_present``) until something settles which copy is the login.
 
 This is ``migrate-store`` with the ``--keep`` choice made from evidence instead of a person.
-Of two copies, the later is: the later generation of one lineage, the one a recorded link
-or the ledger says came after the other, or the only one nothing here has seen (written
-after hswap last looked). The item is compared with the file, or with the active slot's
-copy when Claude Code deleted the file: a GUI process with a stale cache can write an
-older token. Anything else is ``reconcile_ambiguous`` and nothing changes. Expiry orders only copies of one lineage,
-as everywhere else. The writes, the read-back backups and the deletes are migrate-store's.
+The item is compared with the file, or with the active slot's copy when Claude Code deleted
+the file. The later login is: the later generation of one lineage, the one a recorded link
+or the ledger says came after the other, or the store's when the item holds a login that
+migrate-store or reconcile already settled (``seen_logins.json``), since a stale cache put
+it back. A login nothing here has seen proves nothing: a stale writer can hold one too.
+Anything else is ``reconcile_ambiguous``, nothing changes, and a person settles it with
+``migrate-store --keep``. That includes the usual case, a GUI refresh: nothing records
+that the item's token came from the file's.
 
 The item's value can only be read from a login session, so with the keychain locked this
 reports ``keychain_item_present_locked`` and touches nothing: it reads no value, only the
@@ -34,10 +36,13 @@ from claude_swap.migrate_store import (
     _migrate,
     _preflight,
     _report_failure,
+    seen_logins,
 )
+from claude_swap.settings import atomic_write_json
 from claude_swap.paths import get_credentials_path
 
 AMBIGUOUS = "reconcile_ambiguous"
+REPORT_FILENAME = "reconcile.json"
 LOCKED = "keychain_item_present_locked"
 # 3 is the service's "written, loads at next login".
 EXIT_CODES = {AMBIGUOUS: 4, LOCKED: 5}
@@ -63,45 +68,47 @@ def _file_text() -> str:
     return text if text.strip() else ""
 
 
-def _newer(switcher, active, first: str, second: str) -> str | None:
-    """``first``, ``second`` or None: which of two logins came later, on evidence only."""
-    first_fp, second_fp = oauth.credential_fingerprint(first), oauth.credential_fingerprint(second)
-    if first_fp == second_fp:
-        return "first" if credential_generation(first) >= credential_generation(second) else "second"
+def _newer(switcher, active, item: str, rival: str) -> str | None:
+    """``item``, ``rival`` or None: which login came later, on evidence only. Never
+    "the one nothing has seen": a Claude Code with a stale cache can write a token
+    hswap never saw, and it is the older one."""
+    item_fp, rival_fp = oauth.credential_fingerprint(item), oauth.credential_fingerprint(rival)
+    if item_fp == rival_fp:
+        return "item" if credential_generation(item) >= credential_generation(rival) else "rival"
 
     def came_after(winner: str, loser: str) -> bool:
         if winner in switcher._recorded_successors(active.identity, active.slot, loser):
             return True
         return consumed_grants.entry(loser) is not None and consumed_grants.entry(winner) is None
 
-    first_wins, second_wins = came_after(first_fp, second_fp), came_after(second_fp, first_fp)
-    if first_wins != second_wins:
-        return "first" if first_wins else "second"
-    if first_wins:
-        return None  # a cycle
-    email = active.identity[0] if active.identity else ""
-    unseen = [
-        name
-        for name, creds in (("first", first), ("second", second))
-        if switcher.is_provably_new_login(creds, active.slot, email, stores_must_agree=False)
-    ]
-    return unseen[0] if len(unseen) == 1 else None
+    item_wins, rival_wins = came_after(item_fp, rival_fp), came_after(rival_fp, item_fp)
+    if item_wins != rival_wins:
+        return "item" if item_wins else "rival"
+    # A login this command already settled, now back in the item while the store moved on:
+    # a stale writer put it there.
+    if not item_wins and item_fp in seen_logins(switcher):
+        return "rival"
+    return None
 
 
-def choose_kept(switcher, keychain: str, file_creds: str) -> str:
-    """``file`` or ``keychain``, on evidence only. Raises _Stop(AMBIGUOUS)."""
+def choose_kept(switcher, keychain: str, file_creds: str) -> tuple[str, str]:
+    """(``file``, ``keychain`` or ``slot``, the login), on evidence only. Raises
+    _Stop(AMBIGUOUS)."""
     if holds_no_login(keychain) and not holds_no_login(file_creds):
-        return "file"
+        return "file", file_creds
     active = _read_active(switcher)
     if holds_no_login(file_creds):
         # Claude Code deleted the file, maybe from a stale cache: the slot's copy stands in.
-        slot = _read_slot(active)
-        if holds_no_login(slot) or _newer(switcher, active, keychain, slot) == "first":
-            return "keychain"
+        rival, name = _read_slot(active), "slot"
     else:
-        verdict = _newer(switcher, active, keychain, file_creds)
-        if verdict:
-            return "keychain" if verdict == "first" else "file"
+        rival, name = file_creds, "file"
+    if holds_no_login(rival):
+        return "keychain", keychain
+    verdict = _newer(switcher, active, keychain, rival)
+    if verdict == "item":
+        return "keychain", keychain
+    if verdict == "rival":
+        return name, rival
     raise _Stop(AMBIGUOUS, _AMBIGUOUS_MESSAGE)
 
 
@@ -121,6 +128,7 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
         "storesDiffer": False,
         "warning": None,
         "error": None,
+        "backupsPruned": [],
     }
     if dry_run:
         report["dryRun"] = True
@@ -142,9 +150,15 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
             keychain = items.get(
                 (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()), ""
             )
-            keep = choose_kept(switcher, keychain, _file_text())
+            keep, kept = choose_kept(switcher, keychain, _file_text())
             report["kept"] = keep
-            _migrate(switcher, report, keep, dry_run)
+            _migrate(switcher, report, "file" if keep == "slot" else keep, dry_run, kept)
         report["action"] = "planned" if dry_run else "reconciled"
 
-    return _report_failure(report, work)
+    _report_failure(report, work)
+    if not dry_run:
+        try:  # doctor reads it; no token in it
+            atomic_write_json(switcher.backup_dir / "cache" / REPORT_FILENAME, report)
+        except OSError:
+            pass
+    return report

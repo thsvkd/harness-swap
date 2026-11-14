@@ -38,10 +38,14 @@ def build(program: list[str], home: Path | None = None) -> bytes:
 
 
 def _outdated(doc: dict | None, home: Path | None) -> bool | None:
+    return _compare(doc, home)[0]
+
+
+def _compare(doc: dict | None, home: Path | None) -> tuple[bool | None, str | None]:
     args = (doc or {}).get("ProgramArguments") or []
     if not ks._managed(doc, _MARKER) or args[-1:] != ["reconcile"] or len(args) < 2:
-        return None
-    return ks._job(doc, _MARKER) != ks._job(plistlib.loads(build(args[:-1], home)), _MARKER)
+        return None, None
+    return ks.compare(doc, build(args[:-1], home), _MARKER)
 
 
 def status(home: Path | None = None, uid: int | None = None) -> dict:
@@ -50,7 +54,9 @@ def status(home: Path | None = None, uid: int | None = None) -> dict:
     base = ks.job_status(LABEL, _MARKER, doc, launch_agent.plist_path(LABEL, home), home)
     if not macos:
         return base
-    base["outdated"] = _outdated(doc, home)
+    base["outdated"], base["outdatedReason"] = _compare(doc, home)
+    if doc is not None:
+        base["reinstallNeedsSudo"] = False  # a gui LaunchAgent only
     return ks.ask_launchd(base, LABEL, uid, home)
 
 

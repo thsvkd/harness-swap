@@ -1172,7 +1172,8 @@ def _log_migrate_store(report: dict, args) -> None:
 
     events.note(
         kept=report.get("kept"), dryRun=bool(args.dry_run), storesDiffer=report.get("storesDiffer"),
-        steps=report.get("plan") if args.dry_run else [
+        planned=len(report.get("plan") or []) if args.dry_run else None,
+        steps=["planned:%d" % len(report.get("plan") or [])] if args.dry_run else [
             "backups:%d" % len(report.get("backups", [])),
             "slots:%s" % ",".join(map(str, report.get("slotsMigrated", []))),
             "itemAbsent:%s" % report.get("itemAbsent"),

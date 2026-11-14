@@ -90,6 +90,12 @@ class TestOneLinePerCommand:
         assert event["exit"] == code == 0 and event["outcome"] == "ok"
         assert event["details"]["kept"] == "file" and event["details"]["slotsMigrated"] == [1, 2]
 
+    def test_a_dry_run_migration_logs_counts_not_its_plan_sentences(self, split, capsys):
+        run_cli(["migrate-store", "--to", "file", "--keep", "keychain", "--dry-run", "--json"], capsys)
+        details = _last(split, "migrate-store")["details"]
+        assert details["steps"] == [f"planned:{len(details['steps']) and details['planned']}"]
+        assert "back up" not in json.dumps(details) and details["planned"] >= 3
+
     def test_reconcile_details_say_why(self, healthy, capsys):
         healthy.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=9000)
         healthy.file.unlink()
@@ -191,10 +197,10 @@ class TestFile:
             events.note(pad="x" * 100)
             events.finish(0)
         logs = healthy.root / "logs"
-        names = sorted(p.name for p in logs.iterdir())
+        names = sorted(p.name for p in logs.iterdir() if p.name.startswith("events.jsonl"))
         assert names == ["events.jsonl", "events.jsonl.1", "events.jsonl.2", "events.jsonl.3"]
         if os.name == "posix":
-            for path in logs.iterdir():
+            for path in logs.glob("events.jsonl*"):
                 assert stat.S_IMODE(path.stat().st_mode) == 0o600
         # read() returns them oldest first across the rotation
         stamps = [event["ts"] for event in events.read(healthy.root)]
@@ -386,3 +392,174 @@ class TestDoctorLastEvents:
     def test_none_yet(self, healthy, capsys):
         _, out, _ = run_cli(["doctor", "--json"], capsys)
         assert json.loads(out)["lastEvents"] == []
+
+
+# --- independent review of the logging (0.3.1) ---------------------------------------
+
+LEAKY = (
+    "for a@corp.example see /Users/kgolf/.claude/x: server said 'quota exceeded for org' "
+    "via http://bob:hunter2@proxy.corp:3128"
+)
+LEAK_FRAGMENTS = ("a@corp.example", "/Users/kgolf", "quota exceeded", "hunter2", "proxy.corp", "bob:")
+
+
+class TestNoFreeText:
+    @pytest.mark.parametrize("raised, kind", [
+        (lambda: __import__("claude_swap.exceptions", fromlist=["x"]).ClaudeSwitchError(LEAKY), "ClaudeSwitchError"),
+        (lambda: RuntimeError(LEAKY), "RuntimeError"),
+    ], ids=["handled", "unexpected"])
+    def test_auto_errors_leave_only_their_type(self, healthy, capsys, monkeypatch, raised, kind):
+        from claude_swap.autoswitch import AutoSwitchEngine
+
+        def boom(self):
+            raise raised()
+
+        monkeypatch.setattr(AutoSwitchEngine, "_tick_inner", boom)
+        run_cli(["auto", "--once", "--json"], capsys)
+        text = (healthy.root / "logs" / "events.jsonl").read_text()
+        for fragment in LEAK_FRAGMENTS:
+            assert fragment not in text
+        error = [tick for tick in _last(healthy, "auto")["details"]["ticks"] if tick["event"] == "error"]
+        assert error == [{"event": "error", "transient": True, "errorType": kind}]
+
+    def test_switch_warnings_and_no_switch_detail_stay_out(self, healthy):
+        class Event:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def to_json(self):
+                return self.payload
+
+        events.begin("auto")
+        events.auto_event(Event({
+            "event": "switch", "trigger": "threshold", "dryRun": False,
+            "from": {"number": 1, "email": "a@example.com"}, "to": {"number": 2, "email": "b@example.com"},
+            "warnings": [LEAKY],
+        }))
+        events.auto_event(Event({"event": "no-switch", "reason": "cooldown", "detail": LEAKY}))
+        events.auto_event(Event({"event": "config-warning", "message": LEAKY}))
+        events.auto_event(Event({"event": "account-quarantined", "number": 2, "email": "b@example.com", "reason": "dead-token"}))
+        events.finish(0)
+        text = (healthy.root / "logs" / "events.jsonl").read_text()
+        for fragment in (*LEAK_FRAGMENTS, "example.com"):
+            assert fragment not in text
+        ticks = _last(healthy, "auto")["details"]["ticks"]
+        assert ticks == [
+            {"event": "switch", "trigger": "threshold", "dryRun": False, "from": 1, "to": 2},
+            {"event": "no-switch", "reason": "cooldown"},
+            {"event": "config-warning"},
+            {"event": "account-quarantined", "number": 2, "reason": "dead-token"},
+        ]
+
+    def test_an_email_that_slips_into_details_is_masked(self, healthy):
+        events.begin("status")
+        events.note(who="Me.Name+tag@corp.example.co")
+        events.finish(0)
+        text = (healthy.root / "logs" / "events.jsonl").read_text()
+        assert "corp.example" not in text and "[email]" in text
+
+    def test_a_caller_that_is_not_a_plain_name_is_custom(self, monkeypatch):
+        monkeypatch.setenv("HSWAP_CALLER", "me@corp.example")
+        assert events.caller() == "custom"
+        monkeypatch.setenv("HSWAP_CALLER", "launchd-gui-keepalive")
+        assert events.caller() == "launchd-gui-keepalive"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes")
+class TestStderrFileMode:
+    def _err(self, env):
+        err = env.home / "Library" / "Logs" / "dev.hswap.keepalive.err"
+        err.parent.mkdir(parents=True, exist_ok=True)
+        return err
+
+    def test_after_turning_over_both_files_are_owner_only(self, healthy, capsys, monkeypatch):
+        err = self._err(healthy)
+        err.write_text("x" * 64)
+        err.chmod(0o600)
+        monkeypatch.setattr(events, "STDERR_MAX_BYTES", 32)
+        monkeypatch.setenv("HSWAP_CALLER", "launchd-gui-keepalive")
+        run_cli(["status", "--json"], capsys)
+        assert stat.S_IMODE(err.stat().st_mode) == 0o600 and err.stat().st_size == 0
+        assert stat.S_IMODE(err.with_name(err.name + ".1").stat().st_mode) == 0o600
+
+    def test_each_launchd_run_narrows_a_wide_file(self, healthy, capsys, monkeypatch):
+        err = self._err(healthy)
+        err.write_text("old\n")
+        err.chmod(0o644)
+        monkeypatch.setenv("HSWAP_CALLER", "launchd-system-keepalive")
+        run_cli(["status", "--json"], capsys)
+        assert stat.S_IMODE(err.stat().st_mode) == 0o600 and err.read_text() == "old\n"
+
+
+class TestQuietWhenNotWriting:
+    def test_nothing_is_asked_when_nothing_will_be_written(self, temp_home, monkeypatch):
+        asked = []
+        monkeypatch.setattr(events, "_store_label", lambda root: asked.append("store") or "file")
+        monkeypatch.setattr(events, "session", lambda: asked.append("session") or "aqua")
+        events.begin("status")
+        events.finish(0)  # no store root
+        assert asked == []
+
+
+class TestTailRead:
+    def _write(self, path, rows):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def test_the_last_n_come_from_the_end_and_spill_into_older_files(self, healthy, monkeypatch):
+        logs = healthy.root / "logs"
+        self._write(logs / "events.jsonl.1", [{"n": n} for n in range(0, 3)])
+        self._write(logs / "events.jsonl", [{"n": n} for n in range(3, 3 + 5000)])
+        from pathlib import Path
+
+        def refuse(self, *args, **kwargs):
+            raise AssertionError("whole-file read")
+
+        monkeypatch.setattr(Path, "read_text", refuse)
+        assert [row["n"] for row in events.read(healthy.root, last=2)] == [5001, 5002]
+        monkeypatch.undo()
+        self._write(logs / "events.jsonl", [{"n": n} for n in range(3, 6)])
+        assert [row["n"] for row in events.read(healthy.root, last=5)] == [1, 2, 3, 4, 5]
+
+
+class TestLowLevel:
+    def test_the_real_path_of_home_is_shortened_too(self, tmp_path, monkeypatch):
+        real = tmp_path / "Users" / "someone"
+        real.mkdir(parents=True)
+        link = tmp_path / "home-link"
+        link.symlink_to(real)
+        monkeypatch.setattr("pathlib.Path.home", lambda: link)
+        line = events._scrub(json.dumps({"a": str(real / ".claude"), "b": str(link / "x")}))
+        assert str(real) not in line and str(link) not in line and line.count("~/") == 2
+
+    def test_a_carriage_return_is_not_a_new_line(self):
+        import io
+
+        out = io.StringIO()
+        stream = events.StampedStream(out)
+        stream.write("50%\r100%\ndone\n")
+        lines = out.getvalue().rstrip("\n").split("\n")
+        assert len(lines) == 2 and lines[0].endswith("50%\r100%") and ISO.match(lines[0]) and ISO.match(lines[1])
+
+    def test_a_cut_off_line_does_not_swallow_the_next(self, healthy):
+        logs = healthy.root / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "events.jsonl").write_text('{"cmd": "list", "outcome": "o')  # the disk filled up
+        events.begin("status")
+        events.finish(0)
+        assert [row["cmd"] for row in events.read(healthy.root)] == ["status"]
+
+    def test_turning_over_waits_for_no_one(self, healthy, monkeypatch):
+        from claude_swap.locking import FileLock
+
+        monkeypatch.setattr(events, "MAX_BYTES", 300)
+        monkeypatch.setattr(events, "TURN_OVER_LOCK_S", 0.05)
+        logs = healthy.root / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        with FileLock(logs / ".events.lock"):
+            for _ in range(10):
+                events.begin("status")
+                events.note(pad="x" * 80)
+                events.finish(0)
+        # Another process held the turn-over: lines still land, nothing is lost.
+        assert len(events.read(healthy.root)) == 10

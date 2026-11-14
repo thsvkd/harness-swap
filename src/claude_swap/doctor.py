@@ -123,7 +123,7 @@ def run_doctor(switcher) -> dict:
     report["ok"] = not problems
     from claude_swap import events
 
-    report["lastEvents"] = [events.summary(row) for row in events.read(switcher.backup_dir)[-5:]]
+    report["lastEvents"] = [events.summary(row) for row in events.read(switcher.backup_dir, last=5)]
     if events.active() == "doctor":  # not migrate-store's summary
         events.note(problems=list(problems))
         events.outcome("ok" if report["ok"] else "problems")

@@ -450,6 +450,8 @@ class ErrorEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "error"
     message: str
     transient: bool = True
+    # The exception's type or a code, for logs/events.jsonl, which never takes the message.
+    error_type: str = ""
 
     def _fields(self) -> dict:
         return {"message": self.message, "transient": self.transient}
@@ -926,11 +928,13 @@ class AutoSwitchEngine:
             self._persist_health_counters(self._health_account)
             return outcome
         except ClaudeSwitchError as e:
-            self._emit(ErrorEvent(message=str(e), transient=True))
+            self._emit(ErrorEvent(
+                message=str(e), transient=True, error_type=getattr(e, "json_type", None) or type(e).__name__
+            ))
             return TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
             self._emit(
-                ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
+                ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True, error_type=type(e).__name__)
             )
             return TickOutcome.ERROR
 
@@ -1647,6 +1651,7 @@ class AutoSwitchEngine:
                     if systemic
                     else "could not freshen any candidate (network?)",
                     transient=True,
+                    error_type=f"freshen:{systemic}" if systemic else "freshen_failed",
                 )
             )
             return TickOutcome.ERROR
@@ -2649,7 +2654,7 @@ class AutoSwitchEngine:
         self.on_event(event)
         from claude_swap import events
 
-        events.auto_event(event.to_json())
+        events.auto_event(event)
 
     # -- loop -------------------------------------------------------------------
 
@@ -2742,7 +2747,7 @@ class AutoSwitchEngine:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards
                 self._emit(
-                    ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
+                    ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True, error_type=type(e).__name__)
                 )
                 outcome = TickOutcome.ERROR
             delay = self._next_delay(outcome)

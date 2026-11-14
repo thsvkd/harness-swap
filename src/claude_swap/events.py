@@ -29,10 +29,12 @@ EVENTS_FILENAME = "events.jsonl"
 MAX_BYTES = 1024 * 1024
 BACKUPS = 3
 STDERR_MAX_BYTES = 1024 * 1024
+TURN_OVER_LOCK_S = 0.5  # a run never waits longer than this to log
 # Commands that only read the log (writing would bury what they show).
 _SILENT = {"log"}
 # Credentials in any form Claude Code or a person hands over; a long opaque run as well.
 _SECRET = re.compile(r"sk-ant-[A-Za-z0-9_\-]+|[A-Za-z0-9_\-]{40,}")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _FLAG_COMMANDS = {
     "--list": "list", "--status": "status", "--switch": "switch", "--switch-to": "switch",
     "--add-account": "add", "--remove-account": "remove", "--tui": "tui", "--purge": "purge",
@@ -57,7 +59,8 @@ def caller() -> str:
     """HSWAP_CALLER (the launchd plists and jarvis set it), else a TTY's person or unknown."""
     named = os.environ.get("HSWAP_CALLER", "").strip()
     if named:
-        return named[:64]
+        # A name, not free text: anything else (an email, a sentence) becomes "custom".
+        return named if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", named) else "custom"
     try:
         return "tty" if sys.stdin.isatty() else "unknown"
     except (AttributeError, ValueError, OSError):
@@ -179,11 +182,12 @@ def _sequence_active(root: Path):
 
 
 def _scrub(line: str) -> str:
-    home = str(Path.home())
-    for form in (json.dumps(home)[1:-1], home):
-        if form and form != "/":
-            line = line.replace(form, "~")
-    return _SECRET.sub("[redacted]", line)
+    homes = {str(Path.home()), os.path.realpath(Path.home())}  # e.g. /home/x is /Users/x
+    for home in sorted(homes, key=len, reverse=True):
+        for form in (json.dumps(home)[1:-1], home):
+            if form and form != "/":
+                line = line.replace(form, "~")
+    return _SECRET.sub("[redacted]", _EMAIL.sub("[email]", line))
 
 
 def _rotate(target: Path, keep: int) -> None:
@@ -194,31 +198,55 @@ def _rotate(target: Path, keep: int) -> None:
     os.replace(target, target.with_name(f"{target.name}.1"))
 
 
+def _turn_over_if_full(target: Path, incoming: int) -> None:
+    """Under a lock, so two runs cannot both rename (and the second shift away the first's
+    file). A held lock skips the turn-over: this line lands in a file slightly over the
+    limit, and the next run turns it over. Nothing is lost either way."""
+    from claude_swap.locking import FileLock
+    from claude_swap.exceptions import LockError
+
+    try:
+        if target.stat().st_size + incoming <= MAX_BYTES:
+            return  # the common case takes no lock
+        with FileLock(target.parent / ".events.lock", timeout=TURN_OVER_LOCK_S):
+            if target.stat().st_size + incoming > MAX_BYTES:
+                _rotate(target, BACKUPS)
+    except (FileNotFoundError, LockError):
+        pass
+
+
 def _append(target: Path, line: str) -> None:
     target.parent.mkdir(mode=0o700, exist_ok=True)
-    try:
-        if target.stat().st_size + len(line) > MAX_BYTES:
-            _rotate(target, BACKUPS)
-    except FileNotFoundError:
-        pass
-    fd = os.open(target, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    data = line.encode("utf-8")
+    _turn_over_if_full(target, len(data))
+    fd = os.open(target, os.O_CREAT | os.O_APPEND | os.O_RDWR, 0o600)
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
-        os.write(fd, line.encode("utf-8"))
+        # A line cut off by a full disk: start on a line of our own. O_APPEND writes at the
+        # end whatever this offset says.
+        if os.fstat(fd).st_size and os.lseek(fd, -1, os.SEEK_END) >= 0 and os.read(fd, 1) != b"\n":
+            data = b"\n" + data
+        os.write(fd, data)
     finally:
         os.close(fd)
 
 
-def _write(record: dict) -> None:
-    """Best effort, and only into a store that exists: a run must not create one."""
+def _writable() -> bool:
+    """Only into a store that exists (a run must not create one), and not as root: root's
+    HOME may be the user's. Asked first, so a run that writes nothing reads no settings
+    and starts no launchctl."""
     try:
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            return  # root's HOME may be the user's; leave no root-owned file there
-        root = _store_root()
-        if not root.is_dir():
-            return
-        _append(path(root), _scrub(json.dumps(record, default=str, separators=(",", ":"))) + "\n")
+            return False
+        return _store_root().is_dir()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _write(record: dict) -> None:
+    try:
+        _append(path(), _scrub(json.dumps(record, default=str, separators=(",", ":"))) + "\n")
     except Exception:  # noqa: BLE001 - logging never changes a result
         pass
 
@@ -244,7 +272,7 @@ def _record(exit_code: int, outcome_value: str | None, details: dict, error_kind
 
 def step(outcome_value: str, **details) -> None:
     """An extra line for one decision of a long run (an auto loop's switch)."""
-    if not _state or _state["cmd"] in _SILENT:
+    if not _state or _state["cmd"] in _SILENT or not _writable():
         return
     try:
         _write(_record(0, outcome_value, details, None))
@@ -257,7 +285,7 @@ def finish(exit_code) -> None:
         return
     try:
         code = exit_code if isinstance(exit_code, int) else (0 if exit_code is None else 1)
-        if _state["cmd"] not in _SILENT:
+        if _state["cmd"] not in _SILENT and _writable():
             _write(_record(code, _state.get("outcome"), _state["details"], _state.get("error")))
     except Exception:  # noqa: BLE001
         pass
@@ -265,22 +293,58 @@ def finish(exit_code) -> None:
         _state.clear()
 
 
-def read(root: Path | None = None) -> list[dict]:
-    """Every event, oldest first, across the rotated files; unreadable lines skipped."""
-    target = path(root)
+def _rows(lines) -> list[dict]:
     rows = []
-    for candidate in [target.with_name(f"{target.name}.{n}") for n in range(BACKUPS, 0, -1)] + [target]:
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue  # a line cut off, or not ours
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _tail(candidate: Path, wanted: int) -> list[dict]:
+    """The last ``wanted`` events of one file, reading back from its end only as far as needed."""
+    block = 64 * 1024
+    with open(candidate, "rb") as f:
+        end = f.seek(0, os.SEEK_END)
+        data, start = b"", end
+        while start > 0:
+            start = max(0, start - block)
+            f.seek(start)
+            data = f.read(end - start)
+            if data.count(b"\n") > wanted:
+                break
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if start > 0:
+        lines = lines[1:]  # the first may be a partial line
+    return _rows(lines)[-wanted:]
+
+
+def read(root: Path | None = None, last: int | None = None) -> list[dict]:
+    """Events oldest first across the rotated files; unreadable lines skipped. ``last``: only
+    the newest N, read from the files' ends, newest file first."""
+    target = path(root)
+    newest_first = [target] + [target.with_name(f"{target.name}.{n}") for n in range(1, BACKUPS + 1)]
+    if last is not None:
+        rows: list[dict] = []
+        for candidate in newest_first:
+            if len(rows) >= last:
+                break
+            try:
+                rows = _tail(candidate, last - len(rows)) + rows
+            except OSError:
+                continue
+        return rows[-last:] if last else []
+    rows = []
+    for candidate in reversed(newest_first):
         try:
             text = candidate.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for line in text.splitlines():
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
+        rows.extend(_rows(text.splitlines()))
     return rows
 
 
@@ -299,12 +363,23 @@ def _slots(value):
     return value
 
 
-def auto_event(payload: dict) -> None:
+# What an auto event may leave: its kind, codes, slot numbers and numbers. Never a message,
+# a detail, a warning or an email: those carry exception text, paths and server words.
+_AUTO_FIELDS = (
+    "event", "reason", "trigger", "from", "to", "active", "number", "headroomPct", "threshold",
+    "windows", "fetchErrors", "dryRun", "transient", "earliestResetAt", "seconds",
+)
+
+
+def auto_event(event) -> None:
     """One auto-switch event (poll, switch, no-switch, …) into the run's details; a switch
     also gets its own line, so a long loop leaves one per decision."""
     if not _state:
         return
-    compact = _slots(payload)
+    payload = event.to_json()
+    compact = {key: _slots(payload[key]) for key in _AUTO_FIELDS if key in payload}
+    if payload.get("event") == "error":
+        compact["errorType"] = getattr(event, "error_type", "") or "unknown"
     ticks = _state["details"].setdefault("ticks", [])
     ticks.append(compact)
     del ticks[:-_MAX_TICKS]
@@ -336,7 +411,9 @@ class StampedStream:
 
     def write(self, text: str) -> int:
         out = []
-        for piece in text.splitlines(keepends=True):
+        for piece in re.split(r"(?<=\n)", text):  # \n only: a \r rewrites a line, it does not end one
+            if not piece:
+                continue
             if self._at_line_start:
                 out.append(iso(time.time()) + " ")
             out.append(piece)
@@ -355,7 +432,13 @@ def turn_over_stderr_file(label: str) -> None:
         from claude_swap import launch_agent
 
         err = launch_agent.log_paths(label)[1]
-        if err.stat().st_size > STDERR_MAX_BYTES:
+        info = err.stat()
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            return  # not ours: leave its mode and size alone
+        if info.st_size > STDERR_MAX_BYTES:
             os.replace(err, err.with_name(err.name + ".1"))
+            # launchd would create the next one with the umask (0644).
+            os.close(os.open(err, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600))
+        os.chmod(err, 0o600)
     except Exception:  # noqa: BLE001
         pass

@@ -856,6 +856,41 @@ class TestReconcileService:
         assert code == 3 and json.loads(out)["action"] == "deferred"
 
 
+class TestReinstallWaitsForARun:
+    def test_gui_status_needs_no_sudo(self, macos_services):
+        with _launchctl([], gui=True):
+            ks.install(3600, False, macos_services, UID, PROGRAM)
+        with _launchctl([], gui=True, loaded=True):
+            st = ks.status(macos_services, UID)
+        assert st["domain"] == "gui" and st["reinstallNeedsSudo"] is False
+        with _launchctl([]):
+            assert rs.status(macos_services, UID)["reinstallNeedsSudo"] is None  # none installed
+
+    @pytest.mark.parametrize("which", ["keepalive", "reconcile"])
+    def test_a_reload_waits_for_the_running_job_and_then_gives_up(self, macos_services, monkeypatch, which):
+        from claude_swap import paths
+        from claude_swap.locking import FileLock
+
+        monkeypatch.setattr(ks, "RELOAD_LOCK_TIMEOUT_S", 0.2)
+        install = (lambda: ks.install(3600, False, macos_services, UID, PROGRAM)) if which == "keepalive" else (
+            lambda: rs.install(macos_services, UID, PROGRAM))
+        with _launchctl([], gui=True):
+            install()
+        root = paths.get_backup_root()
+        root.mkdir(parents=True, exist_ok=True)
+        calls = []
+        # A run holds the store lock; a changed job would be booted out mid-refresh.
+        doc = plistlib.loads(launch_agent.plist_path(ks.LABEL if which == "keepalive" else rs.LABEL, macos_services).read_bytes())
+        del doc["EnvironmentVariables"]["HSWAP_CALLER"]
+        launch_agent.plist_path(ks.LABEL if which == "keepalive" else rs.LABEL, macos_services).write_bytes(plistlib.dumps(doc))
+        with FileLock(root / ".lock"), _launchctl(calls, gui=True, loaded=True):
+            with pytest.raises(ks.ServiceBusyError):
+                install()
+        assert not any(call[1] in ("bootout", "bootstrap") for call in calls if call[0] == "launchctl")
+        with _launchctl(calls, gui=True):  # the run has ended and the job is idle
+            assert install()["action"] == "updated"
+
+
 class TestKeepaliveDaemon:
     def _install(self, home, calls, **kwargs):
         return ks.install(7200, False, home, UID, PROGRAM, system=True, user="kgolf", **kwargs)
@@ -911,6 +946,23 @@ class TestKeepaliveDaemon:
             assert ks.uninstall(macos_services, UID, system=True)["action"] == "removed"
         assert ["sudo", "launchctl", "bootout", "system/dev.hswap.keepalive"] in calls
         assert not ks.system_plist_path().exists()
+
+    def test_status_says_why_outdated_and_whether_sudo_is_needed(self, macos_services):
+        calls = []
+        with _launchctl(calls):
+            self._install(macos_services, calls)
+        with _launchctl(calls, loaded=True):
+            st = ks.status(macos_services, UID)
+            assert st["domain"] == "system" and st["reinstallNeedsSudo"] is True
+            assert st["outdated"] is False and st["outdatedReason"] is None
+            doc = plistlib.loads(ks.system_plist_path().read_bytes())
+            del doc["EnvironmentVariables"]["HSWAP_CALLER"]  # a 0.3.0 install
+            ks.system_plist_path().write_bytes(plistlib.dumps(doc))
+            st = ks.status(macos_services, UID)
+            assert st["outdated"] is True and st["outdatedReason"] == "caller_env_only"
+            del doc["WatchPaths"]
+            ks.system_plist_path().write_bytes(plistlib.dumps(doc))
+            assert ks.status(macos_services, UID)["outdatedReason"] == "job_changed"
 
     def test_a_foreign_daemon_is_left_alone(self, macos_services):
         ks.SYSTEM_DIR.mkdir(parents=True)

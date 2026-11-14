@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import getpass
 import os
+from contextlib import contextmanager
 import plistlib
 import sys
 import tempfile
@@ -48,6 +49,41 @@ class UnsupportedPlatformError(ClaudeSwitchError):
 
 class ServiceConflictError(ClaudeSwitchError):
     json_type = "ServiceConflict"
+
+
+class ServiceBusyError(ClaudeSwitchError):
+    json_type = "service_busy"
+
+    def __init__(self):
+        super().__init__(
+            "A keepalive or reconcile run held the store lock the whole time; reloading the job "
+            "would stop it mid-write, so nothing was changed. Run the command again."
+        )
+
+
+# How long a reload waits for a running keepalive or reconcile (a refresh POST is bounded at 6 s).
+RELOAD_LOCK_TIMEOUT_S = 30.0
+
+
+@contextmanager
+def between_runs():
+    """Reloading a loaded job boots it out, which kills a run in the middle of a refresh. Wait
+    for the store lock every keepalive and reconcile run holds while it writes, and keep it
+    while launchd reloads, so the next run waits instead. Raises ServiceBusyError."""
+    from claude_swap import paths
+    from claude_swap.locking import FileLock
+
+    root = paths.get_backup_root()
+    if not root.is_dir():
+        yield  # no store, no run to wait for (and no store to create)
+        return
+    lock = FileLock(root / ".lock", timeout=RELOAD_LOCK_TIMEOUT_S)
+    if not lock.acquire():
+        raise ServiceBusyError()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class AheadTooShortError(ClaudeSwitchError):
@@ -144,21 +180,30 @@ def _settings(doc: dict | None) -> tuple[float | None, bool | None]:
     return ahead, then_auto
 
 
-def _outdated(doc: dict | None, home: Path | None) -> bool | None:
-    """Our plist differs from what this hswap would write for its own program,
-    ahead and thenAuto: a reinstall with those settings brings it up to date."""
+def compare(doc: dict, built: bytes, marker: tuple[str, str] = _MARKER) -> tuple[bool, str | None]:
+    """(outdated, why): ``caller_env_only`` when only HSWAP_CALLER differs (a plist from
+    before 0.3.1: the job runs the same, its log lines just lack the caller), otherwise
+    ``job_changed``."""
+    have, want = _job(doc, marker), _job(plistlib.loads(built), marker)
+    if have == want:
+        return False, None
+    return True, "caller_env_only" if have[:-1] == want[:-1] else "job_changed"
+
+
+def _outdated(doc: dict | None, home: Path | None) -> tuple[bool | None, str | None]:
+    """Our plist against what this hswap would write for its own program, ahead and
+    thenAuto: a reinstall with those settings brings it up to date."""
     ahead, then_auto = _settings(doc)
     if ahead is None:
-        return None
+        return None, None
     args = doc.get("ProgramArguments") or []
     if then_auto:
         program = args[3:]
     else:
         program = args[: args.index("keepalive")] if "keepalive" in args else []
     if not program:
-        return None
-    built = build(program, ahead, then_auto, home, user=doc.get("UserName"))
-    return _job(doc) != _job(plistlib.loads(built))
+        return None, None
+    return compare(doc, build(program, ahead, then_auto, home, user=doc.get("UserName")))
 
 
 def job_status(label: str, marker: tuple[str, str], doc: dict | None, plist: Path, home: Path | None) -> dict:
@@ -176,6 +221,9 @@ def job_status(label: str, marker: tuple[str, str], doc: dict | None, plist: Pat
         "lastExitCode": None,
         "intervalSeconds": doc.get("StartInterval") if managed else None,
         "outdated": None,
+        "outdatedReason": None,
+        # A LaunchDaemon is reinstalled through sudo; null when there is no job.
+        "reinstallNeedsSudo": None,
         "plist": str(plist),
         "stderrLog": str(launch_agent.log_paths(label, home)[1]),
     }
@@ -201,7 +249,9 @@ def status(home: Path | None = None, uid: int | None = None) -> dict:
     if doc is not None:
         base["domain"] = SYSTEM if system is not None else "gui"
     base["ahead"], base["thenAuto"] = _settings(doc)
-    base["outdated"] = _outdated(doc, home)
+    base["outdated"], base["outdatedReason"] = _outdated(doc, home)
+    if doc is not None:
+        base["reinstallNeedsSudo"] = system is not None
     return ask_launchd(base, LABEL, uid, home, SYSTEM if system is not None else None)
 
 
@@ -268,14 +318,16 @@ def install_job(label: str, marker: tuple[str, str], plist: bytes, home: Path | 
         return "deferred"
     if unchanged and launch_agent.is_loaded(label, uid):
         return "unchanged"
-    launch_agent.install(label, home, uid=uid, plist=plist)
+    with between_runs():
+        launch_agent.install(label, home, uid=uid, plist=plist)
     return "updated" if doc is not None else "installed"
 
 
 def uninstall_job(label: str, marker: tuple[str, str], home: Path | None, uid: int | None) -> str:
     if refuse_foreign(home, uid, label, marker) is None:
         return "absent"
-    launch_agent.uninstall(label, home, uid)
+    with between_runs():
+        launch_agent.uninstall(label, home, uid)
     return "removed"
 
 
@@ -332,6 +384,18 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
     loaded = launch_agent.is_loaded(LABEL, domain=SYSTEM)
     if doc is None and loaded:
         raise ForeignServiceError(f"launchd runs {target} from a plist hswap did not write; left untouched.")
+    with between_runs():
+        _reload_system(plist, path, target, doc, unchanged, loaded, home)
+        if gui is not None:
+            launch_agent.uninstall(LABEL, home, uid)
+    if unchanged and loaded:
+        action = "unchanged"
+    else:
+        action = "updated" if doc is not None else "installed"
+    return {"action": action, **status(home, uid)}
+
+
+def _reload_system(plist, path, target, doc, unchanged, loaded, home) -> None:
     if not (unchanged and loaded):
         prepare_stderr_log(LABEL, home)  # the user's: launchd would create it as root
         previous = path.read_bytes() if doc is not None else None
@@ -353,13 +417,6 @@ def _install_system(plist: bytes, home: Path | None, uid: int | None) -> dict:
             except ClaudeSwitchError:
                 pass
             raise
-    if gui is not None:
-        launch_agent.uninstall(LABEL, home, uid)
-    if unchanged and loaded:
-        action = "unchanged"
-    else:
-        action = "updated" if doc is not None else "installed"
-    return {"action": action, **status(home, uid)}
 
 
 def install(
@@ -397,6 +454,7 @@ def uninstall(home: Path | None = None, uid: int | None = None, system: bool = F
     if _read_system() is None:
         return {"action": "absent", **status(home, uid)}
     if launch_agent.is_loaded(LABEL, domain=SYSTEM):
-        _sudo("launchctl", "bootout", f"{SYSTEM}/{LABEL}")
+        with between_runs():
+            _sudo("launchctl", "bootout", f"{SYSTEM}/{LABEL}")
     _sudo("rm", "-f", str(system_plist_path()))
     return {"action": "removed", **status(home, uid)}

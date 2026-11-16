@@ -732,6 +732,23 @@ class ClaudeAccountSwitcher:
         self.refuse_unreadable_stash_manifest()
         self.refuse_keychain_item_present()
 
+    def _settle_keychain_item(self) -> None:
+        """File store: Claude Code writes the login it just picked up back into the Keychain
+        right after a switch, which would refuse the next switch until the reconcile service
+        runs. Settle it here when reconcile's rules decide it; anything else is left alone."""
+        if not (
+            self.platform == Platform.MACOS
+            and self._store._file_store()
+            and macos_keychain.credential_item_present()
+        ):
+            return
+        from claude_swap import events
+        from claude_swap.reconcile import run_reconcile
+
+        with events.isolated():
+            settled = run_reconcile(self, dry_run=True)["action"] == "planned" and run_reconcile(self)["ok"]
+        events.note(reconciled=settled)
+
     def refuse_keychain_item_present(self) -> None:
         """File store: a Claude Code that ran with the keychain unlocked may have written
         the successor of the file's token there, so the file's token may be spent."""
@@ -7312,6 +7329,7 @@ class ClaudeAccountSwitcher:
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
         """
+        self._settle_keychain_item()
         self.refuse_if_keychain_unavailable()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")

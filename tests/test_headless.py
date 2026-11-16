@@ -374,6 +374,17 @@ class TestReconcile:
         assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
         _held(healthy, before)
 
+    def test_switch_settles_an_item_reconcile_decides(self, healthy, capsys):
+        """Claude Code rewrote the login it just picked up: the next switch goes through."""
+        healthy.write_file(creds("AT-1", "RT-1", expires_in_s=3600))
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-1B", "RT-1", expires_in_s=7200)
+        code, out, err = run_cli(["switch", "2", "--json"], capsys)
+        assert code == 0, out + err
+        assert ACTIVE_ITEM not in healthy.security.items
+        assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-2"
+        assert oauth.extract_oauth_data(healthy.read_enc(SLOT_1))["accessToken"] == "AT-1B"
+        assert healthy.endpoint.posts == []
+
     def test_two_unseen_logins_are_ambiguous_and_change_nothing(self, healthy, capsys):
         healthy.write_file(creds("AT-N", "RT-N"))
         healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")

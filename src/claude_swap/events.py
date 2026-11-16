@@ -15,6 +15,7 @@ whose log cannot be written ends exactly as it would have.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import os
@@ -142,6 +143,17 @@ def outcome(value: str) -> None:
 def error(kind: str | None) -> None:
     if _state and kind and not _state.get("error"):
         _state["error"] = kind
+
+
+@contextlib.contextmanager
+def isolated():
+    """Run a nested command's step without it writing into this command's record."""
+    saved = {**_state, "details": dict(_state.get("details", {}))} if _state else {}
+    try:
+        yield
+    finally:
+        _state.clear()
+        _state.update(saved)
 
 
 def active_slot(slot) -> None:

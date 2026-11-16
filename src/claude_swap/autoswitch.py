@@ -1274,6 +1274,15 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
+        if trigger in ("consume-first", "priority") and self._hand_picked(state, current):
+            self._emit(
+                NoSwitchEvent(
+                    reason="hand-picked",
+                    detail=f"Account-{current} was chosen by hand; it stays until its switch line",
+                )
+            )
+            return TickOutcome.NO_ACTION
+
         if trigger in ("proactive", "consume-first", "priority") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
@@ -2563,6 +2572,21 @@ class AutoSwitchEngine:
             settings.weekly_threshold,
             scale=settings.threshold,
         )
+
+    def _hand_picked(self, state: dict, current: str) -> bool:
+        """The active account is not where this engine's last switch landed, so
+        a manual switch (or `/login`) chose it. Below-threshold moves must not
+        undo that choice; the switch lines and failover still apply.
+
+        With no landing recorded yet, the account found active becomes the
+        baseline (written once, never in dry-run), so a later hand switch is
+        told apart from it."""
+        landed = state.get("lastSwitchTo")
+        if landed is None:
+            if not self.dry_run:
+                self._mutate_state(lambda s: s.setdefault("lastSwitchTo", current))
+            return False
+        return str(landed) != str(current)
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

@@ -191,6 +191,31 @@ def test_cooldown_then_recovery_and_hard_limit_bypass(temp_home):
     assert h.active_number() == 4
 
 
+def test_hand_switch_is_kept_until_its_switch_line(temp_home):
+    h = fleet(temp_home)
+    values = usage(h)
+    assert h.tick_with_usage(values) is TickOutcome.NO_ACTION  # 1 is the baseline
+    h.switcher.switch_to("3", json_output=True)  # the user picks a lower tier
+    for _ in range(3):
+        h.clock.advance(300)
+        assert h.tick_with_usage(values) is TickOutcome.NO_ACTION
+    assert h.active_number() == 3
+    assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)][-1] == "hand-picked"
+    values["3"]["five_hour"]["pct"] = 90  # its own line still moves it on
+    assert h.tick_with_usage(values) is TickOutcome.SWITCHED
+    assert h.active_number() == 1
+    h.switcher.switch_to("4", json_output=True)  # a hand switch after an engine landing
+    assert h.tick_with_usage(values) is TickOutcome.NO_ACTION
+    assert h.active_number() == 4
+
+
+def test_dry_run_hand_pick_check_writes_no_baseline(temp_home):
+    h = fleet(temp_home)
+    h.engine.dry_run = True
+    h.tick_with_usage(usage(h))
+    assert "lastSwitchTo" not in h.engine._read_state()
+
+
 def test_pre_switch_refresh_can_veto_the_provisional_priority_target(temp_home):
     h = fleet(temp_home)
     h.switcher.set_account_priority("2", 200)

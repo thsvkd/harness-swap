@@ -588,6 +588,102 @@ class TestHealthy:
         assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-NEW"
 
 
+class TestLastResort:
+    """An idle slot that only a new login could bring back gets its own token sent once
+    more: a POST that stalled (timeout, kill), or a slot blocked by copies nothing orders."""
+
+    HOURS_AGO = -2 * 3600
+
+    def _ledger(self, env, value, *, post, age):
+        fingerprint = oauth.credential_fingerprint(value)
+        assert consumed_grants.reserve(fingerprint, ("b@example.com", ""), post=post)
+        path = env.root / "cache" / consumed_grants.FILENAME
+        rows = json.loads(path.read_text())
+        rows[fingerprint]["at"] -= age
+        path.write_text(json.dumps(rows))
+
+    def _refresh_slot_2(self, env):
+        return ClaudeAccountSwitcher().consume_backup_grant(*SLOT_2, env.read_enc(SLOT_2))
+
+    def _sent(self, env):
+        return [post["refresh_token"] for post in env.endpoint.posts]
+
+    def test_a_stalled_post_is_sent_again(self, healthy):
+        self._ledger(healthy, healthy.read_enc(SLOT_2), post=True, age=consumed_grants.STALE_POST_S + 1)
+        outcome = self._refresh_slot_2(healthy)
+        assert outcome.error is None and self._sent(healthy) == ["RT-2"]
+        assert oauth.extract_oauth_data(healthy.read_enc(SLOT_2))["refreshToken"] == "RT-NEW"
+
+    def test_a_post_still_in_flight_is_not(self, healthy):
+        self._ledger(healthy, healthy.read_enc(SLOT_2), post=True, age=60)
+        assert self._refresh_slot_2(healthy).error == "relogin_required"
+        assert self._sent(healthy) == []
+
+    @pytest.mark.parametrize("lapsed_s, sent", [(-2 * 3600, True), (-600, False)])
+    def test_any_stale_reservation_once_the_access_token_is_long_gone(self, healthy, lapsed_s, sent):
+        healthy.write_enc(SLOT_2, creds("AT-2", "RT-2", expires_in_s=lapsed_s))
+        self._ledger(healthy, healthy.read_enc(SLOT_2), post=False, age=consumed_grants.STALE_POST_S + 1)
+        outcome = self._refresh_slot_2(healthy)
+        assert self._sent(healthy) == (["RT-2"] if sent else [])
+        assert outcome.error == (None if sent else "relogin_required")
+
+    def test_never_a_consumed_token(self, healthy):
+        healthy.write_enc(SLOT_2, creds("AT-2", "RT-2", expires_in_s=self.HOURS_AGO))
+        consumed_grants.record(
+            oauth.credential_fingerprint(healthy.read_enc(SLOT_2)), ("b@example.com", ""),
+            consumed_grants.CONSUMED,
+        )
+        assert self._refresh_slot_2(healthy).error == "relogin_required"
+        assert self._sent(healthy) == []
+
+    def test_a_rival_stash_copy_is_retired_after_the_server_takes_the_slot_token(self, healthy):
+        healthy.write_enc(SLOT_2, creds("AT-2", "RT-2", expires_in_s=self.HOURS_AGO))
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(
+            creds("AT-2O", "RT-2-OLD", expires_in_s=3 * self.HOURS_AGO), ("b@example.com", ""), "2", "replaced"
+        )
+        outcome = self._refresh_slot_2(healthy)
+        assert outcome.error is None and self._sent(healthy) == ["RT-2"]
+        assert s._store._list_unclaimed_credentials() == {}
+        healthy.write_enc(SLOT_2, creds("AT-NEW", "RT-NEW", expires_in_s=60))
+        assert self._refresh_slot_2(healthy).error is None  # nothing blocks the next one
+
+    def test_never_while_a_later_copy_may_be_its_successor(self, healthy):
+        """A Claude Code refreshed the slot's token, and its successor sits in the stash."""
+        healthy.write_enc(SLOT_2, creds("AT-2", "RT-2", expires_in_s=self.HOURS_AGO))
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(creds("AT-2S", "RT-2-NEXT", expires_in_s=self.HOURS_AGO / 4), ("b@example.com", ""), "2", "replaced")
+        assert self._refresh_slot_2(healthy).error == "relogin_required"
+        assert self._sent(healthy) == []
+
+    def test_a_rival_blocks_while_the_access_token_may_still_be_in_use(self, healthy):
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(creds("AT-2O", "RT-2-OLD"), ("b@example.com", ""), "2", "replaced")
+        assert self._refresh_slot_2(healthy).error == "relogin_required"
+        assert self._sent(healthy) == []
+        assert len(s._store._list_unclaimed_credentials()) == 1
+
+    def test_never_the_active_login(self, healthy):
+        healthy.write_file(creds("AT-1", "RT-1", expires_in_s=self.HOURS_AGO))
+        healthy.write_enc(SLOT_1, creds("AT-1", "RT-1", expires_in_s=self.HOURS_AGO))
+        self._ledger(healthy, healthy.read_enc(SLOT_1), post=False, age=consumed_grants.STALE_POST_S + 1)
+        assert healthy.keepalive()["error"]["type"] == "relogin_required"
+        assert self._sent(healthy) == []
+
+
+class TestSwitchFreshens:
+    """A manual switch never hands Claude Code a token it would have to refresh itself."""
+
+    @pytest.mark.parametrize("expires_in_s, posted", [(60, ["RT-2"]), (7200, [])])
+    def test_a_lapsing_target_is_refreshed_first(self, healthy, capsys, expires_in_s, posted):
+        healthy.write_enc(SLOT_2, creds("AT-2", "RT-2", expires_in_s=expires_in_s))
+        code, out, err = run_cli(["switch", "2", "--json"], capsys)
+        assert code == 0, out + err
+        assert [post["refresh_token"] for post in healthy.endpoint.posts] == posted
+        live = oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"]
+        assert live == ("RT-NEW" if posted else "RT-2")
+
+
 class TestGuard:
     @pytest.fixture
     def due(self, healthy):

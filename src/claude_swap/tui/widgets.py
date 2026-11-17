@@ -155,7 +155,7 @@ def account_card_text(
     if age:
         text.append(f"   {age}", style=palette.muted)
 
-    sentinel = acc.usage.sentinel
+    sentinel = data.display_sentinel(acc.usage)
     if sentinel is not None:
         text.append("\n    ")
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
@@ -237,7 +237,7 @@ def mini_account_text(
         text.append(badge, style=palette.muted)
     text.append("   ")
 
-    sentinel = acc.usage.sentinel
+    sentinel = data.display_sentinel(acc.usage)
     if sentinel is not None:
         style = palette.muted if sentinel == USAGE_API_KEY else palette.sev_warn
         text.append(data.sentinel_label(sentinel), style=style)

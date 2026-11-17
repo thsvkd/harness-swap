@@ -388,7 +388,7 @@ def _store_holds(store, macos: bool, parked: str) -> bool:
 def _refuse_spent(credentials: str) -> None:
     """Called after every adoption: nothing newer exists, and no POST can help."""
     recorded = consumed_grants.entry(oauth.credential_fingerprint(credentials))
-    if recorded is not None:
+    if recorded is not None and not consumed_grants.reclaimable(recorded):
         raise _Stop(
             "relogin_required",
             _UNCERTAIN_REFRESH if recorded["state"] == consumed_grants.RESERVED else None,

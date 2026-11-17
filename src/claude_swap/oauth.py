@@ -214,6 +214,7 @@ def try_refresh_oauth_credentials(
     timeout_s: float = 10.0,
     *,
     ledger_identity: tuple[str, str] | None = None,
+    rescue: bool = False,
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
@@ -224,6 +225,7 @@ def try_refresh_oauth_credentials(
     The one place a refresh token leaves this machine. It refuses a token the
     ledger lists, and with ``ledger_identity`` reserves the token durably before
     the POST and settles the entry from the outcome (see ``consumed_grants``).
+    ``rescue``: the caller's last resort, which may reclaim any stale reservation.
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -243,7 +245,9 @@ def try_refresh_oauth_credentials(
     fingerprint = credential_fingerprint(credentials)
     try:
         if ledger_identity is not None:
-            if not consumed_grants.reserve(fingerprint, ledger_identity):
+            if not consumed_grants.reserve(
+                fingerprint, ledger_identity, post=True, rescue=rescue
+            ):
                 return RefreshOutcome(None, "consumed")
         elif consumed_grants.entry(fingerprint) is not None:
             return RefreshOutcome(None, "consumed")
@@ -261,8 +265,14 @@ def try_refresh_oauth_credentials(
             elif outcome.fate == GRANT_UNCHANGED:
                 consumed_grants.release(fingerprint)
         except consumed_grants.LedgerUnreadable:
-            # Still reserved, so still refused: the safe side of a failed write.
+            # Still reserved, so still refused: the safe side of a failed write. A POST
+            # that did spend it must also stop being retryable once it stalls.
             _logger.warning("Could not settle a consumed-grant ledger entry")
+            if outcome.fate == GRANT_SPENT:
+                try:
+                    consumed_grants.hold(fingerprint, ledger_identity)
+                except consumed_grants.LedgerUnreadable:
+                    _logger.warning("A spent grant's reservation stays retryable")
     return outcome
 
 

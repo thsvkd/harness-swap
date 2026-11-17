@@ -2504,7 +2504,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
 
             try:
-                result = self.switcher.switch_to(number, json_output=True)
+                result = self.switcher.switch_to(number, json_output=True, freshen=False)
             except StoresDisagreeError:
                 self._emit(NoSwitchEvent(reason="stores-disagree"))
                 return TickOutcome.NO_ACTION

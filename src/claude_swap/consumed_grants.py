@@ -5,7 +5,8 @@ family, which logs out every process. So where this ledger is in use a token is
 reserved here, durably, before its POST, and the outcome settles the entry: a
 success or a rejected grant marks it consumed, a request that provably changed
 nothing clears it, and anything else leaves it reserved because the server may have
-rotated it. `oauth.try_refresh_oauth_credentials` refuses whatever is listed.
+rotated it. `oauth.try_refresh_oauth_credentials` refuses whatever is listed, except a
+POST's reservation stalled for ``STALE_POST_S`` (see ``reclaimable``).
 
 Only keepalive and keychain-required mode start the file; once it exists every
 engine POST uses it. It holds fingerprints and account identities, never a token.
@@ -35,7 +36,10 @@ MAX_BYTES = 8 * 1024 * 1024
 RESERVED = "reserved"
 CONSUMED = "consumed"
 OBSERVED_POST = "observed-post"
+# A POST's reservation still unsettled after this long was cut off (a timeout, a
+# kill): its process is gone, and a successor it may have parked was adopted first.
 NEW_LOGIN = "new-login"
+STALE_POST_S = 15 * 60
 
 
 class LedgerUnreadable(ClaudeSwitchError):
@@ -112,7 +116,9 @@ def _rewrite(mutate) -> None:
         raise LedgerUnreadable(f"{FILENAME} cannot be written") from None
 
 
-def _row(identity: tuple[str, str], state: str, successor: str | None = None) -> dict:
+def _row(
+    identity: tuple[str, str], state: str, successor: str | None = None, post: bool = False
+) -> dict:
     # The account, not the slot: `move` and `swap` renumber slots.
     row = {
         "state": state,
@@ -122,11 +128,29 @@ def _row(identity: tuple[str, str], state: str, successor: str | None = None) ->
     }
     if successor:
         row["successorFp"] = successor
+    if post:
+        row["post"] = True
     return row
 
 
-def reserve(fingerprint: str, identity: tuple[str, str]) -> bool:
-    """Claim this token for one POST. False when any row already names it.
+def reclaimable(row: dict | None, *, any_reservation: bool = False) -> bool:
+    """A reservation that may be sent again: unsettled for ``STALE_POST_S``. Only a
+    POST's own (``post``), unless ``any_reservation`` (a last-resort rescue, where the
+    only other way back is a new login). A consumed token never is."""
+    return (
+        row is not None
+        and row["state"] == RESERVED
+        and (row.get("post") is True or any_reservation)
+        and time.time() - row["at"] >= STALE_POST_S
+    )
+
+
+def reserve(
+    fingerprint: str, identity: tuple[str, str], *, post: bool = False, rescue: bool = False
+) -> bool:
+    """Claim this token. False when a row already names it, unless that row is
+    ``reclaimable`` (``rescue`` widens it to any stale reservation). ``post``: the
+    claim is for a POST about to leave, so it can be retried once it stalls.
 
     One step under the ledger's lock: two consumers cannot both see it absent.
     Raises :class:`LedgerUnreadable`, which forbids the POST too.
@@ -135,9 +159,9 @@ def reserve(fingerprint: str, identity: tuple[str, str]) -> bool:
 
     def mutate(rows: dict) -> bool:
         nonlocal claimed
-        if fingerprint in rows:
+        if fingerprint in rows and not reclaimable(rows[fingerprint], any_reservation=rescue):
             return False
-        rows[fingerprint] = _row(identity, RESERVED)
+        rows[fingerprint] = _row(identity, RESERVED, post=post)
         claimed = True
         return True
 
@@ -169,6 +193,13 @@ def record_lineage(
     if because not in (OBSERVED_POST, NEW_LOGIN):
         raise ValueError(f"not a source of lineage: {because}")
     record(predecessor, identity, CONSUMED, successor)
+
+
+def hold(fingerprint: str, identity: tuple[str, str]) -> None:
+    """A POST that spent this token but could not settle it: still reserved, and no
+    longer a POST's own, so a stall never makes it retryable. Raises
+    :class:`LedgerUnreadable`."""
+    _rewrite(lambda rows: rows.__setitem__(fingerprint, _row(identity, RESERVED)))
 
 
 def release(fingerprint: str) -> None:

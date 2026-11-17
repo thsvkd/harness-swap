@@ -193,7 +193,7 @@ class TestReconcile:
         healthy.security.items[ACTIVE_ITEM] = creds("AT-3", "RT-3", expires_in_s=NEAR, mcpOAuth={"s": {}})
         healthy.write_file(healthy.login)
         report = _reconcile()
-        assert report["ok"] is True and report["kept"] == "keychain", report
+        assert report["ok"] is True and report["kept"] == "keychain"
         assert oauth.credential_fingerprint(healthy.file.read_text()) == oauth.credential_fingerprint(rt3)
         assert oauth.credential_fingerprint(healthy.read_enc(SLOT_1)) == oauth.credential_fingerprint(rt3)
         healthy.keepalive()
@@ -384,6 +384,56 @@ class TestReconcile:
         assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-2"
         assert oauth.extract_oauth_data(healthy.read_enc(SLOT_1))["accessToken"] == "AT-1B"
         assert healthy.endpoint.posts == []
+
+    @staticmethod
+    def _server(monkeypatch, live: dict[str, str]):
+        """The profile endpoint: access token -> the account it signs in as."""
+        monkeypatch.setattr(
+            oauth, "fetch_oauth_profile",
+            lambda token: {
+                "uuid": {"a@example.com": "uuid-1"}.get(live[token], "uuid-9"),
+                "email": live[token], "organizationUuid": "",
+            }
+            if token in live else None,
+        )
+
+    def test_the_server_settles_two_unseen_logins(self, healthy, monkeypatch):
+        """A GUI /login or refresh nothing recorded: the copy whose access token still
+        signs in is the live one (a refresh revokes the access tokens it replaced)."""
+        healthy.write_file(creds("AT-N", "RT-N"))
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        self._server(monkeypatch, {"AT-K": "a@example.com"})
+        report = _reconcile()
+        assert report["ok"] is True and report["kept"] == "keychain"
+        assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-K"
+        assert ACTIVE_ITEM not in healthy.security.items
+
+    def test_the_server_keeps_the_file_when_only_it_signs_in(self, healthy, monkeypatch):
+        healthy.write_file(creds("AT-N", "RT-N"))
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        self._server(monkeypatch, {"AT-N": "a@example.com"})
+        report = _reconcile()
+        assert report["ok"] is True and report["kept"] == "file"
+        assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-N"
+        assert ACTIVE_ITEM not in healthy.security.items
+
+    def test_the_ledger_outweighs_the_server(self, healthy, monkeypatch):
+        """A copy whose refresh token was sent (or may have been) is never kept on the
+        server's word: an access token can outlive its refresh for a moment."""
+        healthy.write_file(creds("AT-N", "RT-N"))
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        ClaudeAccountSwitcher()
+        consumed_grants.reserve(oauth.credential_fingerprint(creds("AT-K", "RT-K")), ("a@example.com", ""))
+        self._server(monkeypatch, {"AT-K": "a@example.com"})
+        report = _reconcile()
+        assert report["kept"] == "file"  # the ledger's rule, not the server's word
+        assert oauth.extract_oauth_data(healthy.file.read_text())["refreshToken"] == "RT-N"
+
+    def test_a_live_token_of_another_account_proves_nothing(self, healthy, monkeypatch):
+        healthy.write_file(creds("AT-N", "RT-N"))
+        healthy.security.items[ACTIVE_ITEM] = creds("AT-K", "RT-K")
+        self._server(monkeypatch, {"AT-K": "b@example.com"})
+        assert _reconcile()["error"]["type"] == "reconcile_ambiguous"
 
     def test_two_unseen_logins_are_ambiguous_and_change_nothing(self, healthy, capsys):
         healthy.write_file(creds("AT-N", "RT-N"))

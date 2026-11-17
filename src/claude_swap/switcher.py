@@ -155,6 +155,9 @@ _FETCH_STAGGER_S = 0.25
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
+# An idle slot's access token lapsed this long ago: no process can still be using it.
+RESCUE_AFTER_S = 3600
+
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
     """"  (ahead of pace)" when a weekly window is meaningfully ahead of pace, else ""."""
@@ -275,6 +278,15 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
+def display_sentinel(entry: UsageEntry) -> str | None:
+    """The sentinel a person should see. A slot the refresh gate refuses (``relogin_required``:
+    its token is spent or unproven) never fetches again until a new login, so its last
+    reading must not pass for a current one."""
+    if entry.sentinel is None and entry.last_error == "relogin_required":
+        return USAGE_RELOGIN_REQUIRED
+    return entry.sentinel
+
+
 def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
@@ -284,10 +296,11 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     with no measurement at all shows "usage unavailable" plus the last fetch
     error, so a failing endpoint is visible instead of a silent blank.
     """
-    if entry.sentinel is not None:
-        out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
+    sentinel = display_sentinel(entry)
+    if sentinel is not None:
+        out = [dimmed(SENTINEL_NOTES.get(sentinel, sentinel))]
         last_seen = last_seen_note(entry)
-        if last_seen is not None and entry.sentinel != USAGE_API_KEY:
+        if last_seen is not None and sentinel != USAGE_API_KEY:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
         return out
     if entry.last_good is not None:
@@ -892,7 +905,8 @@ class ClaudeAccountSwitcher:
             return
 
         fingerprint = oauth.credential_fingerprint(candidate)
-        if consumed_grants.entry(fingerprint) is not None:
+        row = consumed_grants.entry(fingerprint)
+        if row is not None and not consumed_grants.reclaimable(row):
             raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
         num, email, org_uuid = account
         # The active login's own token answers to rule U, at its POST.
@@ -915,6 +929,47 @@ class ClaudeAccountSwitcher:
         num = self._find_account_slot(data, *identity) if data else None
         if self._unproven_copy(candidate, num, *identity):
             raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+
+    def _rescuable(
+        self, num: str, email: str, identity: tuple[str, str], credentials: str
+    ) -> bool:
+        """May an idle slot's own token go once although nothing proves it newest?
+
+        Only when the slot is otherwise dead until a new login: not the active login
+        (Claude Code refreshes that one), no live session holds it, the token is not
+        recorded as spent, a stalled reservation of it has waited ``STALE_POST_S``, and
+        its access token lapsed ``RESCUE_AFTER_S`` ago, so nothing on this machine can
+        still be using any copy of it. Sending it costs nothing that waiting would keep:
+        a spent token fails, and the account then needs the new login it needed anyway.
+        """
+        if identity == self._get_current_account() or self._live_session_pids(num, email):
+            return False
+        row = consumed_grants.entry(oauth.credential_fingerprint(credentials))
+        if row is not None and not consumed_grants.reclaimable(row, any_reservation=True):
+            return False
+        expires_at = (oauth.extract_oauth_data(credentials) or {}).get("expiresAt")
+        if not isinstance(expires_at, (int, float)) or expires_at / 1000 + RESCUE_AFTER_S > time.time():
+            return False
+        # A later copy (say one a Claude Code refreshed, then parked in the stash) may be
+        # this token's successor: sending this one could revoke it.
+        mine = credential_generation(credentials)
+        try:
+            others = self._other_copies(num, *identity)
+        except (CopiesDisagreeError, OSError):
+            return False
+        return all(credential_generation(other) <= mine for other in others)
+
+    def _other_copies(self, num: str, email: str, org_uuid: str) -> list[str]:
+        """The account's leftover `.enc` and stash entries, by value. Raises
+        CopiesDisagreeError when one cannot be read."""
+        copies = [self._store._leftover_backup_enc(num, email) or ""]
+        for entry_id, row in self._store._list_unclaimed_credentials().items():
+            if (row.get("email"), row.get("organizationUuid", "") or "") == (email, org_uuid or ""):
+                value, unreadable = self._store._read_unclaimed_credential(entry_id)
+                if unreadable:
+                    raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+                copies.append(value)
+        return [copy for copy in copies if copy]
 
     def _unproven_copy(self, candidate: str, num: str | None, email: str, org_uuid: str) -> bool:
         """Does any copy of the account hold another token not recorded as older?"""
@@ -2986,7 +3041,21 @@ class ClaudeAccountSwitcher:
                 # With the credential, under this lock: once it is released a
                 # `move` can hand this number to someone else.
                 identity = (email, org_uuid)
-                self._required_mode_gate(refresh_input, (account_num, email, org_uuid))
+                rescue = False
+                try:
+                    self._required_mode_gate(refresh_input, (account_num, email, org_uuid))
+                except ReloginRequiredError as refused:
+                    # A copy that could not be read may be the newest: no rescue then.
+                    if isinstance(refused.__cause__, CopiesDisagreeError) or not self._rescuable(
+                        account_num, email, identity, refresh_input
+                    ):
+                        raise
+                    rescue = True
+                    self._logger.warning(
+                        "Account %s: nothing proves which copy is newest and only a new "
+                        "login would settle it; sending the slot's own token once as a "
+                        "last resort.", account_num,
+                    )
                 if (
                     not self._store._strict_mode()
                     and not self._live_session_pids(account_num, email)
@@ -3096,6 +3165,7 @@ class ClaudeAccountSwitcher:
             identity,
             refresh_input,
             locks_held=global_lock_held,
+            **({"rescue": True} if rescue else {}),
             **({"timeout_s": 6.0} if global_lock_held else {}),
         )
         if result.error is not None or not result.credentials:
@@ -3237,6 +3307,20 @@ class ClaudeAccountSwitcher:
                 # park anything. Every other one wrote the entry first.
                 stashed=stashed_reason != "consume-gate-unpersisted",
             )
+        if rescue and not stashed_reason:
+            # The server took this token, so it was its lineage's live tip; a stash
+            # copy of the account is an older link or a login nothing uses, and left
+            # in place it would block the next refresh the same way.
+            keep = oauth.credential_fingerprint(outcome_creds)
+            sent = credential_generation(refresh_input)
+            for entry_id, row in self._store._read_stash_manifest().items():
+                if (row.get("email"), row.get("organizationUuid", "") or "") != identity or (
+                    row.get("fingerprint") in (None, keep)
+                ):
+                    continue
+                value, unreadable = self._store._read_unclaimed_credential(entry_id)
+                if not unreadable and credential_generation(value) < sent:
+                    self._retire_stash_entry(entry_id, account_num)
         return oauth.RefreshOutcome(
             outcome_creds, None, result.token_account, consumed_fp
         )
@@ -7321,13 +7405,18 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        freshen: bool = True,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+        ``freshen=False``: the caller already refreshed the target (`auto`).
         """
         self._settle_keychain_item()
         self.refuse_if_keychain_unavailable()
@@ -7423,6 +7512,12 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
+        # Not a self-switch's reconcile (``provenance``): the live copy of the active
+        # login may be newer than its slot, which a POST of the slot's token would spend.
+        if freshen and not force and provenance is None:
+            self._freshen_before_activation(
+                target_account, data["accounts"][target_account].get("email", "")
+            )
         op = self._perform_switch(
             target_account,
             emit_output=not json_output,
@@ -7441,6 +7536,26 @@ class ClaudeAccountSwitcher:
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
         return result
+
+    def _freshen_before_activation(self, num: str, email: str) -> None:
+        """Refresh the target first when its token is about to lapse, as `auto` does.
+        Activated as it is, every running Claude Code would refresh it on its own, and one
+        with the keychain open stores the result in the Keychain (file store: an item,
+        and the file deleted). A failure is logged; the switch still goes ahead."""
+        from claude_swap.autoswitch import FRESHEN_BUFFER_MS
+
+        if self.account_kind_for(num) == "api_key" or self._live_session_pids(num, email):
+            return
+        creds = self._read_account_credentials(num, email)
+        expires_at = (oauth.extract_oauth_data(creds) or {}).get("expiresAt") if creds else None
+        if not isinstance(expires_at, (int, float)) or time.time() * 1000 + FRESHEN_BUFFER_MS < expires_at:
+            return
+        outcome = self.consume_backup_grant(num, email, creds)
+        if outcome.error is not None:
+            self._logger.info(
+                "Account %s's token could not be refreshed before the switch (%s); "
+                "Claude Code refreshes it.", num, outcome.error,
+            )
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
         """Whether the live credential is provably the slot's stored lineage.

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 
 from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
@@ -342,6 +343,25 @@ class TestFormatting:
             80,
         ).plain
         assert "last seen" not in api_key
+
+    def test_a_refused_refresh_reads_as_re_login_not_as_current_usage(self):
+        # relogin_required stops every fetch until a new login, so the last reading
+        # (e.g. 100% before a usage reset) must not look current on the card or in list.
+        from claude_swap.switcher import _usage_entry_lines
+        from claude_swap.tui.widgets import account_card_text
+
+        entry = UsageEntry(
+            last_good={"seven_day": {"pct": 100.0}},
+            fetched_at=time.time() - 2 * 86400,
+            age_s=2 * 86400.0,
+            last_error="relogin_required",
+        )
+        card = account_card_text(make_account(2, entry=entry), 80).plain
+        assert "re-login needed" in card and "last seen 100% used" in card
+        lines = [Text.from_ansi(line).plain for line in _usage_entry_lines(entry)]
+        assert lines[0].startswith("re-login needed") and "last seen 100% used" in lines[1]
+        healthy = dataclasses.replace(entry, last_error="http-429")
+        assert "re-login" not in account_card_text(make_account(2, entry=healthy), 80).plain
 
     def test_account_card_uses_light_palette_when_passed(self):
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette

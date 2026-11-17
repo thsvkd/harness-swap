@@ -22,6 +22,9 @@ item's attributes and the keychain's lock state.
 
 from __future__ import annotations
 
+import hashlib
+import logging
+
 from claude_swap import consumed_grants, events, macos_keychain, oauth
 from claude_swap.credentials import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -44,6 +47,7 @@ from claude_swap.migrate_store import (
 from claude_swap.settings import atomic_write_json
 from claude_swap.paths import get_credentials_path
 
+_logger = logging.getLogger("claude-swap")
 AMBIGUOUS = "reconcile_ambiguous"
 REPORT_FILENAME = "reconcile.json"
 LOCKED = "keychain_item_present_locked"
@@ -142,7 +146,58 @@ def _file_text() -> str:
     return text if text.strip() else ""
 
 
-def _newer(switcher, active, item: str, rival: str, side: str = "file") -> str | None:
+def _access_key(creds: str) -> str | None:
+    token = (oauth.extract_oauth_data(creds) or {}).get("accessToken") if creds else None
+    return hashlib.sha256(token.encode()).hexdigest() if token else None
+
+
+def _ask_server(switcher) -> dict[str, bool]:
+    """Before the locks, since no network runs under them: does each copy's access token
+    still sign in as the active account? A refresh revokes the access tokens it replaced
+    (seen on the real server), so one that does is held by its lineage's live refresh
+    token. Keyed by the access token's hash; a copy that changes before the decision
+    simply has no answer. Never raises."""
+    answers: dict[str, bool] = {}
+    try:
+        active = _read_active(switcher)
+        if not active.identity:
+            return answers
+        item = _keychain_items().get(
+            (CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()), ""
+        )
+        for creds in (item, _file_text(), _read_slot(active)):
+            key = _access_key(creds)
+            if key is None or key in answers:
+                continue
+            profile = oauth.fetch_oauth_profile(oauth.extract_oauth_data(creds)["accessToken"])
+            answers[key] = profile is not None and (
+                (profile.get("email") or "").lower(), profile.get("organizationUuid") or ""
+            ) == (active.identity[0].lower(), active.identity[1] or "")
+    except Exception:  # noqa: BLE001 - no answer is the old behaviour, never a failure
+        _logger.debug("Could not ask the server about the copies", exc_info=True)
+    return answers
+
+
+def _server_word(server: dict, item: str, rival: str) -> str | None:
+    """Where no record decides: the copy whose access token still signs in is its
+    lineage's live tip (a refresh revokes the access tokens it replaced), and a mark that
+    it may be spent cannot outweigh that. Only when both copies are as they were probed
+    (a refresh in between leaves one unasked) and neither is on the ledger, which would
+    say its refresh token was or may have been sent. With both alive (two separate
+    logins) the item, which Claude Code wrote last, stays."""
+    item_live, rival_live = server.get(_access_key(item)), server.get(_access_key(rival))
+    if item_live is None or rival_live is None:
+        return None
+    if any(consumed_grants.entry(oauth.credential_fingerprint(c)) for c in (item, rival)):
+        return None
+    if item_live:
+        return "item"
+    return "rival" if rival_live else None
+
+
+def _newer(
+    switcher, active, item: str, rival: str, side: str = "file", server: dict | None = None
+) -> str | None:
     """``item``, ``rival`` or None: which login came later, on evidence only. Never
     "the one nothing has seen": a Claude Code with a stale cache can write a token
     hswap never saw, and it is the older one. Nothing either, with the role record
@@ -152,9 +207,8 @@ def _newer(switcher, active, item: str, rival: str, side: str = "file") -> str |
     _note_sides(item, rival, side, roles or {})
     if roles is None:
         return _ruled("roles_unreadable", None)
-    if "suspect" in (roles.get(item_fp), roles.get(rival_fp)):
-        return _ruled("suspect", None)
-    if item_fp == rival_fp:
+    suspect = "suspect" in (roles.get(item_fp), roles.get(rival_fp))
+    if not suspect and item_fp == rival_fp:
         later = credential_generation(item) >= credential_generation(rival)
         return _ruled("same_lineage", "item" if later else "rival")
 
@@ -164,8 +218,13 @@ def _newer(switcher, active, item: str, rival: str, side: str = "file") -> str |
         return consumed_grants.entry(loser) is not None and consumed_grants.entry(winner) is None
 
     item_wins, rival_wins = came_after(item_fp, rival_fp), came_after(rival_fp, item_fp)
-    if item_wins != rival_wins:
+    if not suspect and item_wins != rival_wins:
         return _ruled("recorded_link", "item" if item_wins else "rival")
+    verdict = _server_word(server or {}, item, rival)
+    if verdict is not None:
+        return _ruled("server_live", verdict)
+    if suspect:
+        return _ruled("suspect", None)
     # A run settled these two against each other before: the one it replaced came back
     # from a stale cache. Both roles must match; a copy only touched proves nothing.
     if not item_wins:
@@ -196,7 +255,9 @@ def _note_sides(item: str, rival: str, side: str, roles: dict) -> None:
     events.note(item=describe(item, "keychain"), rival=describe(rival, side))
 
 
-def choose_kept(switcher, keychain: str, file_creds: str) -> tuple[str, str]:
+def choose_kept(
+    switcher, keychain: str, file_creds: str, server: dict | None = None
+) -> tuple[str, str]:
     """(``file``, ``keychain`` or ``slot``, the login), on evidence only. Raises
     _Stop(AMBIGUOUS)."""
     if holds_no_login(keychain) and not holds_no_login(file_creds):
@@ -211,7 +272,7 @@ def choose_kept(switcher, keychain: str, file_creds: str) -> tuple[str, str]:
     if holds_no_login(rival):
         events.note(rule="no_rival")
         return "keychain", keychain
-    verdict = _newer(switcher, active, keychain, rival, name)
+    verdict = _newer(switcher, active, keychain, rival, name, server)
     if verdict == "item":
         return "keychain", keychain
     if verdict == "rival":
@@ -270,6 +331,7 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
         if report["keychainLocked"]:
             raise _Stop(LOCKED, _LOCKED_MESSAGE)
         _preflight(switcher)
+        server = _ask_server(switcher)
         with _all_locks(switcher):
             items = _keychain_items()
             keychain = items.get(
@@ -277,7 +339,7 @@ def run_reconcile(switcher, *, dry_run: bool = False) -> dict:
             )
             file_creds = _file_text()
             try:
-                keep, kept = choose_kept(switcher, keychain, file_creds)
+                keep, kept = choose_kept(switcher, keychain, file_creds, server)
             except _Ambiguous as ambiguous:
                 report["hint"] = _ambiguity_hint(ambiguous.item, ambiguous.rival, ambiguous.rival_name)
                 if not dry_run:

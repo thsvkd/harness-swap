@@ -22,7 +22,7 @@ from typing import Callable
 from claude_swap import oauth, printer, usage_store
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.snapshot_source import SnapshotSource
-from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
+from claude_swap.switcher import SENTINEL_NOTES, display_sentinel, last_seen_note
 from harness_swap.ui.fmt import clock_stamp, format_duration
 
 
@@ -164,6 +164,7 @@ __all__ = [
     "SnapshotSource",
     "format_age",
     "format_duration",
+    "display_sentinel",
     "last_seen_note",
     "reset_clock",
     "reset_text",

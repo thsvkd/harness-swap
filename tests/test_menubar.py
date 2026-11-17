@@ -446,6 +446,7 @@ class _FakeEntry:
         self.sentinel = sentinel
         self.last_good = last_good
         self.fetched_at = fetched_at
+        self.last_error = None
 
 
 class _FakeAcct:

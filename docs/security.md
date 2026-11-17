@@ -166,7 +166,8 @@ where it always does.
 - The active account is asked in the default home only when its access token has
   more than 10 minutes left (Codex: JWT `exp`, else `last_refresh`; Grok: the
   earlier of `expires_at` and JWT `exp`; agy: `token.expiry`). If the expiry is
-  unreadable it is not asked.
+  unreadable it is not asked. Codex only: a token lapsed for 30 minutes is asked
+  about again, since no running Codex is refreshing it.
 - If the live login file of a harness cannot be read, usage reads for every
   account of that harness return an error snapshot rather than reading a stored
   copy (which could be the account that is actually live).

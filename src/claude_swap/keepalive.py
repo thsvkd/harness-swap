@@ -253,6 +253,17 @@ def _keep(switcher, report, ahead, ensure_file, dry_run, adopt=None) -> None:
         _pass(active, report, ahead, ensure_file, dry_run=True)
         _finish(report, active, None, None, dry_run=True)
         return
+    if active.identity:
+        # Before the locks: a due login a stash copy disputes may be proven current by
+        # the server (see ClaudeAccountSwitcher.probe_tip). The pass reads again and
+        # reports any read failure itself.
+        try:
+            stores = _read_stores(store, macos)
+        except (_Stop, OSError, UnicodeDecodeError):
+            stores = ()
+        for creds in dict.fromkeys(stores):
+            if creds and _due(creds, ahead):
+                switcher.probe_tip(creds, active.slot, active.identity)
     for _ in range(_SLOT_ATTEMPTS):
         expected = _read_active(switcher).slot
         with _locks(switcher, expected):

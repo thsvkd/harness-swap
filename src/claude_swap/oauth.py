@@ -140,6 +140,13 @@ def expires_at_iso(value: object) -> str | None:
     return when.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _lapsed(expires_at: object) -> bool:
+    """Past the expiry itself, not just inside the refresh buffer."""
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return False
+    return datetime.now(timezone.utc).timestamp() * 1000 >= expires_at
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):
@@ -819,8 +826,12 @@ def try_fetch_usage_for_account(
             # Surface the distinct kind instead — ERROR_NOTES renders the
             # remedy for each.
             return UsageOutcome(None, error=refresh.error)
-        # A transient refresh failure falls through to try the (expired) token;
-        # the 401 path below retries the refresh.
+        elif not refresh.credentials and _lapsed(oauth.get("expiresAt")):
+            # Past its expiry the server can only refuse it, and a run of such calls
+            # is answered 429, which reads as a rate limit for days (seen on pit5).
+            return UsageOutcome(None, error="refresh-failed")
+        # A transient refresh failure falls through to try the (nearly expired)
+        # token; the 401 path below retries the refresh.
 
     try:
         data = request_usage_data(access_token)

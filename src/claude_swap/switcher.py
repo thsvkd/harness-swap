@@ -157,6 +157,9 @@ _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
 # An idle slot's access token lapsed this long ago: no process can still be using it.
 RESCUE_AFTER_S = 3600
+# How long a server answer from `probe_tip` stays proof: the probe and the POST it
+# vouches for belong to one pass.
+TIP_PROOF_TTL_S = 60.0
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -333,6 +336,14 @@ def _label_token_status(source: str, credentials: str) -> str | None:
     return f"{source}: {status}"
 
 
+def _norm_identity(identity: tuple[str, str]) -> tuple[str, str]:
+    return ((identity[0] or "").lower(), identity[1] or "")
+
+
+def _same_identity(left: tuple[str, str], right: tuple[str, str]) -> bool:
+    return _norm_identity(left) == _norm_identity(right)
+
+
 def _same_directory(left: Path, right: Path) -> bool:
     """Whether two paths name the same directory, symlinks and ``..`` included.
 
@@ -458,6 +469,9 @@ class ClaudeAccountSwitcher:
         # verdict — measured against a 4ms window, 60 of 60 lost, after which
         # the consume gate POSTs a possibly-spent grant.
         self._active_verdict_tls = threading.local()
+        # Access-token hash -> (the account it signed in as or None, when asked), asked
+        # before any lock (`probe_tip`).
+        self._tip_answers: dict[str, tuple[tuple[str, str] | None, float]] = {}
 
         # Accounts already warned about a provenance problem with the active
         # credential — each condition persists across collect passes and
@@ -927,8 +941,85 @@ class ClaudeAccountSwitcher:
             return
         data = self._get_sequence_data() or {}
         num = self._find_account_slot(data, *identity) if data else None
-        if self._unproven_copy(candidate, num, *identity):
+        try:
+            unproven = self._unproven_copy(candidate, num, *identity)
+        except CopiesDisagreeError:
+            unproven = True
+        if unproven and not self._server_proves_tip(candidate, identity):
             raise CopiesDisagreeError(COPIES_DISAGREE_MESSAGE)
+
+    def probe_tip(self, credentials: str | None, num: str | None, identity: tuple[str, str]) -> None:
+        """Before any lock, since no network runs under them: when a copy of the account
+        disputes this token (a ledger row, or a copy no record orders), ask the server
+        whether its access token still signs in as the account. A refresh revokes the
+        access tokens it replaced (seen on the real server), so one that does belongs to
+        its lineage's live tip: no copy anywhere holds its successor. The answer is kept
+        by access-token hash for `_server_proves_tip`; a token that changes before the
+        decision has none. Never raises."""
+        try:
+            key = oauth.access_token_fingerprint(credentials) if credentials else None
+            if key is None:
+                return
+            data = oauth.extract_oauth_data(credentials) or {}
+            expires_at = data.get("expiresAt")
+            if not isinstance(expires_at, (int, float)) or expires_at <= time.time() * 1000:
+                return  # a lapsed access token answers nothing about its refresh token
+            row = consumed_grants.entry(oauth.credential_fingerprint(credentials))
+            if row is not None and row.get("state") == consumed_grants.CONSUMED:
+                return
+            if row is None:
+                try:
+                    if not self._unproven_copy(credentials, num, *identity):
+                        return  # nothing disputes it: no question to ask
+                except CopiesDisagreeError:
+                    pass
+            profile = oauth.fetch_oauth_profile(data["accessToken"])
+            signed_in = profile is not None and _same_identity(
+                (profile.get("email") or "", profile.get("organizationUuid") or ""), identity
+            )
+            self._tip_answers[key] = (
+                _norm_identity(identity) if signed_in else None, time.monotonic()
+            )
+        except Exception:  # no answer is no proof, never a failure
+            self._logger.debug("Could not ask the server about a token", exc_info=True)
+
+    def _server_proves_tip(self, credentials: str, identity: tuple[str, str]) -> bool:
+        """Did `probe_tip` just see this exact access token sign in as ``identity``? Only
+        a fresh answer counts: a long-lived process (auto, the TUI) must not act on one
+        given before some other copy of the lineage was refreshed."""
+        key = oauth.access_token_fingerprint(credentials)
+        answer = self._tip_answers.get(key) if key is not None else None
+        return (
+            answer is not None
+            and answer[0] == _norm_identity(identity)
+            and time.monotonic() - answer[1] < TIP_PROOF_TTL_S
+        )
+
+    def _probe_slot_tip(self, num: str, email: str) -> None:
+        """`probe_tip` for a slot's stored copy, the bytes its gate re-reads."""
+        try:
+            org = (
+                (self._get_sequence_data() or {}).get("accounts", {}).get(num, {})
+                .get("organizationUuid", "") or ""
+            )
+            self.probe_tip(self._read_account_credentials(num, email), num, (email, org))
+        except Exception:  # see probe_tip
+            self._logger.debug("Could not read account %s to ask the server", num, exc_info=True)
+
+    def _last_resort(
+        self, num: str, email: str, identity: tuple[str, str], credentials: str,
+        *, unreadable: bool = False,
+    ) -> bool:
+        """May the slot's own token go although the gate refused it? When the server
+        proves it is its lineage's tip, or as `_rescuable`'s last resort. Never over a
+        token recorded as spent, or one whose POST may still be in flight.
+        ``unreadable``: a copy could not be read, so only the server can decide."""
+        row = consumed_grants.entry(oauth.credential_fingerprint(credentials))
+        if row is not None and not consumed_grants.reclaimable(row, any_reservation=True):
+            return False
+        if self._server_proves_tip(credentials, identity):
+            return True
+        return not unreadable and self._rescuable(num, email, identity, credentials)
 
     def _rescuable(
         self, num: str, email: str, identity: tuple[str, str], credentials: str
@@ -2911,6 +3002,9 @@ class ClaudeAccountSwitcher:
             # blame the network for local serialization working as designed.
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
+            # Under the consume lock only, which no network rule covers: it serializes
+            # the POST itself.
+            self._probe_slot_tip(account_num, email)
             return self._consume_backup_grant_locked(
                 account_num, email, snapshot
             )
@@ -3045,16 +3139,38 @@ class ClaudeAccountSwitcher:
                 try:
                     self._required_mode_gate(refresh_input, (account_num, email, org_uuid))
                 except ReloginRequiredError as refused:
-                    # A copy that could not be read may be the newest: no rescue then.
-                    if isinstance(refused.__cause__, CopiesDisagreeError) or not self._rescuable(
-                        account_num, email, identity, refresh_input
+                    # A copy that could not be read may be the newest: only the server
+                    # can decide then.
+                    if not self._last_resort(
+                        account_num, email, identity, refresh_input,
+                        unreadable=isinstance(refused.__cause__, CopiesDisagreeError),
                     ):
                         raise
                     rescue = True
+                # The default mode has no gate, but the ledger refuses the same tokens at
+                # the POST: decide here, as the gate does, rather than send a lapsed
+                # access token to the usage endpoint every pass.
+                if not rescue and not self._store._strict_mode():
+                    row = consumed_grants.entry(oauth.credential_fingerprint(refresh_input))
+                    if row is not None and not consumed_grants.reclaimable(row):
+                        if self._last_resort(account_num, email, identity, refresh_input):
+                            rescue = True
+                        elif row.get("state") == consumed_grants.RESERVED and not (
+                            consumed_grants.reclaimable(row, any_reservation=True)
+                        ):
+                            # A POST that may still be in flight, or one cut off minutes
+                            # ago: retried once stale, so not a relogin (auto would
+                            # quarantine the account on that word).
+                            return oauth.RefreshOutcome(None, "transient")
+                        else:
+                            raise ReloginRequiredError(RELOGIN_REQUIRED_MESSAGE)
+                if rescue:
                     self._logger.warning(
-                        "Account %s: nothing proves which copy is newest and only a new "
-                        "login would settle it; sending the slot's own token once as a "
-                        "last resort.", account_num,
+                        "Account %s: no record shows which copy is newest; sending the "
+                        "slot's own token (%s).", account_num,
+                        "the server proves it current"
+                        if self._server_proves_tip(refresh_input, identity)
+                        else "last resort",
                     )
                 if (
                     not self._store._strict_mode()
@@ -3091,6 +3207,7 @@ class ClaudeAccountSwitcher:
                             )
                             refresh_input = profile
                             input_oauth = prof_oauth
+                            rescue = False  # decided for the slot's token, not this one
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
         except RequiredModeUnsupportedError:
             return oauth.RefreshOutcome(None, "required_mode_unsupported")
@@ -3307,7 +3424,7 @@ class ClaudeAccountSwitcher:
                 # park anything. Every other one wrote the entry first.
                 stashed=stashed_reason != "consume-gate-unpersisted",
             )
-        if rescue and not stashed_reason:
+        if (rescue or self._server_proves_tip(refresh_input, identity)) and not stashed_reason:
             # The server took this token, so it was its lineage's live tip; a stash
             # copy of the account is an older link or a login nothing uses, and left
             # in place it would block the next refresh the same way.

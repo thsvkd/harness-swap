@@ -1415,7 +1415,8 @@ class TestUncertainOutcomeIsNeverRetried:
         run_keepalive(new_process())
         s = new_process()
         s._fetch_active_usage("1", "a@example.com", near, "")
-        assert s.consume_backup_grant(*SLOT, near).error == "consumed"
+        # Refused before the POST; a reservation this young is retried once stale.
+        assert s.consume_backup_grant(*SLOT, near).error == "transient"
         assert rotating.posts == ["RT-0"]
 
     def test_reservation_is_durable_before_the_request_leaves(

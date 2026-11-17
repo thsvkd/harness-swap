@@ -671,6 +671,120 @@ class TestLastResort:
         assert self._sent(healthy) == []
 
 
+class TestDefaultModeLastResort(TestLastResort):
+    """Linux and Windows have no gate, only the ledger at the POST (pit5, slot 6: a
+    0.3.x reservation and a lapsed access token answered 429 for four days)."""
+
+    @pytest.fixture(autouse=True)
+    def _default_mode(self, monkeypatch):
+        from claude_swap.credentials import CredentialStore
+
+        monkeypatch.setattr(CredentialStore, "_strict_mode", lambda self: False)
+
+    def test_a_post_still_in_flight_is_not(self, healthy):
+        """Retried once stale, so transient: `auto` quarantines on a relogin answer."""
+        self._ledger(healthy, healthy.read_enc(SLOT_2), post=True, age=60)
+        assert self._refresh_slot_2(healthy).error == "transient"
+        assert self._sent(healthy) == []
+
+    # Rule U and the active-login refusal belong to the gate this mode does not have.
+    test_never_while_a_later_copy_may_be_its_successor = None
+    test_a_rival_blocks_while_the_access_token_may_still_be_in_use = None
+    test_never_the_active_login = None
+    test_a_rival_stash_copy_is_retired_after_the_server_takes_the_slot_token = None
+
+    def test_a_refused_lapsed_token_is_not_sent_for_usage(self, healthy):
+        healthy.write_enc(SLOT_2, creds("AT-2", "RT-2", expires_in_s=-600))
+        self._ledger(healthy, healthy.read_enc(SLOT_2), post=False, age=consumed_grants.STALE_POST_S + 1)
+        outcome = oauth.try_fetch_usage_for_account(
+            "2", "b@example.com", healthy.read_enc(SLOT_2), is_active=False,
+            refresh_via=ClaudeAccountSwitcher().consume_backup_grant,
+        )
+        # The fake endpoint takes every request, the usage GET included.
+        assert outcome.error == "relogin_required" and healthy.endpoint.posts == []
+
+    def test_a_lapsed_token_is_not_sent_for_usage_after_a_failed_refresh(self, healthy):
+        lapsed = creds("AT-2", "RT-2", expires_in_s=-600)
+        outcome = oauth.try_fetch_usage_for_account(
+            "2", "b@example.com", lapsed, is_active=False,
+            refresh_via=lambda *_: oauth.RefreshOutcome(None, "transient"),
+        )
+        assert outcome.error == "refresh-failed" and healthy.endpoint.posts == []
+
+
+class TestServerProof:
+    """A copy no record orders blocks a refresh, unless the server shows the token's own
+    access token still signing in: a refresh revokes the access tokens it replaced, so
+    that token is its lineage's live tip (thsvkd-macmini, 2026-11-17: a stash copy of the
+    previous generation held keepalive at split_brain until a new login)."""
+
+    @pytest.fixture
+    def answers(self, monkeypatch):
+        live = {}
+        monkeypatch.setattr(
+            "claude_swap.oauth.fetch_oauth_profile",
+            lambda token: live.get(token),
+        )
+        return live
+
+    def _signs_in(self, answers, token, email):
+        answers[token] = {"uuid": "u", "email": email, "organizationUuid": ""}
+
+    def test_the_active_login_is_refreshed_and_the_older_copy_retired(self, healthy, answers):
+        healthy.write_file(creds("AT-1", "RT-1", expires_in_s=NEAR))
+        healthy.write_enc(SLOT_1, creds("AT-1", "RT-1", expires_in_s=NEAR))
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(creds("AT-1O", "RT-1-OLD", expires_in_s=-3600), ("a@example.com", ""), "1", "replaced")
+        assert healthy.keepalive()["error"]["type"] == "split_brain"  # nothing proves it
+        self._signs_in(answers, "AT-1", "a@example.com")
+        report = healthy.keepalive()
+        assert report["ok"] is True, report
+        assert [p["refresh_token"] for p in healthy.endpoint.posts] == ["RT-1"]
+        assert s._store._list_unclaimed_credentials() == {}
+
+    def test_an_idle_slot_is_refreshed_over_a_rival(self, healthy, answers):
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(creds("AT-2O", "RT-2-OLD", expires_in_s=600), ("b@example.com", ""), "2", "replaced")
+        self._signs_in(answers, "AT-2", "b@example.com")
+        outcome = s.consume_backup_grant(*SLOT_2, healthy.read_enc(SLOT_2))
+        assert outcome.error is None
+        assert [p["refresh_token"] for p in healthy.endpoint.posts] == ["RT-2"]
+        assert s._store._list_unclaimed_credentials() == {}
+
+    @pytest.mark.parametrize("email", [None, "c@example.com"])
+    def test_no_proof_without_the_server_naming_the_account(self, healthy, answers, email):
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(creds("AT-2O", "RT-2-OLD"), ("b@example.com", ""), "2", "replaced")
+        if email:
+            self._signs_in(answers, "AT-2", email)
+        assert s.consume_backup_grant(*SLOT_2, healthy.read_enc(SLOT_2)).error == "relogin_required"
+        assert healthy.endpoint.posts == []
+
+    def test_an_old_answer_proves_nothing(self, healthy, answers):
+        import claude_swap.switcher as switcher_module
+
+        s = ClaudeAccountSwitcher()
+        s.stash_verified(creds("AT-2O", "RT-2-OLD"), ("b@example.com", ""), "2", "replaced")
+        self._signs_in(answers, "AT-2", "b@example.com")
+        s._probe_slot_tip(*SLOT_2)
+        slot = healthy.read_enc(SLOT_2)
+        assert s._server_proves_tip(slot, ("b@example.com", ""))
+        key = oauth.access_token_fingerprint(slot)
+        who, when = s._tip_answers[key]
+        s._tip_answers[key] = (who, when - switcher_module.TIP_PROOF_TTL_S)
+        assert not s._server_proves_tip(slot, ("b@example.com", ""))
+
+    def test_never_over_a_consumed_token(self, healthy, answers):
+        consumed_grants.record(
+            oauth.credential_fingerprint(healthy.read_enc(SLOT_2)), ("b@example.com", ""),
+            consumed_grants.CONSUMED,
+        )
+        self._signs_in(answers, "AT-2", "b@example.com")
+        s = ClaudeAccountSwitcher()
+        assert s.consume_backup_grant(*SLOT_2, healthy.read_enc(SLOT_2)).error == "relogin_required"
+        assert healthy.endpoint.posts == []
+
+
 class TestSwitchFreshens:
     """A manual switch never hands Claude Code a token it would have to refresh itself."""
 

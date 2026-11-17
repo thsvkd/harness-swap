@@ -10946,9 +10946,11 @@ class TestGateUltraReviewFixes:
         def read_ex(num, email):
             return next(reads, (THIRD, False))
 
+        # The reads above are scripted in order; the server probe would take one.
         with patch.object(s, "_read_account_credentials", return_value=THIRD), \
              patch.object(s, "_read_account_credentials_ex",
                           side_effect=read_ex), \
+             patch.object(s, "_probe_slot_tip"), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
             out = s.consume_backup_grant("1", "test@example.com", self._OLD)

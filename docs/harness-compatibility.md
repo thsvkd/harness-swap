@@ -90,7 +90,12 @@ Codex does any token refresh itself. An inactive account is asked with
 `CODEX_HOME=<its own account dir>`; the active one in the default home, and only
 when the access token has more than 10 minutes left (without a readable `exp`:
 `last_refresh` younger than 8 days minus 10 minutes), else the last measurement
-is kept (`stale`). An account owned by a running session is not asked. A reply
+is kept (`stale`). Once that token has been lapsed for 30 minutes it is asked
+anyway, even with a Codex running: Codex refreshes 5 minutes before expiry and its
+shared background server retries every 4.5 minutes, so no running Codex is
+refreshing it (seen 2026-11-17: the server refused its refresh token), and the
+answer tells whether it needs signing in again. `hswap codex refresh` follows the
+same rule. An account owned by a running session is not asked. A reply
 for a different account id is refused. Minimum interval 300 s.
 
 Automatic rotation (opt-in) is experimental: OpenAI's Terms of Use (2024-12-11

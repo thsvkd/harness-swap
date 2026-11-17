@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+import harness_swap.adapters.codex as codex_module
+
 from harness_swap.adapters.codex import CodexAdapter, snapshot_from_rate_limits
 from harness_swap.core import accounts as service
 from harness_swap.core import sessions
@@ -623,6 +625,34 @@ def test_keep_alive_touches_the_active_login_only_while_no_codex_runs(remote, mo
     monkeypatch.setenv("FAKE_ROTATE", "1")
     assert keep(adapter, 2) == "token refreshed"
     assert calls()[0]["home"] == str(home)
+
+
+@posix_only
+def test_a_token_no_running_codex_refreshed_is_asked_about(remote, monkeypatch):
+    """pit5 and kgolf-macmini-m1, 2026-11-17: a resident Codex app-server whose refresh the
+    server refused (refresh token expired) left the active token lapsed for days while
+    hswap kept waiting for that Codex to refresh it."""
+    adapter, home, ask, calls = remote
+    monkeypatch.setattr("harness_swap.infrastructure.processes.find", lambda names: [4242])
+    write_json(Path(os.environ["FAKE_REPLY"]), app_server_reply(account="acct-2"))
+    set_live_token(home, exp=int(time.time()) - 20 * 60)  # Codex may still be at it
+    assert keep(adapter, 2) == "skipped: Codex CLI is running and refreshes the active login itself"
+    assert ask(2).state is UsageState.STALE and calls() == []
+    set_live_token(home, exp=int(time.time()) - 5 * 86400)
+    # First seen lapsed now, so only after awake time: a machine that slept through the
+    # lapse would have Codex and hswap refresh at once on wake.
+    assert keep(adapter, 2) == "skipped: Codex CLI is running and refreshes the active login itself"
+    assert calls() == []
+    awake = codex_module._awake_clock()
+    monkeypatch.setattr(codex_module, "_awake_clock", lambda: awake + 60)  # asleep 16 min, awake 1
+    mark = adapter.store.root / codex_module._LAPSE_MARK
+    seen = json.loads(mark.read_text())
+    mark.write_text(json.dumps({**seen, "wall": seen["wall"] - 16 * 60}))
+    assert keep(adapter, 2).startswith("skipped:")
+    monkeypatch.setattr(codex_module, "_awake_clock", lambda: awake + 16 * 60)
+    assert keep(adapter, 2) == "token still valid"
+    assert ask(2).state is UsageState.AVAILABLE
+    assert {c["home"] for c in calls() if "argv" in c} == {str(home)}
 
 
 @posix_only

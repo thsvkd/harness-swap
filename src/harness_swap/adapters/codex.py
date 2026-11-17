@@ -31,6 +31,8 @@ docs/harness-compatibility.md for the evidence and its classification):
   active login is asked only while its access token has more than 10
   minutes left: Codex refreshes 5 minutes before expiry, and a Codex the
   user started could refresh the same single-use refresh token at once.
+  Once it has been lapsed for 30 minutes it is asked anyway: no running Codex
+  is refreshing it then, and the answer tells whether it needs signing in again.
   Limits: only the main ``codex`` limit is mapped; extra metered limits in
   ``rateLimitsByLimitId`` are not read. If a read is cut off at the timeout
   while Codex is mid-refresh, the rotated refresh token may be lost and that
@@ -80,6 +82,15 @@ _MAX_LOGS = 300
 _MIN_TOKEN_LIFE_S = 600.0
 #: Without a readable ``exp``, Codex refreshes when ``last_refresh`` is older than this.
 _REFRESH_INTERVAL_S = 8 * 86400.0
+#: A running Codex refreshes 5 minutes before expiry and its shared background server
+#: tries again every 4.5 minutes, so a token still lapsed this long is one no running
+#: Codex is refreshing (refused by the server, or held by another account): asking
+#: cannot race a refresh then, and tells whether the login needs signing in again.
+_ABANDONED_AFTER_S = 30 * 60.0
+#: ... counted while awake: after a sleep the token is long lapsed, and Codex and hswap
+#: would both try at once on wake. This much awake time seen lapsed is several retries.
+_ABANDONED_AWAKE_S = 15 * 60.0
+_LAPSE_MARK = "codex-lapsed.json"
 #: Start-up, a possible token refresh and the usage request, in total.
 _RPC_TIMEOUT_S = 45.0
 _PASSIVE_POLICY = UsagePolicy(min_interval_s=30.0, stale_after_s=3600.0, max_backoff_s=600.0)
@@ -249,6 +260,45 @@ def refresh_due(auth_file: Path, now: float) -> str | None:
     )
 
 
+def _awake_clock() -> float:
+    """Seconds that do not advance while the machine sleeps (macOS: CLOCK_UPTIME_RAW;
+    Linux: CLOCK_MONOTONIC, which stops in suspend)."""
+    clock = getattr(time, "CLOCK_UPTIME_RAW", None)
+    return time.clock_gettime(clock) if clock is not None else time.monotonic()
+
+
+def abandoned(auth_file: Path, now: float, mark: Path | None = None) -> bool:
+    """Has the active login's access token been lapsed past ``_ABANDONED_AFTER_S``, and
+    seen lapsed for ``_ABANDONED_AWAKE_S`` of awake time? ``mark`` remembers when this
+    token was first seen lapsed, across hswap runs; without it, never."""
+    try:
+        doc = json.loads(auth_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    tokens = doc.get("tokens") if isinstance(doc, dict) and isinstance(doc.get("tokens"), dict) else {}
+    exp = jwt_claims(tokens.get("access_token")).get("exp")
+    if not (isinstance(exp, int | float) and not isinstance(exp, bool) and now - exp > _ABANDONED_AFTER_S):
+        return False
+    if mark is None:
+        return False
+    token, awake = _token_hash(auth_file), _awake_clock()
+    try:
+        seen = json.loads(mark.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        seen = {}
+    seen = seen if isinstance(seen, dict) else {}
+    elapsed = awake - seen.get("awake", awake + 1) if isinstance(seen.get("awake"), int | float) else -1
+    # Same token, same boot: the awake clock moved forward, and no faster than the wall clock.
+    if seen.get("token") == token and 0 <= elapsed <= now - seen.get("wall", now) + 1:
+        return elapsed >= _ABANDONED_AWAKE_S
+    try:
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.write_text(json.dumps({"token": token, "awake": awake, "wall": now}), encoding="utf-8")
+    except OSError:
+        pass
+    return False
+
+
 def _token_hash(auth_file: Path) -> str | None:
     """A digest of what a refresh changes, so the outcome is told without showing a token."""
     try:
@@ -315,6 +365,10 @@ class CodexAdapter(FileCredentialAdapter):
     fmt = CodexAuthFormat()
     #: The provider's terms on switching accounts, shown when it is opted in to usage.remote/auto.enabled.
     terms = _TERMS
+
+    @property
+    def _lapse_mark(self) -> Path:
+        return self.store.root / _LAPSE_MARK
 
     @property
     def remote_usage(self) -> bool:
@@ -433,7 +487,8 @@ class CodexAdapter(FileCredentialAdapter):
         with self.usage_home(account) as (home, active):
             if home is None:
                 return UsageSnapshot(UsageState.STALE, detail="in use by a running session; showing the last measurement")
-            if active and (why := refresh_due(home / self.credential_file, time.time())):
+            auth, now = home / self.credential_file, time.time()
+            if active and (why := refresh_due(auth, now)) and not abandoned(auth, now, self._lapse_mark):
                 return UsageSnapshot(UsageState.STALE, detail=why)
             try:
                 result = self._rate_limits(inst.executable, home)
@@ -467,9 +522,11 @@ class CodexAdapter(FileCredentialAdapter):
         with self.usage_home(account) as (home, active):
             if home is None:
                 return "skipped: a running session keeps it fresh"
-            if active and processes.find({self.executable}) != []:
-                return f"skipped: {self.display_name} is running and refreshes the active login itself"
             auth = home / self.credential_file
+            if active and processes.find({self.executable}) != [] and not abandoned(
+                auth, time.time(), self._lapse_mark
+            ):
+                return f"skipped: {self.display_name} is running and refreshes the active login itself"
             before, error = _token_hash(auth), None
             if before is None:
                 raise HswapError("sign in again: this account's login is missing from its Codex home")
